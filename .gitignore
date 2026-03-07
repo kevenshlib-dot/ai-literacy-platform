@@ -45,3 +45,4 @@ alembic/versions/*.pyc
 
 # Claude Code
 .claude/
+.github/
