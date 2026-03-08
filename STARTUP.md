@@ -1,9 +1,9 @@
-# AI素养评测平台 — 重启服务指南
+# AI素养评测平台 — 本地开发启动指南
 
 ## 项目路径
 
 ```
-cd /Users/shlibkeven/Desktop/PRD/素养能力平台/ai-literacy-platform
+cd ~/remote-projects/ai-literacy-platform-git
 ```
 
 ---
@@ -13,7 +13,7 @@ cd /Users/shlibkeven/Desktop/PRD/素养能力平台/ai-literacy-platform
 ### 第 1 步：启动 Docker 容器（数据库 + 中间件）
 
 ```bash
-docker compose up -d
+docker compose up -d postgres elasticsearch minio milvus-standalone redis rabbitmq
 ```
 
 包含以下服务：
@@ -21,37 +21,41 @@ docker compose up -d
 | 服务 | 端口 | 说明 |
 |------|------|------|
 | PostgreSQL | 5432 | 主数据库 |
+| Elasticsearch | 9200 | 全文检索 |
 | MinIO | 9000 / 9001 | 对象存储（文件上传） |
 | Milvus | 19530 | 向量数据库 |
-| etcd | 2379 | Milvus 依赖 |
-| Milvus-MinIO | 9010 / 9011 | Milvus 内部存储 |
+| RabbitMQ | 5672 / 15672 | 消息队列 |
+| Redis | 6379 | 缓存 |
 
 等待约 30 秒，确认容器健康：
 
 ```bash
-docker ps
+docker compose ps
 ```
 
 所有容器应显示 `Up ... (healthy)`。
 
 ---
 
-### 第 2 步：启动 LM Studio（AI 大模型）
+### 第 2 步：启动 vLLM（AI 大模型）
 
-1. 打开应用：**LM Studio.app**
-2. 加载模型：`qwen/qwen2.5-coder-14b`
-3. 启动本地服务器，确保监听端口 **1234**
+在 GPU 服务器上启动 vLLM：
 
-> 验证：浏览器访问 `http://localhost:1234/v1/models`，能返回 JSON 即正常。
-> 如果 LM Studio 未启动，训练题目生成会自动降级为从题库随机抽题，不影响其他功能。
+```bash
+python -m vllm.entrypoints.openai.api_server \
+  --model Qwen/Qwen3.5-35B-A3B-GPTQ-Int4 \
+  --port 8100 --host 0.0.0.0 \
+  --max-model-len 32768 --gpu-memory-utilization 0.9
+```
+
+> 验证：`curl http://localhost:8100/v1/models`，能返回 JSON 即正常。
+> 如果 vLLM 未启动，AI 出题/评分会自动降级为模板生成，不影响其他功能。
 
 ---
 
 ### 第 3 步：启动后端（FastAPI）
 
 ```bash
-cd /Users/shlibkeven/Desktop/PRD/素养能力平台/ai-literacy-platform
-
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -66,9 +70,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 **新开一个终端窗口：**
 
 ```bash
-cd /Users/shlibkeven/Desktop/PRD/素养能力平台/ai-literacy-platform/frontend
-
-npm run dev
+cd frontend && npm run dev
 ```
 
 > 看到 `VITE ready` 表示启动成功。
@@ -80,10 +82,10 @@ npm run dev
 
 | 检查项 | 方法 |
 |--------|------|
-| 数据库 | `docker ps` 查看 postgres 状态 |
+| 数据库 | `docker compose ps` 查看 postgres 状态 |
 | 后端 API | 浏览器打开 `http://localhost:8000/docs` |
 | 前端页面 | 浏览器打开 `http://localhost:3000` |
-| LLM 服务 | 浏览器打开 `http://localhost:1234/v1/models` |
+| LLM 服务 | `curl http://localhost:8100/v1/models` |
 
 ---
 
@@ -92,9 +94,9 @@ npm run dev
 ```bash
 # 停止前端：在前端终端按 Ctrl+C
 # 停止后端：在后端终端按 Ctrl+C
+# 停止 vLLM：Ctrl+C 或 pkill -f "vllm.entrypoints"
 
 # 停止 Docker 容器
-cd /Users/shlibkeven/Desktop/PRD/素养能力平台/ai-literacy-platform
 docker compose down
 ```
 
@@ -108,10 +110,13 @@ docker compose down
 |------|------|
 | 前端 (Vue) | 3000 |
 | 后端 (FastAPI) | 8000 |
-| LM Studio (LLM) | 1234 |
+| vLLM (LLM) | 8100 |
 | PostgreSQL | 5432 |
+| Elasticsearch | 9200 |
 | MinIO 控制台 | 9001 |
 | Milvus | 19530 |
+| RabbitMQ 管理 | 15672 |
+| Redis | 6379 |
 
 ---
 
