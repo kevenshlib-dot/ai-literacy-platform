@@ -14,6 +14,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
+from app.agents.llm_utils import strip_thinking_tags
 
 logger = logging.getLogger(__name__)
 
@@ -88,9 +89,11 @@ def ai_review_question(
             ],
             temperature=0.3,
             max_tokens=1024,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
 
         raw = response.choices[0].message.content.strip()
+        raw = strip_thinking_tags(raw)
         if "```json" in raw:
             raw = raw.split("```json", 1)[1].split("```", 1)[0].strip()
         elif "```" in raw:

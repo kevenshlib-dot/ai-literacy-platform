@@ -33,13 +33,13 @@ fi
 echo "Docker 版本: $(docker --version)"
 echo "Docker Compose 版本: $(docker compose version 2>/dev/null)"
 
-# 2. 检查 LM Studio
+# 2. 检查 vLLM 大模型服务
 echo ""
-echo "[2/6] 检查 LM Studio..."
+echo "[2/6] 检查 vLLM 服务..."
 
-if curl -sf http://localhost:1234/v1/models > /dev/null 2>&1; then
-    echo "LM Studio 已在运行，可用模型:"
-    curl -s http://localhost:1234/v1/models | python3 -c "
+if curl -sf http://localhost:8100/v1/models > /dev/null 2>&1; then
+    echo "vLLM 已在运行，可用模型:"
+    curl -s http://localhost:8100/v1/models | python3 -c "
 import sys,json
 try:
     data=json.load(sys.stdin)
@@ -50,33 +50,27 @@ except: print('  (无法解析模型列表)')
 else
     echo ""
     echo "=========================================="
-    echo "  LM Studio 未检测到！请先完成以下步骤："
+    echo "  vLLM 未检测到！请先完成以下步骤："
     echo "=========================================="
     echo ""
-    echo "  1. 下载 LM Studio Linux 版:"
-    echo "     https://lmstudio.ai/download/linux"
+    echo "  1. 创建 Python 虚拟环境并安装 vLLM:"
+    echo "     python3 -m venv ~/vllm-env"
+    echo "     ~/vllm-env/bin/pip install vllm"
     echo ""
-    echo "  2. 安装:"
-    echo "     chmod +x LM-Studio-*.AppImage"
-    echo "     # 有桌面环境: 直接双击运行"
-    echo "     # 无桌面 (推荐): 使用 lms CLI"
+    echo "  2. 启动 vLLM 服务 (以 Qwen2.5-7B-Instruct 为例):"
+    echo "     export HF_ENDPOINT=https://hf-mirror.com  # 国内镜像加速"
+    echo "     nohup ~/vllm-env/bin/python -m vllm.entrypoints.openai.api_server \\"
+    echo "       --model Qwen/Qwen2.5-7B-Instruct \\"
+    echo "       --host 0.0.0.0 --port 8100 \\"
+    echo "       > ~/vllm-server.log 2>&1 &"
     echo ""
-    echo "  3. 使用 CLI 启动 (无需桌面环境):"
-    echo "     # 安装 CLI"
-    echo "     npx lmstudio install-cli"
-    echo "     # 下载模型"
-    echo "     lms get openai/gpt-oss-20b"
-    echo "     # 加载模型并启动服务"
-    echo "     lms load openai/gpt-oss-20b"
-    echo "     lms server start"
-    echo ""
-    echo "  4. 确认 LM Studio 在 http://localhost:1234 运行后"
+    echo "  3. 确认 vLLM 在 http://localhost:8100 运行后"
     echo "     重新执行本脚本: ./deploy.sh"
     echo "=========================================="
     echo ""
-    read -p "LM Studio 是否已就绪？继续部署？(y/N): " CONTINUE
+    read -p "vLLM 是否已就绪？继续部署？(y/N): " CONTINUE
     if [ "$CONTINUE" != "y" ] && [ "$CONTINUE" != "Y" ]; then
-        echo "已取消。请先启动 LM Studio 后再运行此脚本。"
+        echo "已取消。请先启动 vLLM 后再运行此脚本。"
         exit 0
     fi
 fi
@@ -148,7 +142,7 @@ else
     echo "  平台访问:  http://${LOCAL_IP}"
     echo "  API 文档:  http://${LOCAL_IP}/docs"
     echo ""
-    echo "  LM Studio: http://localhost:1234 (本机)"
+    echo "  vLLM:      http://localhost:8100 (本机)"
     echo "  MinIO:     http://${LOCAL_IP}:9001  (minioadmin/minioadmin)"
     echo "  RabbitMQ:  http://${LOCAL_IP}:15672 (guest/guest)"
     echo ""

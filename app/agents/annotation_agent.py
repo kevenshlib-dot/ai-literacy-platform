@@ -10,6 +10,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
+from app.agents.llm_utils import strip_thinking_tags
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +51,10 @@ def auto_annotate_content(content: str, title: Optional[str] = None) -> dict:
             ],
             temperature=0.3,
             max_tokens=500,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         raw = response.choices[0].message.content.strip()
+        raw = strip_thinking_tags(raw)
         json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
         if json_match:
             raw = json_match.group(1)

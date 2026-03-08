@@ -1,40 +1,36 @@
 services:
   # Nginx + Vue Frontend (入口: http://服务器IP:80)
+  # 使用 host 网络模式，直接通过 localhost:8000 访问后端
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: ai-literacy-frontend
-    ports:
-      - "80:80"
+    network_mode: host
     depends_on:
       - app
-    networks:
-      - ai-literacy-net
     restart: unless-stopped
 
   # FastAPI Backend
+  # 使用 host 网络模式，解决 DGX Spark 上 Docker bridge 无法访问宿主机 vLLM 的问题
   app:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: ai-literacy-app
-    ports:
-      - "8000:8000"
+    network_mode: host
     env_file:
       - .env.production
     environment:
-      # 覆盖 host 为 Docker 内部服务名
-      - POSTGRES_HOST=postgres
-      - ELASTICSEARCH_HOST=elasticsearch
-      - MILVUS_HOST=milvus-standalone
-      - MINIO_HOST=minio
-      - RABBITMQ_HOST=rabbitmq
-      - REDIS_HOST=redis
-      # LM Studio 运行在宿主机上，通过 host.docker.internal 访问
-      - LLM_BASE_URL=http://host.docker.internal:1234/v1
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      # host 网络模式下，所有服务都通过 localhost + 映射端口访问
+      - POSTGRES_HOST=localhost
+      - ELASTICSEARCH_HOST=localhost
+      - MILVUS_HOST=localhost
+      - MINIO_HOST=localhost
+      - RABBITMQ_HOST=localhost
+      - REDIS_HOST=localhost
+      # vLLM 运行在宿主机上，直接通过 localhost 访问
+      - LLM_BASE_URL=http://localhost:8100/v1
     depends_on:
       postgres:
         condition: service_healthy
@@ -46,8 +42,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    networks:
-      - ai-literacy-net
     restart: unless-stopped
 
   # PostgreSQL

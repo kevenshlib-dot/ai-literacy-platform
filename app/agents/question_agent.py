@@ -9,6 +9,7 @@ from openai import OpenAI
 from httpx import Timeout
 
 from app.core.config import settings
+from app.agents.llm_utils import strip_thinking_tags
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +150,61 @@ SCENARIO_CONTEXTS = [
     "社会治理场景（如公共安全、城市管理、政务服务、舆情监测）",
     "创意创作场景（如艺术设计、音乐创作、影视制作、游戏开发）",
     "创业创新场景（如产品设计、市场调研、商业决策、技术选型）",
+    "法律合规场景（如知识产权保护、合同审查、数据合规、伦理审批）",
+    "新闻媒体场景（如事实核查、深度报道、自媒体运营、信息甄别）",
+]
+
+# 直接出题时的主题池 - 增加多样性
+DIRECT_GENERATION_TOPICS = [
+    {
+        "theme": "AI与自然语言处理",
+        "keywords": "大语言模型、Transformer架构、文本生成、机器翻译、情感分析、对话系统、提示工程、RAG检索增强生成",
+    },
+    {
+        "theme": "AI与计算机视觉",
+        "keywords": "图像识别、目标检测、图像分割、人脸识别、OCR文字识别、视频分析、医学影像、自动驾驶视觉",
+    },
+    {
+        "theme": "AI与数据科学",
+        "keywords": "数据预处理、特征工程、模型评估、A/B测试、数据可视化、异常检测、预测建模、数据仓库",
+    },
+    {
+        "theme": "AI伦理与社会影响",
+        "keywords": "算法偏见、隐私保护、深度伪造、AI监管、就业影响、数字鸿沟、信息茧房、版权争议",
+    },
+    {
+        "theme": "AI工具使用与效率",
+        "keywords": "ChatGPT/Claude使用技巧、AI绘画工具、AI编程助手、AI办公自动化、AI辅助写作、AI翻译工具",
+    },
+    {
+        "theme": "机器学习基础原理",
+        "keywords": "监督学习、无监督学习、强化学习、过拟合与正则化、梯度下降、交叉验证、集成学习、迁移学习",
+    },
+    {
+        "theme": "深度学习与神经网络",
+        "keywords": "CNN卷积神经网络、RNN循环神经网络、注意力机制、生成对抗网络GAN、自编码器、扩散模型",
+    },
+    {
+        "theme": "AI行业应用案例",
+        "keywords": "智慧医疗、智能金融、智能制造、智慧教育、智慧农业、智能物流、AI客服、个性化推荐",
+    },
+    {
+        "theme": "AI安全与对抗",
+        "keywords": "对抗样本、数据投毒、模型窃取、后门攻击、联邦学习隐私、差分隐私、鲁棒性、安全审计",
+    },
+    {
+        "theme": "AI创新前沿",
+        "keywords": "多模态AI、AI Agent、世界模型、具身智能、量子机器学习、神经符号AI、小样本学习、AI科学发现",
+    },
+]
+
+# 出题语气/视角池 - 增加题干表达方式多样性
+QUESTION_VOICE_STYLES = [
+    "第三人称叙事视角：以'某公司/某团队/某研究员'为主角设置情境",
+    "第二人称代入视角：以'你作为...需要...'的方式让考生代入角色",
+    "新闻报道视角：以'据报道/近日/最新研究表明'引出真实感场景",
+    "对话讨论视角：以'同事/朋友/专家'之间的讨论引出问题",
+    "问题驱动视角：以'如何解决/怎样实现/为什么会'开头直接提出挑战",
 ]
 
 # 难度校准详细描述
@@ -215,7 +271,12 @@ def classify_dimension(stem: str, knowledge_tags: list = None) -> str:
 SYSTEM_PROMPT = """\
 # 角色定义
 
-你是一位资深的AI素养评测出题专家，拥有10年以上教育测评经验，专长于：
+你同时具备三个身份：
+1. **资深社会人文学科教授**——擅长将专业知识转化为生动、贴近实际的考题，语言风格灵活多变
+2. **精通AI的技术实践者**——对人工智能的原理、工具、伦理和应用有深入的实战经验
+3. **资深图书馆专家**——善于从文献资料中提取核心知识点，精准把握信息素养和知识组织
+
+你的专业能力：
 - 布鲁姆认知目标分类法（Bloom's Taxonomy）的精准应用
 - 基于情境的评测设计（Scenario-Based Assessment）
 - 干扰项心理学（Distractor Psychology）：利用常见误解和认知偏差设计高质量干扰项
@@ -226,9 +287,14 @@ SYSTEM_PROMPT = """\
 # 出题质量标准
 
 ## 题干设计标准
-1. **情境丰富性**：优先使用具体情境（工作场景、学习场景、生活场景）包裹知识点，避免纯粹的"以下哪项正确"式提问
-2. **认知层次精准**：题目应精准对应布鲁姆认知层次——记忆/理解层次问"是什么"，应用层次问"怎么做"，分析层次问"为什么"，评价层次问"哪个更好"，创造层次问"如何设计"
-3. **表述清晰完整**：题干必须自足，不依赖外部信息即可作答；避免否定句式（"以下哪项不正确"）除非明确标注
+1. **语言多样化**：每道题的题干必须使用不同的表达方式和句式开头，严禁使用固定模板。具体要求：
+   - 不要每道题都以"以下关于...的描述"或"以下哪项..."开头
+   - 交替使用陈述句、设问句、情境描述、案例引用、数据引用等不同开头
+   - 每道题的语言风格应有所变化（学术风、口语风、新闻风、叙事风等）
+2. **情境丰富性**：优先使用具体情境（工作场景、学习场景、生活场景）包裹知识点，避免纯粹的"以下哪项正确"式提问
+3. **认知层次精准**：题目应精准对应布鲁姆认知层次——记忆/理解层次问"是什么"，应用层次问"怎么做"，分析层次问"为什么"，评价层次问"哪个更好"，创造层次问"如何设计"
+4. **表述清晰完整**：题干必须自足，不依赖外部信息即可作答；避免否定句式（"以下哪项不正确"）除非明确标注
+5. **答案简明扼要**：正确答案和解析要准确精练，避免冗长啰嗦
 
 ## 干扰项设计标准（核心）
 1. **基于真实误解**：每个干扰项应对应一种常见的认知错误或误解，而非随意编造的错误选项
@@ -237,13 +303,16 @@ SYSTEM_PROMPT = """\
 4. **独立性**：选项之间不能互相矛盾导致排除法过于容易，也不能有包含关系
 5. **正确答案位置随机**：正确答案不能总是A或总是最长的选项，应在A/B/C/D之间均匀分布
 
-## 反模式（必须避免）
-- 所有题目正确答案都是同一个字母
-- 题干过于笼统："关于XX，以下说法正确的是？"（没有情境）
-- 干扰项一眼假：如"AI已经完全取代了人类"这种明显错误
-- 题目之间高度重复：考查同一个知识点的不同措辞
-- 判断题全部为"正确"
-- 选项中出现"以上都是/以上都不是"
+## 反模式（必须避免，违反将导致题目无效）
+- ❌ 所有题目正确答案都是同一个字母（必须随机分布在A/B/C/D中）
+- ❌ 题干过于笼统："关于XX，以下说法正确的是？"（没有情境）
+- ❌ 题干句式雷同：多道题都以"以下关于..."或"以下哪项..."开头
+- ❌ 干扰项一眼假：如"AI已经完全取代了人类"这种明显错误
+- ❌ 题目之间高度重复：考查同一个知识点的不同措辞
+- ❌ 判断题全部为"正确"
+- ❌ 选项中出现"以上都是/以上都不是"
+- ❌ 考查书名、作者、章节标题等形式化信息（有参考素材时）
+- ❌ 答案和解析过于冗长（应简明扼要）
 
 # 题目风格目录
 
@@ -355,16 +424,29 @@ def _build_user_prompt(
     if content:
         content_section = f"""
 
-【知识内容】（请基于以下内容深度出题，确保题目考查内容中的核心概念和关键知识点）
+【参考素材】（请严格以下述素材为出题基础）
 {content}
 
-【内容分析指引】
-- 识别上述内容中的核心概念、关键定义、重要原理
-- 围绕这些核心知识点设计题目，不要仅考查表面文字
-- 干扰项应基于对这些概念的常见误解来设计
-- 确保每道题至少与内容中的一个核心知识点直接相关"""
+【素材出题规则——必须遵守】
+1. **只从素材中选取知识点**：所有题目必须围绕素材中出现的概念、原理、观点、案例来出题
+2. **禁止考查篇章结构**：不得以素材的章节标题、目录结构、作者姓名、书名、出版信息等作为考查内容
+3. **考查内容理解而非形式记忆**：题目应考查对素材中知识点的理解和应用，而非对原文措辞的死记硬背
+4. **深入挖掘核心知识点**：识别素材中的核心概念、关键定义、重要原理，围绕这些设计题目
+5. **干扰项设计**：基于对素材中概念的常见误解来设计干扰项，确保每个干扰项都有迷惑性
+6. **不要超出素材范围**：不要引入素材中未提及的专业知识作为正确答案"""
     else:
-        content_section = """
+        # 随机选取主题子集，增加直接出题的多样性
+        num_topics = min(3, len(DIRECT_GENERATION_TOPICS))
+        selected_topics = random.sample(DIRECT_GENERATION_TOPICS, num_topics)
+        topic_lines = []
+        for t in selected_topics:
+            topic_lines.append(f"  - {t['theme']}：{t['keywords']}")
+        topic_section = "\n".join(topic_lines)
+
+        # 随机选取语气风格
+        voice_style = random.choice(QUESTION_VOICE_STYLES)
+
+        content_section = f"""
 
 【出题范围】
 请基于AI素养领域的专业知识出题，涵盖以下维度（均匀分布）：
@@ -372,18 +454,33 @@ def _build_user_prompt(
 - AI技术应用（NLP、计算机视觉、推荐系统、大语言模型、AIGC）
 - AI伦理安全（隐私保护、算法偏见、数据安全、负责任AI）
 - AI批判思维（信息辨别、AI局限性认知、证据评估、逻辑推理）
-- AI创新实践（提示工程、AI工具使用、工作流自动化、方案设计）"""
+- AI创新实践（提示工程、AI工具使用、工作流自动化、方案设计）
+
+【本次推荐出题主题】（请优先围绕这些主题出题，但不限于此）
+{topic_section}
+
+【本次推荐题干风格】
+{voice_style}
+请尽量让每道题采用不同的表达方式和切入角度，避免题干开头和句式雷同。"""
+
+    # ── 随机选取出题视角 ──
+    voice_style = random.choice(QUESTION_VOICE_STYLES)
 
     # ── 组合多样性要求 ──
     diversity_rules = f"""
 
-【多样性与质量要求】
-1. 题目风格混合——请在以下推荐风格中选择并混合使用：
+【多样性与质量要求——核心规则】
+1. **语言多样化**——每道题的题干必须使用不同的句式和表达方式：
+   - 本次推荐视角：{voice_style}
+   - 严禁多道题使用相同的句式开头（如全都用"以下关于..."或"以下哪项..."）
+   - 每道题的语言风格和切入角度要有变化
+2. **题目风格混合**——请在以下推荐风格中选择并混合使用：
 {style_section}
-2. 情境多样——题目场景应涉及：{context_section}
-3. 正确答案分布——{count}道题中，正确答案应分布在不同选项位置（ABCD），不要集中在某一个
-4. 知识点覆盖——每道题应考查不同的知识点或从不同角度考查，避免重复
-5. 干扰项质量——每个干扰项都应对应一种常见误解，在explanation中简要说明为何该选项不正确"""
+3. **情境多样**——题目场景应涉及：{context_section}
+4. **正确答案随机分布**——{count}道题中，正确答案必须随机分布在不同选项位置（ABCD），绝对不能全都是A或全都是AB
+5. **知识点覆盖**——每道题应考查不同的知识点或从不同角度考查，避免重复
+6. **干扰项质量**——每个干扰项都应对应一种常见误解，具有足够迷惑性
+7. **答案简明**——correct_answer（主观题除外）和explanation应简洁明了"""
 
     return f"""请生成 {count} 道题目，严格遵守系统提示中的输出格式和质量标准。
 
@@ -605,12 +702,15 @@ def generate_questions_via_llm(
         client = OpenAI(
             api_key=settings.LLM_API_KEY,
             base_url=settings.LLM_BASE_URL,
-            timeout=Timeout(60.0, connect=10.0),
+            timeout=Timeout(300.0, connect=10.0),  # 5 分钟超时，Qwen3.5 思考链较长
         )
 
         user_prompt = _build_user_prompt(
             content, question_types, count, difficulty, bloom_level, custom_prompt
         )
+
+        # 根据题目数量动态调整 max_tokens，每题预留约 600 tokens
+        max_tokens = max(4096, count * 600)
 
         response = client.chat.completions.create(
             model=settings.LLM_MODEL,
@@ -618,11 +718,17 @@ def generate_questions_via_llm(
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.7,
-            max_tokens=4096,
+            temperature=0.85,  # 稍高温度增加多样性
+            max_tokens=max_tokens,
+            extra_body={
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
         )
 
         raw = response.choices[0].message.content.strip()
+
+        # Strip Qwen3.5 thinking chain (<think>...</think>) if present
+        raw = strip_thinking_tags(raw)
 
         # Extract JSON from response (LLM may wrap in ```json ... ```)
         if "```json" in raw:
@@ -648,7 +754,7 @@ def generate_questions_via_llm(
         return validated[:count]
 
     except json.JSONDecodeError as e:
-        logger.error(f"LLM output is not valid JSON: {e}")
+        logger.error(f"LLM output is not valid JSON: {e}\nRaw output (first 500 chars): {raw[:500] if raw else 'EMPTY'}")
         return _template_fallback(content, question_types, count, difficulty, bloom_level)
     except Exception as e:
         logger.error(f"LLM question generation failed: {e}")

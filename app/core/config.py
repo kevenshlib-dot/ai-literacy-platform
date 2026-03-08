@@ -74,10 +74,10 @@ class Settings(BaseSettings):
     def REDIS_URL(self) -> str:
         return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/0"
 
-    # LLM
-    LLM_API_KEY: str = "your-api-key"
-    LLM_BASE_URL: str = "https://api.deepseek.com/v1"
-    LLM_MODEL: str = "deepseek-reasoner"
+    # LLM (vLLM local server)
+    LLM_API_KEY: str = "token-not-needed"
+    LLM_BASE_URL: str = "http://localhost:8100/v1"
+    LLM_MODEL: str = "Qwen/Qwen3.5-35B-A3B"
 
     # JWT
     JWT_SECRET_KEY: str = "change-this"
