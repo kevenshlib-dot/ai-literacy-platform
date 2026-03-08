@@ -18,146 +18,283 @@
       </a-space>
     </div>
 
-    <!-- Filter Bar -->
-    <a-card class="filter-card" :bordered="false">
-      <a-row :gutter="16">
-        <a-col :span="5">
-          <a-input
-            v-model:value="filters.keyword"
-            placeholder="搜索题干关键词"
-            allow-clear
-            @press-enter="fetchQuestions"
-          >
-            <template #prefix><SearchOutlined /></template>
-          </a-input>
-        </a-col>
-        <a-col :span="4">
-          <a-select v-model:value="filters.status" placeholder="状态" allow-clear style="width: 100%">
-            <a-select-option value="draft">草稿</a-select-option>
-            <a-select-option value="pending_review">待审核</a-select-option>
-            <a-select-option value="approved">已通过</a-select-option>
-            <a-select-option value="rejected">已拒绝</a-select-option>
-            <a-select-option value="archived">已归档</a-select-option>
-          </a-select>
-        </a-col>
-        <a-col :span="4">
-          <a-select v-model:value="filters.question_type" placeholder="题型" allow-clear style="width: 100%">
-            <a-select-option value="single_choice">单选题</a-select-option>
-            <a-select-option value="multiple_choice">多选题</a-select-option>
-            <a-select-option value="true_false">判断题</a-select-option>
-            <a-select-option value="fill_blank">填空题</a-select-option>
-            <a-select-option value="short_answer">简答题</a-select-option>
-          </a-select>
-        </a-col>
-        <a-col :span="3">
-          <a-select v-model:value="filters.difficulty" placeholder="难度" allow-clear style="width: 100%">
-            <a-select-option :value="1">1 - 入门</a-select-option>
-            <a-select-option :value="2">2 - 简单</a-select-option>
-            <a-select-option :value="3">3 - 中等</a-select-option>
-            <a-select-option :value="4">4 - 困难</a-select-option>
-            <a-select-option :value="5">5 - 专家</a-select-option>
-          </a-select>
-        </a-col>
-        <a-col :span="4">
-          <a-select v-model:value="filters.dimension" placeholder="AI素养维度" allow-clear style="width: 100%">
-            <a-select-option value="AI基础知识">AI基础知识</a-select-option>
-            <a-select-option value="AI技术应用">AI技术应用</a-select-option>
-            <a-select-option value="AI伦理安全">AI伦理安全</a-select-option>
-            <a-select-option value="AI批判思维">AI批判思维</a-select-option>
-            <a-select-option value="AI创新实践">AI创新实践</a-select-option>
-          </a-select>
-        </a-col>
-        <a-col :span="4">
-          <a-space>
-            <a-button type="primary" @click="fetchQuestions">查询</a-button>
-            <a-button @click="resetFilters">重置</a-button>
-          </a-space>
-        </a-col>
-      </a-row>
-    </a-card>
-
-    <!-- Batch Actions -->
-    <a-card v-if="selectedRowKeys.length > 0" :bordered="false" style="margin-bottom: 16px">
-      <div style="display: flex; justify-content: space-between; align-items: center">
-      <a-space>
-        <span>已选 {{ selectedRowKeys.length }} 项</span>
-        <a-button size="small" style="background: #1f4e79; color: #fff; border-color: #1f4e79" @click="batchApprove">批量通过</a-button>
-        <a-button size="small" style="background: #1f4e79; color: #fff; border-color: #1f4e79" @click="batchReject">批量拒绝</a-button>
-        <a-button size="small" style="background: #1f4e79; color: #fff; border-color: #1f4e79" @click="batchDelete">批量删除</a-button>
-        <a-button size="small" style="background: #1f4e79; color: #fff; border-color: #1f4e79" @click="batchSubmit">批量提交审核</a-button>
-      </a-space>
-      <a-button size="small" style="background: #1f4e79; color: #fff; border-color: #1f4e79" @click="exportSelectedMd">
-        <template #icon><UploadOutlined /></template>
-        导出题库
-      </a-button>
-      </div>
-    </a-card>
-
-    <!-- Questions Table -->
-    <a-card :bordered="false">
-      <a-table
-        :columns="columns"
-        :data-source="questions"
-        :loading="loading"
-        :pagination="pagination"
-        :row-selection="{ selectedRowKeys, onChange: onSelectChange }"
-        row-key="id"
-        @change="handleTableChange"
-        size="middle"
-      >
-        <template #bodyCell="{ column, record }">
-          <template v-if="column.key === 'stem'">
-            <a @click="showDetail(record)">{{ truncate(record.stem, 40) }}</a>
-          </template>
-          <template v-if="column.key === 'question_type'">
-            <a-tag :color="typeColor(record.question_type)">{{ typeLabel(record.question_type) }}</a-tag>
-          </template>
-          <template v-if="column.key === 'difficulty'">
-            <a-rate :value="record.difficulty" disabled :count="5" style="font-size: 12px" />
-          </template>
-          <template v-if="column.key === 'dimension'">
-            <a-tag v-if="record.dimension" :color="dimensionColor(record.dimension)">{{ record.dimension }}</a-tag>
-            <span v-else style="color: #ccc">未分类</span>
-          </template>
-          <template v-if="column.key === 'status'">
-            <a-tag :color="statusColor(record.status)">{{ statusLabel(record.status) }}</a-tag>
-          </template>
-          <template v-if="column.key === 'created_at'">
-            {{ formatDate(record.created_at) }}
-          </template>
-          <template v-if="column.key === 'actions'">
-            <a-space>
-              <a-button size="small" type="link" @click="showDetail(record)">详情</a-button>
-              <a-button
-                v-if="record.status === 'draft'"
-                size="small"
-                type="link"
-                @click="submitForReview(record.id)"
-              >提交审核</a-button>
-              <a-button
-                v-if="record.status === 'draft' || record.status === 'pending_review'"
-                size="small"
-                type="link"
-                style="color: #52c41a"
-                @click="quickApprove(record.id)"
-              >通过</a-button>
-              <a-button
-                v-if="record.status === 'draft'"
-                size="small"
-                type="link"
-                @click="editQuestion(record)"
-              >编辑</a-button>
-              <a-popconfirm
-                title="确认删除该题目？"
-                @confirm="deleteQuestion(record.id)"
-              >
-                <a-button size="small" type="link" danger>删除</a-button>
-              </a-popconfirm>
-            </a-space>
-          </template>
+    <!-- Tab Switcher -->
+    <a-tabs v-model:activeKey="activeTab" @change="onTabChange" class="main-tabs">
+      <a-tab-pane key="all" tab="全部题目" />
+      <a-tab-pane key="review">
+        <template #tab>
+          <a-badge :count="reviewPendingTotal" :offset="[10, -2]" :overflow-count="999">
+            <span><AuditOutlined style="margin-right: 4px" />批量审核</span>
+          </a-badge>
         </template>
-      </a-table>
-    </a-card>
+      </a-tab-pane>
+    </a-tabs>
+
+    <!-- ========== Tab: 全部题目 ========== -->
+    <template v-if="activeTab === 'all'">
+      <!-- Filter Bar -->
+      <a-card class="filter-card" :bordered="false">
+        <a-row :gutter="16">
+          <a-col :span="5">
+            <a-input
+              v-model:value="filters.keyword"
+              placeholder="搜索题干关键词"
+              allow-clear
+              @press-enter="fetchQuestions"
+            >
+              <template #prefix><SearchOutlined /></template>
+            </a-input>
+          </a-col>
+          <a-col :span="4">
+            <a-select v-model:value="filters.status" placeholder="状态" allow-clear style="width: 100%">
+              <a-select-option value="draft">草稿</a-select-option>
+              <a-select-option value="pending_review">待审核</a-select-option>
+              <a-select-option value="approved">已通过</a-select-option>
+              <a-select-option value="rejected">已拒绝</a-select-option>
+              <a-select-option value="archived">已归档</a-select-option>
+            </a-select>
+          </a-col>
+          <a-col :span="4">
+            <a-select v-model:value="filters.question_type" placeholder="题型" allow-clear style="width: 100%">
+              <a-select-option value="single_choice">单选题</a-select-option>
+              <a-select-option value="multiple_choice">多选题</a-select-option>
+              <a-select-option value="true_false">判断题</a-select-option>
+              <a-select-option value="fill_blank">填空题</a-select-option>
+              <a-select-option value="short_answer">简答题</a-select-option>
+            </a-select>
+          </a-col>
+          <a-col :span="3">
+            <a-select v-model:value="filters.difficulty" placeholder="难度" allow-clear style="width: 100%">
+              <a-select-option :value="1">1 - 入门</a-select-option>
+              <a-select-option :value="2">2 - 简单</a-select-option>
+              <a-select-option :value="3">3 - 中等</a-select-option>
+              <a-select-option :value="4">4 - 困难</a-select-option>
+              <a-select-option :value="5">5 - 专家</a-select-option>
+            </a-select>
+          </a-col>
+          <a-col :span="4">
+            <a-select v-model:value="filters.dimension" placeholder="AI素养维度" allow-clear style="width: 100%">
+              <a-select-option value="AI基础知识">AI基础知识</a-select-option>
+              <a-select-option value="AI技术应用">AI技术应用</a-select-option>
+              <a-select-option value="AI伦理安全">AI伦理安全</a-select-option>
+              <a-select-option value="AI批判思维">AI批判思维</a-select-option>
+              <a-select-option value="AI创新实践">AI创新实践</a-select-option>
+            </a-select>
+          </a-col>
+          <a-col :span="4">
+            <a-space>
+              <a-button type="primary" @click="fetchQuestions">查询</a-button>
+              <a-button @click="resetFilters">重置</a-button>
+            </a-space>
+          </a-col>
+        </a-row>
+      </a-card>
+
+      <!-- Batch Actions -->
+      <a-card v-if="selectedRowKeys.length > 0" :bordered="false" style="margin-bottom: 16px">
+        <div style="display: flex; justify-content: space-between; align-items: center">
+        <a-space>
+          <span>已选 {{ selectedRowKeys.length }} 项</span>
+          <a-button size="small" style="background: #1f4e79; color: #fff; border-color: #1f4e79" @click="batchApprove">批量通过</a-button>
+          <a-button size="small" style="background: #1f4e79; color: #fff; border-color: #1f4e79" @click="batchReject">批量拒绝</a-button>
+          <a-button size="small" style="background: #1f4e79; color: #fff; border-color: #1f4e79" @click="batchDelete">批量删除</a-button>
+          <a-button size="small" style="background: #1f4e79; color: #fff; border-color: #1f4e79" @click="batchSubmit">批量提交审核</a-button>
+        </a-space>
+        <a-button size="small" style="background: #1f4e79; color: #fff; border-color: #1f4e79" @click="exportSelectedMd">
+          <template #icon><UploadOutlined /></template>
+          导出题库
+        </a-button>
+        </div>
+      </a-card>
+
+      <!-- Questions Table -->
+      <a-card :bordered="false">
+        <a-table
+          :columns="columns"
+          :data-source="questions"
+          :loading="loading"
+          :pagination="pagination"
+          :row-selection="{ selectedRowKeys, onChange: onSelectChange }"
+          row-key="id"
+          @change="handleTableChange"
+          size="middle"
+        >
+          <template #bodyCell="{ column, record }">
+            <template v-if="column.key === 'stem'">
+              <a @click="showDetail(record)">{{ truncate(record.stem, 40) }}</a>
+            </template>
+            <template v-if="column.key === 'question_type'">
+              <a-tag :color="typeColor(record.question_type)">{{ typeLabel(record.question_type) }}</a-tag>
+            </template>
+            <template v-if="column.key === 'difficulty'">
+              <a-rate :value="record.difficulty" disabled :count="5" style="font-size: 12px" />
+            </template>
+            <template v-if="column.key === 'dimension'">
+              <a-tag v-if="record.dimension" :color="dimensionColor(record.dimension)">{{ record.dimension }}</a-tag>
+              <span v-else style="color: #ccc">未分类</span>
+            </template>
+            <template v-if="column.key === 'status'">
+              <a-tag :color="statusColor(record.status)">{{ statusLabel(record.status) }}</a-tag>
+            </template>
+            <template v-if="column.key === 'created_at'">
+              {{ formatDate(record.created_at) }}
+            </template>
+            <template v-if="column.key === 'actions'">
+              <a-space>
+                <a-button size="small" type="link" @click="showDetail(record)">详情</a-button>
+                <a-button
+                  v-if="record.status === 'draft'"
+                  size="small"
+                  type="link"
+                  @click="submitForReview(record.id)"
+                >提交审核</a-button>
+                <a-button
+                  v-if="record.status === 'draft' || record.status === 'pending_review'"
+                  size="small"
+                  type="link"
+                  style="color: #52c41a"
+                  @click="quickApprove(record.id)"
+                >通过</a-button>
+                <a-button
+                  v-if="record.status === 'draft'"
+                  size="small"
+                  type="link"
+                  @click="editQuestion(record)"
+                >编辑</a-button>
+                <a-popconfirm
+                  title="确认删除该题目？"
+                  @confirm="deleteQuestion(record.id)"
+                >
+                  <a-button size="small" type="link" danger>删除</a-button>
+                </a-popconfirm>
+              </a-space>
+            </template>
+          </template>
+        </a-table>
+      </a-card>
+    </template>
+
+    <!-- ========== Tab: 批量审核 ========== -->
+    <template v-if="activeTab === 'review'">
+      <!-- Review Stats Bar -->
+      <a-card :bordered="false" class="filter-card">
+        <a-row :gutter="16" align="middle">
+          <a-col :flex="'auto'">
+            <a-space :size="24">
+              <a-statistic title="待审核题目" :value="reviewPendingTotal" :value-style="{ color: '#1f4e79', fontSize: '24px' }" />
+              <a-divider type="vertical" style="height: 40px" />
+              <a-space>
+                <a-select v-model:value="reviewFilters.question_type" placeholder="筛选题型" allow-clear style="width: 140px" @change="fetchReviewQuestions">
+                  <a-select-option value="single_choice">单选题</a-select-option>
+                  <a-select-option value="multiple_choice">多选题</a-select-option>
+                  <a-select-option value="true_false">判断题</a-select-option>
+                  <a-select-option value="fill_blank">填空题</a-select-option>
+                  <a-select-option value="short_answer">简答题</a-select-option>
+                </a-select>
+                <a-select v-model:value="reviewFilters.dimension" placeholder="筛选维度" allow-clear style="width: 140px" @change="fetchReviewQuestions">
+                  <a-select-option value="AI基础知识">AI基础知识</a-select-option>
+                  <a-select-option value="AI技术应用">AI技术应用</a-select-option>
+                  <a-select-option value="AI伦理安全">AI伦理安全</a-select-option>
+                  <a-select-option value="AI批判思维">AI批判思维</a-select-option>
+                  <a-select-option value="AI创新实践">AI创新实践</a-select-option>
+                </a-select>
+              </a-space>
+            </a-space>
+          </a-col>
+          <a-col>
+            <a-space>
+              <a-button @click="fetchReviewQuestions" :loading="reviewLoading">
+                <template #icon><ReloadOutlined /></template>
+                刷新
+              </a-button>
+              <a-button
+                type="primary"
+                :disabled="reviewSelectedKeys.length === 0"
+                @click="reviewBatchApprove"
+                style="background: #52c41a; border-color: #52c41a"
+              >
+                <template #icon><CheckCircleOutlined /></template>
+                批量通过 {{ reviewSelectedKeys.length > 0 ? `(${reviewSelectedKeys.length})` : '' }}
+              </a-button>
+              <a-button
+                danger
+                :disabled="reviewSelectedKeys.length === 0"
+                @click="reviewBatchReject"
+              >
+                <template #icon><CloseCircleOutlined /></template>
+                批量拒绝 {{ reviewSelectedKeys.length > 0 ? `(${reviewSelectedKeys.length})` : '' }}
+              </a-button>
+            </a-space>
+          </a-col>
+        </a-row>
+      </a-card>
+
+      <!-- Review Table -->
+      <a-card :bordered="false">
+        <a-alert
+          v-if="reviewQuestions.length === 0 && !reviewLoading"
+          type="success"
+          message="暂无待审核题目"
+          description="所有题目均已审核完毕，可前往「全部题目」查看已通过的题目。"
+          show-icon
+          style="margin-bottom: 16px"
+        />
+        <a-table
+          v-else
+          :columns="reviewColumns"
+          :data-source="filteredReviewQuestions"
+          :loading="reviewLoading"
+          :pagination="reviewPagination"
+          :row-selection="{ selectedRowKeys: reviewSelectedKeys, onChange: onReviewSelectChange }"
+          row-key="id"
+          @change="handleReviewTableChange"
+          size="middle"
+        >
+          <template #bodyCell="{ column, record }">
+            <template v-if="column.key === 'stem'">
+              <a @click="showDetail(record)">{{ truncate(record.stem, 50) }}</a>
+            </template>
+            <template v-if="column.key === 'question_type'">
+              <a-tag :color="typeColor(record.question_type)">{{ typeLabel(record.question_type) }}</a-tag>
+            </template>
+            <template v-if="column.key === 'difficulty'">
+              <a-rate :value="record.difficulty" disabled :count="5" style="font-size: 12px" />
+            </template>
+            <template v-if="column.key === 'dimension'">
+              <a-tag v-if="record.dimension" :color="dimensionColor(record.dimension)">{{ record.dimension }}</a-tag>
+              <span v-else style="color: #ccc">未分类</span>
+            </template>
+            <template v-if="column.key === 'bloom_level'">
+              <a-tag v-if="record.bloom_level" color="geekblue">{{ bloomLabel(record.bloom_level) }}</a-tag>
+              <span v-else style="color: #ccc">-</span>
+            </template>
+            <template v-if="column.key === 'created_at'">
+              {{ formatDate(record.created_at) }}
+            </template>
+            <template v-if="column.key === 'review_actions'">
+              <a-space>
+                <a-button size="small" type="link" @click="showDetail(record)">
+                  <template #icon><EyeOutlined /></template>
+                  查看
+                </a-button>
+                <a-button size="small" type="link" @click="runAICheck(record.id)" :loading="aiCheckLoading && detailQuestion?.id === record.id">
+                  <template #icon><RobotOutlined /></template>
+                  AI检查
+                </a-button>
+                <a-button size="small" type="link" style="color: #52c41a" @click="quickReviewApprove(record.id)">
+                  <template #icon><CheckOutlined /></template>
+                  通过
+                </a-button>
+                <a-button size="small" type="link" danger @click="reviewAction(record.id, 'reject')">
+                  <template #icon><CloseOutlined /></template>
+                  拒绝
+                </a-button>
+              </a-space>
+            </template>
+          </template>
+        </a-table>
+      </a-card>
+    </template>
 
     <!-- Create/Edit Modal -->
     <a-modal
@@ -522,11 +659,16 @@ import {
   PlusOutlined,
   SearchOutlined,
   CheckOutlined,
+  CheckCircleOutlined,
+  CloseOutlined,
+  CloseCircleOutlined,
   RobotOutlined,
   ThunderboltOutlined,
-  DeleteOutlined,
   DownloadOutlined,
   UploadOutlined,
+  AuditOutlined,
+  ReloadOutlined,
+  EyeOutlined,
 } from '@ant-design/icons-vue'
 import { message, Modal } from 'ant-design-vue'
 import request from '@/utils/request'
@@ -547,6 +689,26 @@ const reviewHistory = ref<any[]>([])
 const reviewModalAction = ref('')
 const reviewModalQuestionId = ref('')
 const reviewComment = ref('')
+
+// ---- Tab & Review State ----
+const activeTab = ref('all')
+const reviewLoading = ref(false)
+const reviewQuestions = ref<any[]>([])
+const reviewSelectedKeys = ref<string[]>([])
+const reviewPendingTotal = ref(0)
+
+const reviewFilters = reactive({
+  question_type: undefined as string | undefined,
+  dimension: undefined as string | undefined,
+})
+
+const reviewPagination = reactive({
+  current: 1,
+  pageSize: 20,
+  total: 0,
+  showSizeChanger: true,
+  showTotal: (total: number) => `共 ${total} 条待审核`,
+})
 
 const filters = reactive({
   keyword: '',
@@ -590,6 +752,29 @@ const columns = [
   { title: '创建时间', key: 'created_at', dataIndex: 'created_at', width: 120 },
   { title: '操作', key: 'actions', width: 200, fixed: 'right' as const },
 ]
+
+// ---- Review Tab Columns ----
+const reviewColumns = [
+  { title: '题干', key: 'stem', dataIndex: 'stem', ellipsis: true, width: 300 },
+  { title: '题型', key: 'question_type', dataIndex: 'question_type', width: 90 },
+  { title: '难度', key: 'difficulty', dataIndex: 'difficulty', width: 140 },
+  { title: '维度', key: 'dimension', dataIndex: 'dimension', width: 120, ellipsis: true },
+  { title: '认知层次', key: 'bloom_level', dataIndex: 'bloom_level', width: 90 },
+  { title: '创建时间', key: 'created_at', dataIndex: 'created_at', width: 110 },
+  { title: '操作', key: 'review_actions', width: 260, fixed: 'right' as const },
+]
+
+// Computed: client-side filter for review tab (type & dimension)
+const filteredReviewQuestions = computed(() => {
+  let list = reviewQuestions.value
+  if (reviewFilters.question_type) {
+    list = list.filter(q => q.question_type === reviewFilters.question_type)
+  }
+  if (reviewFilters.dimension) {
+    list = list.filter(q => q.dimension === reviewFilters.dimension)
+  }
+  return list
+})
 
 // ---- Label Maps ----
 const typeMap: Record<string, string> = {
@@ -786,13 +971,34 @@ function reviewAction(id: string, action: string) {
 
 async function confirmReview() {
   try {
+    // Handle batch reject from review tab
+    if (reviewModalQuestionId.value === '__batch_review__') {
+      await request.post('/questions/batch/review', {
+        question_ids: reviewSelectedKeys.value,
+        action: 'reject',
+        comment: reviewComment.value || '批量拒绝',
+      })
+      message.success(`已批量拒绝 ${reviewSelectedKeys.value.length} 道题目`)
+      reviewSelectedKeys.value = []
+      reviewModalVisible.value = false
+      await fetchReviewQuestions()
+      return
+    }
+
     const resp: any = await request.post(`/questions/${reviewModalQuestionId.value}/review`, {
       action: reviewModalAction.value,
       comment: reviewComment.value || undefined,
     })
     message.success(reviewModalAction.value === 'approve' ? '审核通过' : '已拒绝')
     reviewModalVisible.value = false
-    fetchQuestions()
+
+    // Refresh the appropriate tab
+    if (activeTab.value === 'review') {
+      await fetchReviewQuestions()
+    } else {
+      fetchQuestions()
+    }
+
     if (detailQuestion.value?.id === reviewModalQuestionId.value) {
       detailQuestion.value.status = resp.status
       detailQuestion.value.review_comment = resp.review_comment
@@ -839,6 +1045,95 @@ async function runAICheck(id: string) {
   } finally {
     aiCheckLoading.value = false
   }
+}
+
+// ---- Review Tab Functions ----
+async function fetchReviewQuestions() {
+  reviewLoading.value = true
+  try {
+    const params: any = {
+      skip: (reviewPagination.current - 1) * reviewPagination.pageSize,
+      limit: reviewPagination.pageSize,
+    }
+    const data: any = await request.get('/questions/review/pending', { params })
+    reviewQuestions.value = data.items || []
+    reviewPagination.total = data.total || 0
+    reviewPendingTotal.value = data.total || 0
+  } catch (e) {
+    message.error('加载待审核题目失败')
+  } finally {
+    reviewLoading.value = false
+  }
+}
+
+async function fetchReviewCount() {
+  try {
+    const data: any = await request.get('/questions/review/pending', { params: { skip: 0, limit: 1 } })
+    reviewPendingTotal.value = data.total || 0
+  } catch {
+    // silent fail
+  }
+}
+
+function onTabChange(key: string) {
+  if (key === 'review') {
+    reviewSelectedKeys.value = []
+    reviewPagination.current = 1
+    fetchReviewQuestions()
+  } else {
+    fetchQuestions()
+  }
+}
+
+function onReviewSelectChange(keys: string[]) {
+  reviewSelectedKeys.value = keys
+}
+
+function handleReviewTableChange(pag: any) {
+  reviewPagination.current = pag.current
+  reviewPagination.pageSize = pag.pageSize
+  fetchReviewQuestions()
+}
+
+async function quickReviewApprove(id: string) {
+  try {
+    await request.post(`/questions/${id}/review`, { action: 'approve' })
+    message.success('已通过')
+    // Remove from local list for immediate feedback
+    reviewQuestions.value = reviewQuestions.value.filter(q => q.id !== id)
+    reviewPendingTotal.value = Math.max(0, reviewPendingTotal.value - 1)
+    reviewPagination.total = Math.max(0, reviewPagination.total - 1)
+    // If list becomes empty and there are more pages, fetch next page
+    if (reviewQuestions.value.length === 0 && reviewPagination.total > 0) {
+      if (reviewPagination.current > 1) reviewPagination.current -= 1
+      fetchReviewQuestions()
+    }
+  } catch (e) {
+    message.error('操作失败')
+  }
+}
+
+async function reviewBatchApprove() {
+  if (reviewSelectedKeys.value.length === 0) return
+  try {
+    await request.post('/questions/batch/review', {
+      question_ids: reviewSelectedKeys.value,
+      action: 'approve',
+    })
+    message.success(`已批量通过 ${reviewSelectedKeys.value.length} 道题目`)
+    reviewSelectedKeys.value = []
+    await fetchReviewQuestions()
+  } catch (e) {
+    message.error('批量通过失败')
+  }
+}
+
+async function reviewBatchReject() {
+  if (reviewSelectedKeys.value.length === 0) return
+  reviewModalAction.value = 'reject'
+  reviewModalQuestionId.value = '__batch_review__'
+  reviewComment.value = ''
+  reviewModalVisible.value = true
 }
 
 // ---- Batch Operations ----
@@ -1243,6 +1538,7 @@ async function handleBankBuild() {
 // ---- Init ----
 onMounted(() => {
   fetchQuestions()
+  fetchReviewCount()
 })
 </script>
 
@@ -1262,5 +1558,19 @@ onMounted(() => {
 }
 .filter-card {
   margin-bottom: 16px;
+}
+.main-tabs {
+  margin-bottom: 16px;
+}
+.main-tabs :deep(.ant-tabs-tab) {
+  font-size: 15px;
+  padding: 8px 16px;
+}
+.main-tabs :deep(.ant-tabs-ink-bar) {
+  background: #1f4e79;
+}
+.main-tabs :deep(.ant-tabs-tab-active .ant-tabs-tab-btn) {
+  color: #1f4e79;
+  font-weight: 600;
 }
 </style>
