@@ -1,5 +1,7 @@
 from fastapi import APIRouter
 
+from app.core.config import settings
+
 router = APIRouter()
 
 
@@ -9,6 +11,7 @@ async def health_check():
         "status": "healthy",
         "service": "AI素养评测平台",
         "version": "0.1.0",
+        "llm_model": settings.LLM_MODEL,
     }
 
 

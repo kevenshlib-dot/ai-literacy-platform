@@ -28,7 +28,11 @@ from app.schemas.question import (
     QuestionBankBuildRequest,
     QuestionBankSuggestResponse,
     FreeGenerateRequest,
+    PreviewQuestionItem,
+    PreviewResponse,
+    BatchCreateFromRawRequest,
 )
+from app.core.config import settings
 from app.services import question_service
 from app.services.question_io_service import export_questions_to_md, parse_md_to_questions
 
@@ -323,7 +327,7 @@ async def build_question_bank(
 ):
     """Build question bank from a material with specific type distribution."""
     try:
-        questions = await question_service.build_question_bank_from_material(
+        result = await question_service.build_question_bank_from_material(
             db=db,
             material_id=material_id,
             type_distribution=body.type_distribution,
@@ -336,9 +340,13 @@ async def build_question_bank(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     await db.commit()
+    questions = result.get("questions", result) if isinstance(result, dict) else result
+    stats = result.get("stats") if isinstance(result, dict) else None
     return GenerateResponse(
         generated=len(questions),
         questions=[_to_response(q) for q in questions],
+        stats=stats,
+        model_name=settings.LLM_MODEL,
     )
 
 
@@ -364,7 +372,7 @@ async def generate_free(
 ):
     """Generate questions without material, using LLM's own knowledge."""
     try:
-        questions = await question_service.generate_questions_free(
+        result = await question_service.generate_questions_free(
             db=db,
             type_distribution=body.type_distribution,
             difficulty=body.difficulty,
@@ -374,6 +382,87 @@ async def generate_free(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    await db.commit()
+    questions = result.get("questions", result) if isinstance(result, dict) else result
+    stats = result.get("stats") if isinstance(result, dict) else None
+    return GenerateResponse(
+        generated=len(questions),
+        questions=[_to_response(q) for q in questions],
+        stats=stats,
+        model_name=settings.LLM_MODEL,
+    )
+
+
+@router.post("/preview/bank/{material_id}", response_model=PreviewResponse)
+async def preview_question_bank(
+    material_id: UUID,
+    body: QuestionBankBuildRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    """Generate question bank preview WITHOUT saving to DB.
+    Returns raw question items for user review before committing."""
+    try:
+        result = await question_service.preview_question_bank_from_material(
+            db=db,
+            material_id=material_id,
+            type_distribution=body.type_distribution,
+            difficulty=body.difficulty,
+            bloom_level=body.bloom_level,
+            max_units=body.max_units,
+            custom_prompt=body.custom_prompt,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    preview_items = result.get("questions", [])
+    stats = result.get("stats")
+    return PreviewResponse(
+        questions=[PreviewQuestionItem(**item) for item in preview_items],
+        total=len(preview_items),
+        stats=stats,
+        model_name=settings.LLM_MODEL,
+    )
+
+
+@router.post("/preview/free", response_model=PreviewResponse)
+async def preview_free(
+    body: FreeGenerateRequest,
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    """Generate preview questions without material (no DB save)."""
+    try:
+        result = question_service.preview_questions_free(
+            type_distribution=body.type_distribution,
+            difficulty=body.difficulty,
+            bloom_level=body.bloom_level,
+            custom_prompt=body.custom_prompt,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    preview_items = result.get("questions", [])
+    stats = result.get("stats")
+    return PreviewResponse(
+        questions=[PreviewQuestionItem(**item) for item in preview_items],
+        total=len(preview_items),
+        stats=stats,
+        model_name=settings.LLM_MODEL,
+    )
+
+
+@router.post("/batch/create-raw", response_model=GenerateResponse)
+async def batch_create_from_raw(
+    body: BatchCreateFromRawRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    """Batch save previewed questions to DB. Called after user review/edit."""
+    questions = await question_service.batch_create_from_raw(
+        db=db,
+        raw_questions=[q.model_dump() for q in body.questions],
+        created_by=current_user.id,
+    )
     await db.commit()
     return GenerateResponse(
         generated=len(questions),

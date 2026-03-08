@@ -689,14 +689,18 @@ def generate_questions_via_llm(
     difficulty: int = 3,
     bloom_level: Optional[str] = None,
     custom_prompt: Optional[str] = None,
-) -> list[dict]:
+) -> dict:
     """Generate questions using LLM API.
 
-    Returns list of validated question dicts. Falls back to templates on failure.
+    Returns dict with 'questions' (list of validated question dicts) and
+    'usage' (token usage dict with prompt_tokens, completion_tokens, total_tokens).
+    Falls back to templates on failure.
     """
+    _empty_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
     if settings.LLM_API_KEY == "your-api-key":
         logger.warning("LLM API key not configured, using template fallback")
-        return _template_fallback(content, question_types, count, difficulty, bloom_level)
+        return {"questions": _template_fallback(content, question_types, count, difficulty, bloom_level), "usage": _empty_usage}
 
     try:
         client = OpenAI(
@@ -725,6 +729,15 @@ def generate_questions_via_llm(
             },
         )
 
+        # Capture token usage
+        usage = _empty_usage
+        if response.usage:
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens or 0,
+                "completion_tokens": response.usage.completion_tokens or 0,
+                "total_tokens": response.usage.total_tokens or 0,
+            }
+
         raw = response.choices[0].message.content.strip()
 
         # Strip Qwen3.5 thinking chain (<think>...</think>) if present
@@ -749,16 +762,16 @@ def generate_questions_via_llm(
 
         if not validated:
             logger.warning("LLM output passed 0 validation, falling back to template")
-            return _template_fallback(content, question_types, count, difficulty, bloom_level)
+            return {"questions": _template_fallback(content, question_types, count, difficulty, bloom_level), "usage": usage}
 
-        return validated[:count]
+        return {"questions": validated[:count], "usage": usage}
 
     except json.JSONDecodeError as e:
         logger.error(f"LLM output is not valid JSON: {e}\nRaw output (first 500 chars): {raw[:500] if raw else 'EMPTY'}")
-        return _template_fallback(content, question_types, count, difficulty, bloom_level)
+        return {"questions": _template_fallback(content, question_types, count, difficulty, bloom_level), "usage": _empty_usage}
     except Exception as e:
         logger.error(f"LLM question generation failed: {e}")
-        return _template_fallback(content, question_types, count, difficulty, bloom_level)
+        return {"questions": _template_fallback(content, question_types, count, difficulty, bloom_level), "usage": _empty_usage}
 
 
 # ── 模板降级（无 LLM 时使用） ────────────────────────────────────────
