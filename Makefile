@@ -1,4 +1,4 @@
-.PHONY: help dev up down build test lint migrate
+.PHONY: help dev up down build test lint migrate webui-up webui-down webui-logs
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -32,3 +32,12 @@ logs: ## View application logs
 
 ps: ## Show running containers
 	docker-compose ps
+
+webui-up: ## Start Open WebUI (LLM Chat interface on port 3100)
+	docker compose -f docker-compose.webui.yml up -d
+
+webui-down: ## Stop Open WebUI
+	docker compose -f docker-compose.webui.yml down
+
+webui-logs: ## View Open WebUI logs
+	docker compose -f docker-compose.webui.yml logs -f

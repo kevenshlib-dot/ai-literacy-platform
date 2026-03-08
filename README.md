@@ -85,6 +85,7 @@
 │   │   └── Scores.vue          # 成绩管理
 │   └── Dockerfile              # 前端构建 (Nginx)
 ├── docker-compose.yml          # Docker 编排
+├── docker-compose.webui.yml    # Open WebUI（LLM Chat 调试界面）
 ├── Dockerfile                  # 后端构建
 ├── nginx.conf                  # Nginx 反向代理配置
 ├── requirements.txt            # Python 依赖
@@ -170,6 +171,16 @@ LLM_MODEL=deepseek-chat
 ```
 
 > LLM 不可用时，题目生成自动降级为模板生成，其他功能不受影响。
+
+## Open WebUI（可选）
+
+提供 LLM Chat 界面，方便直接与大模型对话调试，独立于主平台：
+
+```bash
+make webui-up     # 启动，访问 http://<服务器IP>:3100
+make webui-down   # 停止
+make webui-logs   # 查看日志
+```
 
 ## API 文档
 

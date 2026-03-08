@@ -1,0 +1,25 @@
+# Open WebUI - 大模型 Chat & 管理界面
+# 独立于 AI Literacy Platform，不影响主平台服务
+#
+# 启动：docker compose -f docker-compose.webui.yml up -d
+# 停止：docker compose -f docker-compose.webui.yml down
+# 清理：docker compose -f docker-compose.webui.yml down -v
+#
+# 访问：http://<服务器IP>:3100
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: ai-literacy-open-webui
+    network_mode: host
+    volumes:
+      - open-webui-data:/app/backend/data
+    environment:
+      - PORT=3100
+      - OPENAI_API_BASE_URL=http://localhost:8100/v1
+      - OPENAI_API_KEY=token-not-needed
+      - WEBUI_AUTH=false
+    restart: unless-stopped
+
+volumes:
+  open-webui-data:
