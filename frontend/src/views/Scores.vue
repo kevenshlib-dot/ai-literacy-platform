@@ -179,7 +179,7 @@
             </div>
           </div>
         </template>
-        <template #customFilterIcon="{ column, filtered }">
+        <template #customFilterIcon="{ filtered }">
           <SearchOutlined :style="{ color: filtered ? '#1890ff' : undefined }" />
         </template>
         <template #bodyCell="{ column, record }">
@@ -410,7 +410,7 @@
         <div v-for="(item, idx) in (reviewData?.wrong_items || [])" :key="idx"
              style="margin-bottom: 24px; border-bottom: 1px solid #f0f0f0; padding-bottom: 16px">
           <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px">
-            <span style="font-weight: 600; font-size: 15px">第 {{ idx + 1 }} 题</span>
+            <span style="font-weight: 600; font-size: 15px">第 {{ (idx as number) + 1 }} 题</span>
             <a-tag>{{ typeLabel(item.question_type) }}</a-tag>
             <a-tag v-if="item.dimension" color="blue">{{ item.dimension }}</a-tag>
             <a-tag color="red">{{ item.earned_score }}/{{ item.max_score }}分</a-tag>
@@ -604,7 +604,7 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, nextTick, watch } from 'vue'
-import { LeftOutlined, DownloadOutlined, SafetyCertificateOutlined, ThunderboltOutlined, SearchOutlined, ExportOutlined, FilterOutlined, DatabaseOutlined, DeleteOutlined } from '@ant-design/icons-vue'
+import { LeftOutlined, DownloadOutlined, SafetyCertificateOutlined, ThunderboltOutlined, SearchOutlined, ExportOutlined, DatabaseOutlined } from '@ant-design/icons-vue'
 import { useRouter } from 'vue-router'
 import { message, Empty } from 'ant-design-vue'
 import * as echarts from 'echarts/core'
