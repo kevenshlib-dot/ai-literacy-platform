@@ -15,6 +15,15 @@ from app.agents.review_agent import ai_review_question
 logger = logging.getLogger(__name__)
 
 
+def _coerce_uuid(value: Optional[uuid.UUID | str]) -> Optional[uuid.UUID]:
+    """Accept UUID objects or strings from preview payloads."""
+    if value is None:
+        return None
+    if isinstance(value, uuid.UUID):
+        return value
+    return uuid.UUID(value)
+
+
 async def create_question(
     db: AsyncSession,
     question_type: str,
@@ -831,8 +840,8 @@ async def batch_create_from_raw(
                 dimension=raw.get("dimension"),
                 knowledge_tags=raw.get("knowledge_tags"),
                 bloom_level=raw.get("bloom_level"),
-                source_material_id=uuid.UUID(raw["source_material_id"]) if raw.get("source_material_id") else None,
-                source_knowledge_unit_id=uuid.UUID(raw["source_knowledge_unit_id"]) if raw.get("source_knowledge_unit_id") else None,
+                source_material_id=_coerce_uuid(raw.get("source_material_id")),
+                source_knowledge_unit_id=_coerce_uuid(raw.get("source_knowledge_unit_id")),
                 created_by=created_by,
             )
             questions.append(q)

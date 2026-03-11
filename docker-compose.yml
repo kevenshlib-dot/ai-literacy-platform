@@ -29,8 +29,7 @@ services:
       - MINIO_HOST=localhost
       - RABBITMQ_HOST=localhost
       - REDIS_HOST=localhost
-      # vLLM 运行在宿主机上，直接通过 localhost 访问
-      - LLM_BASE_URL=http://localhost:8100/v1
+      # LLM 相关配置从 .env.production 读取，避免覆盖不同环境下的地址
     depends_on:
       postgres:
         condition: service_healthy

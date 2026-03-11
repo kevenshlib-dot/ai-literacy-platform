@@ -464,6 +464,44 @@ async def test_batch_generate_from_material():
 
 
 @pytest.mark.asyncio
+async def test_batch_create_from_raw_accepts_uuid_source_fields():
+    """Preview save should accept UUID objects produced by Pydantic."""
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        mid, ku_id = await upload_and_parse_material(client, token)
+
+        resp = await client.post(
+            "/api/v1/questions/batch/create-raw",
+            json={
+                "questions": [
+                    {
+                        "question_type": "single_choice",
+                        "stem": "保存预览题目",
+                        "options": {"A": "人工智能", "B": "区块链"},
+                        "correct_answer": "A",
+                        "explanation": "测试保存预览题目",
+                        "difficulty": 3,
+                        "dimension": "AI基础认知",
+                        "knowledge_tags": ["AI基础"],
+                        "bloom_level": "understand",
+                        "source_material_id": mid,
+                        "source_knowledge_unit_id": ku_id,
+                    }
+                ]
+            },
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["generated"] == 1
+    assert data["questions"][0]["source_material_id"] == mid
+    assert data["questions"][0]["source_knowledge_unit_id"] == ku_id
+
+
+@pytest.mark.asyncio
 async def test_generate_invalid_knowledge_unit():
     async with get_client() as client:
         token = await register_user(client, "organizer")
