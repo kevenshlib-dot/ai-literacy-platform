@@ -78,6 +78,14 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = "token-not-needed"
     LLM_BASE_URL: str = "http://localhost:8100/v1"
     LLM_MODEL: str = "Qwen/Qwen3.5-35B-A3B"
+    GEMINI_API_KEY: str = ""
+    GEMINI_BASE_URL: str = ""
+    DASHSCOPE_API_KEY: str = ""
+    DASHSCOPE_BASE_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    VOLCES_API_KEY: str = ""
+    VOLCES_BASE_URL: str = "https://ark.cn-beijing.volces.com/api/v3"
+    LOCAL_QWEN_API_KEY: str = "token-not-needed"
+    LOCAL_QWEN_BASE_URL: str = "http://100.64.0.6:8100/v1"
 
     # JWT
     JWT_SECRET_KEY: str = "change-this"

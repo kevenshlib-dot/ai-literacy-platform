@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.question import Question, QuestionType, QuestionStatus, BloomLevel, ReviewRecord
 from app.models.material import Material, KnowledgeUnit
 from app.agents.question_agent import generate_questions_via_llm, classify_dimension
+from app.agents.model_registry import ModelConfig
 from app.agents.review_agent import ai_review_question
 
 logger = logging.getLogger(__name__)
@@ -309,6 +310,8 @@ async def generate_from_knowledge_unit(
     bloom_level: Optional[str] = None,
     created_by: Optional[uuid.UUID] = None,
     custom_prompt: Optional[str] = None,
+    model_config: Optional[ModelConfig] = None,
+    prompt_seed: Optional[int] = None,
 ) -> list[Question]:
     """Generate questions from a knowledge unit using LLM."""
     # Fetch KU
@@ -327,6 +330,8 @@ async def generate_from_knowledge_unit(
         difficulty=difficulty,
         bloom_level=bloom_level,
         custom_prompt=custom_prompt,
+        model_config=model_config,
+        prompt_seed=prompt_seed,
     )
     raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
     usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
@@ -443,6 +448,8 @@ async def build_question_bank_from_material(
     max_units: int = 10,
     created_by: Optional[uuid.UUID] = None,
     custom_prompt: Optional[str] = None,
+    model_config: Optional[ModelConfig] = None,
+    prompt_seed: Optional[int] = None,
 ) -> list[Question]:
     """Build question bank from a material with specific type distribution.
 
@@ -477,6 +484,8 @@ async def build_question_bank_from_material(
     num_units = len(units)
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     type_counts: dict[str, int] = {}
+    errors: list[str] = []
+    fallback_count = 0
     start_time = time.time()
 
     for qtype, total_count in type_distribution.items():
@@ -499,6 +508,8 @@ async def build_question_bank_from_material(
                 bloom_level=bloom_level,
                 created_by=created_by,
                 custom_prompt=custom_prompt,
+                model_config=model_config,
+                prompt_seed=prompt_seed,
             )
             questions = result.get("questions", result) if isinstance(result, dict) else result
             usage = result.get("usage", {}) if isinstance(result, dict) else {}
@@ -582,6 +593,8 @@ async def generate_questions_free(
     bloom_level: Optional[str] = None,
     custom_prompt: Optional[str] = None,
     created_by: Optional[uuid.UUID] = None,
+    model_config: Optional[ModelConfig] = None,
+    prompt_seed: Optional[int] = None,
 ) -> list[Question]:
     """Generate questions without material, using LLM's own knowledge."""
     all_questions: list[Question] = []
@@ -599,6 +612,8 @@ async def generate_questions_free(
             difficulty=difficulty,
             bloom_level=bloom_level,
             custom_prompt=custom_prompt,
+            model_config=model_config,
+            prompt_seed=prompt_seed,
         )
         raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
         usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
@@ -659,6 +674,8 @@ async def preview_question_bank_from_material(
     bloom_level: Optional[str] = None,
     max_units: int = 10,
     custom_prompt: Optional[str] = None,
+    model_config: Optional[ModelConfig] = None,
+    prompt_seed: Optional[int] = None,
 ) -> dict:
     """Preview question bank generation WITHOUT saving to DB.
 
@@ -691,6 +708,8 @@ async def preview_question_bank_from_material(
     num_units = len(units)
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     type_counts: dict[str, int] = {}
+    errors: list[str] = []
+    fallback_count = 0
     start_time = time.time()
 
     for qtype, total_count in type_distribution.items():
@@ -712,9 +731,15 @@ async def preview_question_bank_from_material(
                 difficulty=difficulty,
                 bloom_level=bloom_level,
                 custom_prompt=custom_prompt,
+                model_config=model_config,
+                prompt_seed=prompt_seed,
             )
             raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
             usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
+            if isinstance(llm_result, dict) and llm_result.get("fallback_used"):
+                fallback_count += 1
+                if llm_result.get("error"):
+                    errors.append(str(llm_result["error"]))
             for k in total_usage:
                 total_usage[k] += usage.get(k, 0)
 
@@ -747,7 +772,13 @@ async def preview_question_bank_from_material(
         type_counts[qtype] = type_generated
 
     duration = round(time.time() - start_time, 2)
-    stats = {**total_usage, "duration_seconds": duration, "type_counts": type_counts}
+    stats = {
+        **total_usage,
+        "duration_seconds": duration,
+        "type_counts": type_counts,
+        "fallback_count": fallback_count,
+        "errors": errors,
+    }
     return {"questions": all_preview, "stats": stats}
 
 
@@ -756,11 +787,15 @@ def preview_questions_free(
     difficulty: int = 3,
     bloom_level: Optional[str] = None,
     custom_prompt: Optional[str] = None,
+    model_config: Optional[ModelConfig] = None,
+    prompt_seed: Optional[int] = None,
 ) -> dict:
     """Preview question generation without material. No DB involvement."""
     all_preview: list[dict] = []
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     type_counts: dict[str, int] = {}
+    errors: list[str] = []
+    fallback_count = 0
     start_time = time.time()
 
     for qtype, count in type_distribution.items():
@@ -773,9 +808,15 @@ def preview_questions_free(
             difficulty=difficulty,
             bloom_level=bloom_level,
             custom_prompt=custom_prompt,
+            model_config=model_config,
+            prompt_seed=prompt_seed,
         )
         raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
         usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
+        if isinstance(llm_result, dict) and llm_result.get("fallback_used"):
+            fallback_count += 1
+            if llm_result.get("error"):
+                errors.append(str(llm_result["error"]))
         for k in total_usage:
             total_usage[k] += usage.get(k, 0)
 
@@ -809,7 +850,13 @@ def preview_questions_free(
         type_counts[qtype] = type_generated
 
     duration = round(time.time() - start_time, 2)
-    stats = {**total_usage, "duration_seconds": duration, "type_counts": type_counts}
+    stats = {
+        **total_usage,
+        "duration_seconds": duration,
+        "type_counts": type_counts,
+        "fallback_count": fallback_count,
+        "errors": errors,
+    }
     return {"questions": all_preview, "stats": stats}
 
 

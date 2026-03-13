@@ -1,4 +1,5 @@
 """Question generation agent - uses LLM to generate questions from knowledge units."""
+import hashlib
 import json
 import logging
 import random
@@ -10,6 +11,12 @@ from httpx import Timeout
 
 from app.core.config import settings
 from app.agents.llm_utils import strip_thinking_tags
+from app.agents.model_registry import (
+    ModelConfig,
+    get_default_model_config,
+    resolve_api_key,
+    resolve_base_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -370,8 +377,31 @@ def _build_user_prompt(
     difficulty: int,
     bloom_level: Optional[str] = None,
     custom_prompt: Optional[str] = None,
+    prompt_seed: Optional[int] = None,
 ) -> str:
     """Build user prompt for question generation with diversity and quality instructions."""
+    if prompt_seed is None:
+        rng = random
+    else:
+        seed_material = json.dumps(
+            {
+                "prompt_seed": prompt_seed,
+                "content": content,
+                "question_types": question_types,
+                "count": count,
+                "difficulty": difficulty,
+                "bloom_level": bloom_level,
+                "custom_prompt": custom_prompt,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        derived_seed = int(
+            hashlib.sha256(seed_material.encode("utf-8")).hexdigest()[:16],
+            16,
+        )
+        rng = random.Random(derived_seed)
+
     # ── 题型说明 ──
     type_parts = []
     for t in question_types:
@@ -402,7 +432,7 @@ def _build_user_prompt(
 
     # ── 随机选择题目风格要求（多样性机制） ──
     num_styles = min(count, 4)
-    selected_styles = random.sample(QUESTION_STEM_STYLES, min(num_styles, len(QUESTION_STEM_STYLES)))
+    selected_styles = rng.sample(QUESTION_STEM_STYLES, min(num_styles, len(QUESTION_STEM_STYLES)))
     style_instructions = []
     for i, style in enumerate(selected_styles, 1):
         style_instructions.append(
@@ -412,7 +442,7 @@ def _build_user_prompt(
 
     # ── 随机选择情境上下文 ──
     num_contexts = min(3, count)
-    selected_contexts = random.sample(SCENARIO_CONTEXTS, min(num_contexts, len(SCENARIO_CONTEXTS)))
+    selected_contexts = rng.sample(SCENARIO_CONTEXTS, min(num_contexts, len(SCENARIO_CONTEXTS)))
     context_section = "、".join(selected_contexts)
 
     # ── 额外要求 ──
@@ -437,14 +467,14 @@ def _build_user_prompt(
     else:
         # 随机选取主题子集，增加直接出题的多样性
         num_topics = min(3, len(DIRECT_GENERATION_TOPICS))
-        selected_topics = random.sample(DIRECT_GENERATION_TOPICS, num_topics)
+        selected_topics = rng.sample(DIRECT_GENERATION_TOPICS, num_topics)
         topic_lines = []
         for t in selected_topics:
             topic_lines.append(f"  - {t['theme']}：{t['keywords']}")
         topic_section = "\n".join(topic_lines)
 
         # 随机选取语气风格
-        voice_style = random.choice(QUESTION_VOICE_STYLES)
+        voice_style = rng.choice(QUESTION_VOICE_STYLES)
 
         content_section = f"""
 
@@ -464,7 +494,7 @@ def _build_user_prompt(
 请尽量让每道题采用不同的表达方式和切入角度，避免题干开头和句式雷同。"""
 
     # ── 随机选取出题视角 ──
-    voice_style = random.choice(QUESTION_VOICE_STYLES)
+    voice_style = rng.choice(QUESTION_VOICE_STYLES)
 
     # ── 组合多样性要求 ──
     diversity_rules = f"""
@@ -689,6 +719,8 @@ def generate_questions_via_llm(
     difficulty: int = 3,
     bloom_level: Optional[str] = None,
     custom_prompt: Optional[str] = None,
+    model_config: Optional[ModelConfig] = None,
+    prompt_seed: Optional[int] = None,
 ) -> dict:
     """Generate questions using LLM API.
 
@@ -697,48 +729,44 @@ def generate_questions_via_llm(
     Falls back to templates on failure.
     """
     _empty_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    runtime_model = model_config or get_default_model_config()
+    api_key = resolve_api_key(runtime_model)
 
-    if settings.LLM_API_KEY == "your-api-key":
+    if not api_key or api_key == "your-api-key":
         logger.warning("LLM API key not configured, using template fallback")
-        return {"questions": _template_fallback(content, question_types, count, difficulty, bloom_level), "usage": _empty_usage}
-
-    try:
-        client = OpenAI(
-            api_key=settings.LLM_API_KEY,
-            base_url=settings.LLM_BASE_URL,
-            timeout=Timeout(300.0, connect=10.0),  # 5 分钟超时，Qwen3.5 思考链较长
+        return _build_fallback_generation_result(
+            content,
+            question_types,
+            count,
+            difficulty,
+            bloom_level,
+            _empty_usage,
+            runtime_model,
+            "LLM API key not configured",
         )
 
+    try:
         user_prompt = _build_user_prompt(
-            content, question_types, count, difficulty, bloom_level, custom_prompt
+            content,
+            question_types,
+            count,
+            difficulty,
+            bloom_level,
+            custom_prompt,
+            prompt_seed=prompt_seed,
         )
 
         # 根据题目数量动态调整 max_tokens，每题预留约 600 tokens
         max_tokens = max(4096, count * 600)
-
-        response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.85,  # 稍高温度增加多样性
-            max_tokens=max_tokens,
-            extra_body={
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
+        response_data = _request_question_generation(
+            runtime_model,
+            api_key,
+            user_prompt,
+            max_tokens,
+            _empty_usage,
         )
-
-        # Capture token usage
-        usage = _empty_usage
-        if response.usage:
-            usage = {
-                "prompt_tokens": response.usage.prompt_tokens or 0,
-                "completion_tokens": response.usage.completion_tokens or 0,
-                "total_tokens": response.usage.total_tokens or 0,
-            }
-
-        raw = response.choices[0].message.content.strip()
+        usage = response_data["usage"]
+        raw = response_data["content"]
 
         # Strip Qwen3.5 thinking chain (<think>...</think>) if present
         raw = strip_thinking_tags(raw)
@@ -762,16 +790,133 @@ def generate_questions_via_llm(
 
         if not validated:
             logger.warning("LLM output passed 0 validation, falling back to template")
-            return {"questions": _template_fallback(content, question_types, count, difficulty, bloom_level), "usage": usage}
+            return _build_fallback_generation_result(
+                content,
+                question_types,
+                count,
+                difficulty,
+                bloom_level,
+                usage,
+                runtime_model,
+                "LLM output passed 0 validation",
+            )
 
-        return {"questions": validated[:count], "usage": usage}
+        return {
+            "questions": validated[:count],
+            "usage": usage,
+            "model_name": runtime_model.model_name,
+            "provider": runtime_model.provider,
+            "fallback_used": False,
+            "error": None,
+        }
 
     except json.JSONDecodeError as e:
         logger.error(f"LLM output is not valid JSON: {e}\nRaw output (first 500 chars): {raw[:500] if raw else 'EMPTY'}")
-        return {"questions": _template_fallback(content, question_types, count, difficulty, bloom_level), "usage": _empty_usage}
+        return _build_fallback_generation_result(
+            content,
+            question_types,
+            count,
+            difficulty,
+            bloom_level,
+            _empty_usage,
+            runtime_model,
+            f"Invalid JSON: {e}",
+        )
     except Exception as e:
         logger.error(f"LLM question generation failed: {e}")
-        return {"questions": _template_fallback(content, question_types, count, difficulty, bloom_level), "usage": _empty_usage}
+        return _build_fallback_generation_result(
+            content,
+            question_types,
+            count,
+            difficulty,
+            bloom_level,
+            _empty_usage,
+            runtime_model,
+            str(e),
+        )
+
+
+def _build_fallback_generation_result(
+    content: str,
+    question_types: list[str],
+    count: int,
+    difficulty: int,
+    bloom_level: Optional[str],
+    usage: dict,
+    runtime_model: ModelConfig,
+    error_message: str,
+) -> dict:
+    return {
+        "questions": _template_fallback(content, question_types, count, difficulty, bloom_level),
+        "usage": usage,
+        "model_name": runtime_model.model_name,
+        "provider": runtime_model.provider,
+        "fallback_used": True,
+        "error": error_message,
+    }
+
+
+def _request_question_generation(
+    model_config: ModelConfig,
+    api_key: str,
+    user_prompt: str,
+    max_tokens: int,
+    empty_usage: dict,
+) -> dict:
+    """Dispatch question generation to the right provider."""
+    return _request_question_generation_openai_compatible(
+        model_config,
+        api_key,
+        user_prompt,
+        max_tokens,
+        empty_usage,
+    )
+
+
+def _request_question_generation_openai_compatible(
+    model_config: ModelConfig,
+    api_key: str,
+    user_prompt: str,
+    max_tokens: int,
+    empty_usage: dict,
+) -> dict:
+    client = OpenAI(
+        api_key=api_key,
+        base_url=resolve_base_url(model_config),
+        timeout=Timeout(300.0, connect=10.0),
+    )
+
+    request_kwargs = {
+        "model": model_config.model_name,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.85,
+        "max_tokens": max_tokens,
+    }
+    if model_config.slug in {"default", "local_qwen"}:
+        # vLLM-hosted Qwen models may emit thinking chains unless disabled explicitly.
+        request_kwargs["extra_body"] = {
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+
+    response = client.chat.completions.create(
+        **request_kwargs,
+    )
+
+    usage = empty_usage
+    if response.usage:
+        usage = {
+            "prompt_tokens": response.usage.prompt_tokens or 0,
+            "completion_tokens": response.usage.completion_tokens or 0,
+            "total_tokens": response.usage.total_tokens or 0,
+        }
+
+    return {
+        "content": response.choices[0].message.content.strip(),
+        "usage": usage,
+    }
 
 
 # ── 模板降级（无 LLM 时使用） ────────────────────────────────────────
