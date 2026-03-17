@@ -14,7 +14,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
-from app.agents.llm_utils import strip_thinking_tags
+from app.agents.llm_utils import strip_thinking_tags, build_disable_thinking_extra_body
 
 logger = logging.getLogger(__name__)
 
@@ -81,16 +81,23 @@ def ai_review_question(
 正确答案：{correct_answer}
 解析：{explanation or '无'}"""
 
-        response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            messages=[
+        request_kwargs = {
+            "model": settings.LLM_MODEL,
+            "messages": [
                 {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
                 {"role": "user", "content": f"请审核以下题目：\n\n{question_text}"},
             ],
-            temperature=0.3,
-            max_tokens=1024,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            "temperature": 0.3,
+            "max_tokens": 1024,
+        }
+        extra_body = build_disable_thinking_extra_body(
+            settings.LLM_MODEL,
+            settings.LLM_BASE_URL,
         )
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        response = client.chat.completions.create(**request_kwargs)
 
         raw = response.choices[0].message.content.strip()
         raw = strip_thinking_tags(raw)

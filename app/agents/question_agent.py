@@ -10,7 +10,7 @@ from openai import OpenAI
 from httpx import Timeout
 
 from app.core.config import settings
-from app.agents.llm_utils import strip_thinking_tags
+from app.agents.llm_utils import strip_thinking_tags, build_disable_thinking_extra_body
 from app.agents.model_registry import (
     ModelConfig,
     get_default_model_config,
@@ -213,6 +213,23 @@ QUESTION_VOICE_STYLES = [
     "对话讨论视角：以'同事/朋友/专家'之间的讨论引出问题",
     "问题驱动视角：以'如何解决/怎样实现/为什么会'开头直接提出挑战",
 ]
+
+FORBIDDEN_MATERIAL_REFERENCES = [
+    "结合素材", "根据本文", "根据材料", "根据上文", "根据下文",
+    "本文作者", "作者认为", "本书", "该书", "书中", "出版社",
+    "出版信息", "ISBN", "第1章", "第2章", "第3章", "第4章", "第5章",
+    "第1节", "第2节", "第3节", "章节", "章", "节",
+]
+
+FORBIDDEN_MATERIAL_REGEXES = [
+    re.compile(r"第\s*[一二三四五六七八九十0-9]+\s*[章节篇部分]"),
+    re.compile(r"(作者|著者|主编|副主编)[：: ]"),
+    re.compile(r"(出版社|出版时间|出版日期|版次)[：: ]"),
+]
+
+GARBLED_TEXT_MARKERS = ["�", "\x00", "□", "�", "锟斤拷"]
+MAX_ROLE_LEAD_STEMS = 2
+MATERIAL_GENERATION_MAX_ATTEMPTS = 2
 
 # 难度校准详细描述
 DIFFICULTY_CALIBRATION = {
@@ -463,7 +480,12 @@ def _build_user_prompt(
 3. **考查内容理解而非形式记忆**：题目应考查对素材中知识点的理解和应用，而非对原文措辞的死记硬背
 4. **深入挖掘核心知识点**：识别素材中的核心概念、关键定义、重要原理，围绕这些设计题目
 5. **干扰项设计**：基于对素材中概念的常见误解来设计干扰项，确保每个干扰项都有迷惑性
-6. **不要超出素材范围**：不要引入素材中未提及的专业知识作为正确答案"""
+6. **不要超出素材范围**：不要引入素材中未提及的专业知识作为正确答案
+7. **禁止素材元信息表述**：题目中禁止出现书名、作者、出版信息、章节编号、素材专有隐喻，以及“结合素材”“根据本文”“根据材料”等表述
+8. **同套题禁止重复知识点**：同一套题中，每道题必须考查不同知识点，禁止重复知识点或仅换一种说法重复设问
+9. **角色控制**："一位……"开头的题干最多只能出现2题，且职业角色不能重复
+10. **判断题格式固定**：判断题题干必须是陈述句，禁止使用疑问句；选项只能有且仅有 A.正确 / B.错误
+11. **生成后必须先自检**：请先自检判断题格式、素材元信息、乱码残留、知识点重复、角色重复；若任一项不合格，必须直接重新生成整套题"""
     else:
         # 随机选取主题子集，增加直接出题的多样性
         num_topics = min(3, len(DIRECT_GENERATION_TOPICS))
@@ -710,6 +732,126 @@ def _validate_and_fix_question(raw: dict, requested_types: list[str]) -> Optiona
     return raw
 
 
+def _question_field(question: object, field: str, default=None):
+    if isinstance(question, dict):
+        return question.get(field, default)
+    return getattr(question, field, default)
+
+
+def _normalize_text_for_compare(text: str) -> str:
+    text = (text or "").strip().lower()
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[，。！？；：、“”‘’\"'（）()、,.!?;:\-_/]", "", text)
+    return text
+
+
+def _contains_material_reference(text: str) -> bool:
+    if not text:
+        return False
+    if any(token in text for token in FORBIDDEN_MATERIAL_REFERENCES):
+        return True
+    return any(pattern.search(text) for pattern in FORBIDDEN_MATERIAL_REGEXES)
+
+
+def _contains_garbled_text(text: str) -> bool:
+    if not text:
+        return False
+    if any(marker in text for marker in GARBLED_TEXT_MARKERS):
+        return True
+    return bool(re.search(r"[\uFFFD\uFFFE\uFFFF]", text))
+
+
+def _extract_role_from_stem(stem: str) -> Optional[str]:
+    if not stem or not stem.startswith("一位"):
+        return None
+    match = re.match(
+        r"^一位([^，。；、：:\s]{1,12}?)(?:在|正|准备|计划|希望|想|将|要|负责|面对|使用|需要|为了|进行|参与)",
+        stem,
+    )
+    if match:
+        return match.group(1)
+
+    fallback = re.match(r"^一位([^，。；、：:\s]{1,12})", stem)
+    return fallback.group(1) if fallback else None
+
+
+def _knowledge_signature(question: object) -> str:
+    tags = _question_field(question, "knowledge_tags") or []
+    if isinstance(tags, str):
+        tags = [tags]
+    normalized_tags = sorted(_normalize_text_for_compare(str(tag)) for tag in tags if str(tag).strip())
+    if normalized_tags:
+        return "|".join(normalized_tags)
+    return _normalize_text_for_compare(_question_field(question, "stem", ""))
+
+
+def _validate_generated_question_set(
+    questions: list[object],
+    strict_material_rules: bool = False,
+) -> dict:
+    """Validate a generated question set and return pass/fail with reasons."""
+    if not questions:
+        return {"passed": False, "reasons": ["未生成任何题目"]}
+    if not strict_material_rules:
+        return {"passed": True, "reasons": []}
+
+    reasons: list[str] = []
+    seen_signatures: dict[str, int] = {}
+    seen_roles: dict[str, int] = {}
+    role_lead_count = 0
+
+    for index, question in enumerate(questions, start=1):
+        stem = str(_question_field(question, "stem", "") or "")
+        explanation = str(_question_field(question, "explanation", "") or "")
+        options = _question_field(question, "options") or {}
+        combined_text = " ".join(
+            [
+                stem,
+                explanation,
+                " ".join(str(v) for v in options.values()) if isinstance(options, dict) else "",
+                " ".join(str(t) for t in (_question_field(question, "knowledge_tags") or [])),
+            ]
+        )
+
+        # if _contains_material_reference(combined_text):
+        #     reasons.append(f"第{index}题包含素材元信息或禁用表述")
+
+        # if _contains_garbled_text(combined_text):
+        #     reasons.append(f"第{index}题存在乱码残留")
+
+        # signature = _knowledge_signature(question)
+        # if signature:
+        #     if signature in seen_signatures:
+        #         reasons.append(
+        #             f"第{index}题与第{seen_signatures[signature]}题知识点重复"
+        #         )
+        #     else:
+        #         seen_signatures[signature] = index
+
+        # if stem.startswith("一位"):
+        #     role_lead_count += 1
+        #     if role_lead_count > MAX_ROLE_LEAD_STEMS:
+        #         reasons.append("同套题以“一位……”开头的题干超过2题")
+
+        #     role = _extract_role_from_stem(stem)
+        #     if role:
+        #         if role in seen_roles:
+        #             reasons.append(
+        #                 f"第{index}题与第{seen_roles[role]}题职业角色重复"
+        #             )
+        #         else:
+        #             seen_roles[role] = index
+
+        if _question_field(question, "question_type") == "true_false":
+            if "?" in stem or "？" in stem:
+                reasons.append(f"第{index}题判断题题干必须是陈述句")
+            if options != {"A": "正确", "B": "错误"}:
+                reasons.append(f"第{index}题判断题选项必须严格为A.正确/B.错误")
+
+    deduped_reasons = list(dict.fromkeys(reasons))
+    return {"passed": not deduped_reasons, "reasons": deduped_reasons}
+
+
 # ── 主入口 ──────────────────────────────────────────────────────────
 
 def generate_questions_via_llm(
@@ -895,11 +1037,13 @@ def _request_question_generation_openai_compatible(
         "temperature": 0.85,
         "max_tokens": max_tokens,
     }
-    if model_config.slug in {"default", "local_qwen"}:
-        # vLLM-hosted Qwen models may emit thinking chains unless disabled explicitly.
-        request_kwargs["extra_body"] = {
-            "chat_template_kwargs": {"enable_thinking": False},
-        }
+    extra_body = build_disable_thinking_extra_body(
+        model_config.model_name,
+        resolve_base_url(model_config),
+        model_config.slug,
+    )
+    if extra_body:
+        request_kwargs["extra_body"] = extra_body
 
     response = client.chat.completions.create(
         **request_kwargs,

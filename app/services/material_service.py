@@ -2,10 +2,11 @@
 import uuid
 from typing import Optional
 
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.material import Material, MaterialStatus
+from app.models.material import Material, MaterialStatus, KnowledgeUnit
+from app.models.question import Question
 from app.services.minio_service import upload_file, delete_file, get_presigned_url
 
 
@@ -106,6 +107,27 @@ async def delete_material(
     material = await get_material_by_id(db, material_id)
     if not material:
         return False
+
+    ku_result = await db.execute(
+        select(KnowledgeUnit.id).where(KnowledgeUnit.material_id == material_id)
+    )
+    knowledge_unit_ids = list(ku_result.scalars().all())
+
+    await db.execute(
+        update(Question)
+        .where(Question.source_material_id == material_id)
+        .values(source_material_id=None)
+    )
+
+    if knowledge_unit_ids:
+        await db.execute(
+            update(Question)
+            .where(Question.source_knowledge_unit_id.in_(knowledge_unit_ids))
+            .values(source_knowledge_unit_id=None)
+        )
+        await db.execute(
+            delete(KnowledgeUnit).where(KnowledgeUnit.material_id == material_id)
+        )
 
     try:
         delete_file(material.file_path)

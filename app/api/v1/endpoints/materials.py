@@ -36,7 +36,7 @@ async def upload_material(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "organizer"])),
 ):
-    """Upload a single material file. Supports PDF, Word, Markdown, images, video, audio, CSV, JSON.
+    """Upload a single material file. Supports PDF, Word, EPUB, Markdown, images, video, audio, CSV, JSON.
     Automatically triggers async parsing after upload."""
     file_data = await file.read()
     if not file_data:
@@ -69,6 +69,7 @@ async def upload_material(
 
 @router.post("/batch", status_code=status.HTTP_201_CREATED)
 async def batch_upload_materials(
+    background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     category: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db),
@@ -77,6 +78,7 @@ async def batch_upload_materials(
     """Batch upload multiple material files."""
     results = []
     errors = []
+    material_ids: list[UUID] = []
 
     for file in files:
         file_data = await file.read()
@@ -95,10 +97,14 @@ async def batch_upload_materials(
                 category=category,
             )
             results.append(MaterialResponse.model_validate(material))
+            material_ids.append(material.id)
         except ValueError as e:
             errors.append({"filename": file.filename, "error": str(e)})
 
     await db.commit()
+    for material_id in material_ids:
+        background_tasks.add_task(trigger_parse, material_id)
+
     return {
         "uploaded": len(results),
         "failed": len(errors),

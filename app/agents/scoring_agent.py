@@ -10,7 +10,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
-from app.agents.llm_utils import strip_thinking_tags
+from app.agents.llm_utils import strip_thinking_tags, build_disable_thinking_extra_body
 
 logger = logging.getLogger(__name__)
 
@@ -69,16 +69,23 @@ def score_subjective_answer(
 
 请评分并给出反馈。"""
 
-        response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            messages=[
+        request_kwargs = {
+            "model": settings.LLM_MODEL,
+            "messages": [
                 {"role": "system", "content": SCORING_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.2,
-            max_tokens=512,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            "temperature": 0.2,
+            "max_tokens": 512,
+        }
+        extra_body = build_disable_thinking_extra_body(
+            settings.LLM_MODEL,
+            settings.LLM_BASE_URL,
         )
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        response = client.chat.completions.create(**request_kwargs)
 
         raw = response.choices[0].message.content.strip()
         raw = strip_thinking_tags(raw)
@@ -224,18 +231,25 @@ def _single_evaluator_score(
 
     try:
         client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
-        response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            messages=[
+        request_kwargs = {
+            "model": settings.LLM_MODEL,
+            "messages": [
                 {"role": "system", "content": PANEL_SYSTEM_PROMPT.format(
                     position_instruction=position_instruction
                 )},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.3,
-            max_tokens=512,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            "temperature": 0.3,
+            "max_tokens": 512,
+        }
+        extra_body = build_disable_thinking_extra_body(
+            settings.LLM_MODEL,
+            settings.LLM_BASE_URL,
         )
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        response = client.chat.completions.create(**request_kwargs)
         raw = response.choices[0].message.content.strip()
         raw = strip_thinking_tags(raw)
         if "```json" in raw:

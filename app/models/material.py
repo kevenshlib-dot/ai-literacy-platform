@@ -12,6 +12,7 @@ from app.core.database import Base
 class MaterialFormat(str, enum.Enum):
     PDF = "pdf"
     WORD = "word"
+    EPUB = "epub"
     MARKDOWN = "markdown"
     HTML = "html"
     IMAGE = "image"
@@ -67,7 +68,9 @@ class Material(Base):
     )
 
     knowledge_units: Mapped[list["KnowledgeUnit"]] = relationship(
-        back_populates="material"
+        back_populates="material",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
@@ -81,7 +84,7 @@ class KnowledgeUnit(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     material_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("materials.id"), nullable=False
+        UUID(as_uuid=True), ForeignKey("materials.id", ondelete="CASCADE"), nullable=False
     )
     title: Mapped[str] = mapped_column(String(500), nullable=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)

@@ -385,6 +385,14 @@ crontab -e
 0 2 * * * docker exec ai-literacy-postgres pg_dump -U ai_literacy ai_literacy_db > /opt/backups/db_$(date +\%Y\%m\%d).sql
 ```
 
+也可以直接使用 `docker-compose.yml` 中新增的 `postgres-backup` 服务：
+
+- 备份时间：每天凌晨 2 点
+- 保留策略：按天保留 14 天，同时保留周/月级归档
+- 备份目录：`./backups/postgres/`
+
+启动后会自动生成备份，无需再单独配置宿主机 crontab。
+
 ---
 
 ## 八、常见问题

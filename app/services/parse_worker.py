@@ -88,6 +88,15 @@ async def parse_and_store(db: AsyncSession, material_id: uuid.UUID) -> bool:
 
     except Exception as e:
         logger.error(f"Failed to parse material {material_id}: {e}")
+        await db.rollback()
+        result = await db.execute(
+            select(Material).where(Material.id == material_id)
+        )
+        material = result.scalar_one_or_none()
+        if not material:
+            logger.error(f"Material {material_id} not found after rollback")
+            return False
+
         material.status = MaterialStatus.FAILED
         await db.flush()
         return False

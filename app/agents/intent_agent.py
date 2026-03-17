@@ -11,7 +11,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
-from app.agents.llm_utils import strip_thinking_tags
+from app.agents.llm_utils import strip_thinking_tags, build_disable_thinking_extra_body
 
 logger = logging.getLogger(__name__)
 
@@ -79,16 +79,23 @@ def parse_intent_via_llm(description: str) -> dict:
 
     try:
         client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
-        response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            messages=[
+        request_kwargs = {
+            "model": settings.LLM_MODEL,
+            "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": description},
             ],
-            temperature=0.3,
-            max_tokens=500,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            "temperature": 0.3,
+            "max_tokens": 500,
+        }
+        extra_body = build_disable_thinking_extra_body(
+            settings.LLM_MODEL,
+            settings.LLM_BASE_URL,
         )
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        response = client.chat.completions.create(**request_kwargs)
         content = response.choices[0].message.content.strip()
         content = strip_thinking_tags(content)
 

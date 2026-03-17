@@ -48,6 +48,7 @@
           >
             <a-select-option value="pdf">PDF</a-select-option>
             <a-select-option value="word">Word</a-select-option>
+            <a-select-option value="epub">EPUB</a-select-option>
             <a-select-option value="markdown">Markdown</a-select-option>
             <a-select-option value="image">图片</a-select-option>
             <a-select-option value="video">视频</a-select-option>
@@ -141,7 +142,7 @@
           >
             <a-button><UploadOutlined /> 选择文件</a-button>
           </a-upload>
-          <div class="upload-hint">支持 PDF, Word, Markdown, 图片, 视频, 音频, CSV, JSON</div>
+          <div class="upload-hint">支持 PDF, Word, EPUB, Markdown, 图片, 视频, 音频, CSV, JSON</div>
         </a-form-item>
         <a-form-item>
           <a-button
@@ -177,7 +178,7 @@
           >
             <p class="ant-upload-drag-icon"><InboxOutlined /></p>
             <p class="ant-upload-text">点击或拖拽文件到此区域</p>
-            <p class="ant-upload-hint">支持多文件批量上传</p>
+            <p class="ant-upload-hint">支持 PDF、Word、EPUB、Markdown、图片、视频、音频、CSV、JSON 批量上传</p>
           </a-upload-dragger>
         </a-form-item>
         <a-form-item>
@@ -285,11 +286,11 @@ const columns = [
 ]
 
 const formatLabels: Record<string, string> = {
-  pdf: 'PDF', word: 'Word', markdown: 'Markdown', html: 'HTML',
+  pdf: 'PDF', word: 'Word', epub: 'EPUB', markdown: 'Markdown', html: 'HTML',
   image: '图片', video: '视频', audio: '音频', csv: 'CSV', json: 'JSON',
 }
 const formatColors: Record<string, string> = {
-  pdf: 'red', word: 'blue', markdown: 'green', html: 'orange',
+  pdf: 'red', word: 'blue', epub: 'volcano', markdown: 'green', html: 'orange',
   image: 'purple', video: 'cyan', audio: 'magenta', csv: 'geekblue', json: 'lime',
 }
 const statusLabels: Record<string, string> = {
@@ -398,6 +399,7 @@ async function handleUpload() {
 
     await request.post('/materials', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
     })
     message.success('上传成功')
     showUploadModal.value = false
@@ -422,6 +424,7 @@ async function handleBatchUpload() {
 
     const res: any = await request.post('/materials/batch', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
     })
     message.success(`成功上传 ${res.uploaded} 个文件${res.failed > 0 ? `，${res.failed} 个失败` : ''}`)
     showBatchUpload.value = false

@@ -12,6 +12,7 @@ from app.core.config import settings
 FORMAT_EXTENSIONS = {
     "pdf": [".pdf"],
     "word": [".doc", ".docx"],
+    "epub": [".epub"],
     "markdown": [".md", ".markdown"],
     "html": [".html", ".htm"],
     "image": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg"],
@@ -26,6 +27,7 @@ MIME_TO_FORMAT = {
     "application/pdf": "pdf",
     "application/msword": "word",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "word",
+    "application/epub+zip": "epub",
     "text/markdown": "markdown",
     "text/html": "html",
     "text/csv": "csv",
@@ -51,6 +53,7 @@ MIME_TO_FORMAT = {
 MAX_FILE_SIZES = {
     "pdf": 100 * 1024 * 1024,      # 100MB
     "word": 50 * 1024 * 1024,       # 50MB
+    "epub": 50 * 1024 * 1024,       # 50MB
     "markdown": 10 * 1024 * 1024,   # 10MB
     "html": 10 * 1024 * 1024,       # 10MB
     "image": 20 * 1024 * 1024,      # 20MB

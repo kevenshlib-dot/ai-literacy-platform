@@ -1,5 +1,6 @@
 """Tests for question generation engine (T009)."""
 import io
+import uuid
 import pytest
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy import text
@@ -8,7 +9,9 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from app.main import app
 from app.core.database import Base, get_db
 from app.core.config import settings
-from app.services.user_service import init_roles
+from app.services import question_service
+from app.models.material import Material, MaterialFormat, MaterialStatus, KnowledgeUnit
+from app.services.user_service import create_user, init_roles
 from app.agents.question_agent import generate_questions_via_llm, _template_fallback
 
 
@@ -250,6 +253,121 @@ async def test_list_questions_with_filter():
             headers=headers,
         )
         assert resp.json()["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_preview_bank_retries_invalid_material_question_set(monkeypatch):
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    material_id = uuid.uuid4()
+
+    responses = [
+        {
+            "questions": [
+                {
+                    "question_type": "single_choice",
+                    "stem": "根据本文，一位产品经理首先应该完成哪一步？",
+                    "options": {"A": "识别敏感字段", "B": "跳过清洗", "C": "直接上线", "D": "共享原始数据"},
+                    "correct_answer": "A",
+                    "explanation": "应先识别敏感字段。",
+                    "knowledge_tags": ["隐私脱敏"],
+                    "dimension": "AI伦理安全",
+                },
+                {
+                    "question_type": "single_choice",
+                    "stem": "一位产品经理在上线推荐服务前，首要的合规动作是什么？",
+                    "options": {"A": "评估用途与授权范围", "B": "扩大数据采集", "C": "忽略用户同意", "D": "删除审计日志"},
+                    "correct_answer": "A",
+                    "explanation": "应先评估用途与授权范围。",
+                    "knowledge_tags": ["隐私脱敏"],
+                    "dimension": "AI伦理安全",
+                },
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+            "model_name": "fake-model",
+            "provider": "fake",
+            "fallback_used": False,
+            "error": None,
+        },
+        {
+            "questions": [
+                {
+                    "question_type": "single_choice",
+                    "stem": "推荐系统上线前，哪项做法最能降低个人信息误用风险？",
+                    "options": {"A": "只保留必要字段", "B": "扩大日志采集", "C": "长期留存原始数据", "D": "取消访问审计"},
+                    "correct_answer": "A",
+                    "explanation": "只保留必要字段符合最小化原则。",
+                    "knowledge_tags": ["数据最小化"],
+                    "dimension": "AI伦理安全",
+                },
+                {
+                    "question_type": "single_choice",
+                    "stem": "一位数据分析师在训练推荐模型前，最应优先核查哪项内容？",
+                    "options": {"A": "字段用途与授权范围是否一致", "B": "是否收集更多敏感数据", "C": "是否跳过样本清洗", "D": "是否关闭审计日志"},
+                    "correct_answer": "A",
+                    "explanation": "先核查用途与授权范围，才能判断数据是否可用。",
+                    "knowledge_tags": ["授权范围"],
+                    "dimension": "AI伦理安全",
+                },
+            ],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 21, "total_tokens": 32},
+            "model_name": "fake-model",
+            "provider": "fake",
+            "fallback_used": False,
+            "error": None,
+        },
+    ]
+    call_count = {"value": 0}
+
+    def fake_generate(*args, **kwargs):
+        index = call_count["value"]
+        call_count["value"] += 1
+        return responses[min(index, len(responses) - 1)]
+
+    monkeypatch.setattr(question_service, "generate_questions_via_llm", fake_generate)
+
+    async with session_factory() as session:
+        uploader = await create_user(
+            session,
+            username=f"material_owner_{uuid.uuid4().hex[:8]}",
+            email=f"{uuid.uuid4().hex[:8]}@test.com",
+            password="password123",
+            role_name="organizer",
+        )
+        material = Material(
+            id=material_id,
+            title="AI基础教材",
+            format=MaterialFormat.MARKDOWN,
+            file_path="materials/test.md",
+            file_size=128,
+            status=MaterialStatus.PARSED,
+            uploaded_by=uploader.id,
+        )
+        session.add(material)
+        session.add(
+            KnowledgeUnit(
+                material_id=material_id,
+                title="片段1",
+                content="大模型应用需要完成隐私脱敏和合规审查。",
+                chunk_index=0,
+                dimension="AI伦理安全",
+            )
+        )
+        await session.commit()
+
+        result = await question_service.preview_question_bank_from_material(
+            db=session,
+            material_id=material_id,
+            type_distribution={"single_choice": 2},
+            difficulty=3,
+            custom_prompt="侧重隐私合规",
+        )
+
+    await engine.dispose()
+
+    assert call_count["value"] == 2
+    assert len(result["questions"]) == 2
+    assert result["questions"][0]["stem"] == "推荐系统上线前，哪项做法最能降低个人信息误用风险？"
 
 
 @pytest.mark.asyncio

@@ -1,3 +1,6 @@
+import io
+import zipfile
+
 import pytest
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy import text
@@ -58,6 +61,50 @@ async def register_user(client, role="organizer"):
     return resp.json()["access_token"]
 
 
+def build_test_epub_bytes() -> bytes:
+    container_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>
+"""
+    content_opf = """<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>EPUB测试</dc:title>
+  </metadata>
+  <manifest>
+    <item id="chapter2" href="chapter2.xhtml" media-type="application/xhtml+xml"/>
+    <item id="chapter1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="chapter1"/>
+    <itemref idref="chapter2"/>
+  </spine>
+</package>
+"""
+    chapter1 = """<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <body><h1>第一章</h1><p>这是EPUB第一章内容。</p></body>
+</html>
+"""
+    chapter2 = """<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <body><h1>第二章</h1><p>这是EPUB第二章内容。</p></body>
+</html>
+"""
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr("META-INF/container.xml", container_xml)
+        archive.writestr("OEBPS/content.opf", content_opf)
+        archive.writestr("OEBPS/chapter1.xhtml", chapter1)
+        archive.writestr("OEBPS/chapter2.xhtml", chapter2)
+    return buf.getvalue()
+
+
 # ---- Upload Tests ----
 
 @pytest.mark.asyncio
@@ -91,6 +138,20 @@ async def test_upload_word():
     assert resp.status_code == 201
     assert resp.json()["format"] == "word"
     assert resp.json()["category"] == "教材"
+
+
+@pytest.mark.asyncio
+async def test_upload_epub():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        resp = await client.post(
+            "/api/v1/materials",
+            files={"file": ("book.epub", build_test_epub_bytes(), "application/epub+zip")},
+            data={"title": "EPUB电子书"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert resp.status_code == 201
+    assert resp.json()["format"] == "epub"
 
 
 @pytest.mark.asyncio
@@ -156,7 +217,17 @@ async def test_upload_forbidden_for_examinee():
 # ---- Batch Upload Tests ----
 
 @pytest.mark.asyncio
-async def test_batch_upload():
+async def test_batch_upload_triggers_parse(monkeypatch):
+    scheduled_material_ids = []
+
+    async def fake_trigger_parse(material_id):
+        scheduled_material_ids.append(str(material_id))
+
+    monkeypatch.setattr(
+        "app.api.v1.endpoints.materials.trigger_parse",
+        fake_trigger_parse,
+    )
+
     async with get_client() as client:
         token = await register_user(client, "organizer")
         resp = await client.post(
@@ -172,6 +243,8 @@ async def test_batch_upload():
     data = resp.json()
     assert data["uploaded"] == 2
     assert data["failed"] == 0
+    assert len(scheduled_material_ids) == 2
+    assert set(scheduled_material_ids) == {item["id"] for item in data["materials"]}
 
 
 # ---- List / Query Tests ----
@@ -278,6 +351,32 @@ async def test_delete_material():
             headers={"Authorization": f"Bearer {token}"},
         )
         mid = upload.json()["id"]
+        resp = await client.delete(
+            f"/api/v1/materials/{mid}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert resp.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_delete_parsed_material():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        upload = await client.post(
+            "/api/v1/materials",
+            files={"file": ("parsed.md", b"# AI\n\n" + "knowledge " * 200, "text/markdown")},
+            data={"title": "已解析素材删除"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        mid = upload.json()["id"]
+
+        parse_resp = await client.post(
+            f"/api/v1/materials/{mid}/parse",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert parse_resp.status_code == 200
+        assert parse_resp.json()["parsed"] is True
+
         resp = await client.delete(
             f"/api/v1/materials/{mid}",
             headers={"Authorization": f"Bearer {token}"},

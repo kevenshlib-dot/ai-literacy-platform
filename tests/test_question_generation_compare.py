@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from app.agents import question_agent
+from app.agents.llm_utils import build_disable_thinking_extra_body
 from app.agents.model_registry import (
     DEFAULT_COMPARE_MODEL_SLUGS,
     ModelConfig,
@@ -66,6 +67,38 @@ def test_build_user_prompt_changes_when_seed_changes():
     assert prompt1 != prompt2
 
 
+def test_build_user_prompt_material_generation_includes_material_only_rules():
+    prompt = question_agent._build_user_prompt(
+        content="大模型应用需要隐私脱敏与合规审查。",
+        question_types=["single_choice", "true_false"],
+        count=4,
+        difficulty=3,
+        bloom_level="apply",
+        prompt_seed=42,
+    )
+
+    assert "禁止出现书名、作者、出版信息、章节编号" in prompt
+    assert "同套题禁止重复知识点" in prompt
+    assert "\"一位……\"开头的题干最多只能出现2题" in prompt
+    assert "判断题题干必须是陈述句，禁止使用疑问句" in prompt
+    assert "生成后必须先自检" in prompt
+
+
+def test_build_user_prompt_free_generation_omits_material_only_rules():
+    prompt = question_agent._build_user_prompt(
+        content="",
+        question_types=["single_choice", "true_false"],
+        count=4,
+        difficulty=3,
+        bloom_level="apply",
+        prompt_seed=42,
+    )
+
+    assert "禁止出现书名、作者、出版信息、章节编号" not in prompt
+    assert "同套题禁止重复知识点" not in prompt
+    assert "生成后必须先自检" not in prompt
+
+
 def test_get_compare_models_defaults_to_all_supported_models():
     models = get_compare_models()
 
@@ -119,6 +152,22 @@ def test_request_question_generation_routes_gemini_to_openai_compatible(monkeypa
     assert result["content"] == "[]"
 
 
+def test_disable_thinking_extra_body_skips_gemini_hosts():
+    assert build_disable_thinking_extra_body(
+        model_name="gemini-3-pro-preview",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        model_slug="default",
+    ) is None
+
+
+def test_disable_thinking_extra_body_keeps_local_qwen():
+    assert build_disable_thinking_extra_body(
+        model_name="Qwen/Qwen3.5-35B-A3B-FP8",
+        base_url="http://100.64.0.6:8100/v1",
+        model_slug="default",
+    ) == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
 def test_question_agent_does_not_expose_legacy_gemini_helpers():
     assert not hasattr(question_agent, "_request_question_generation_gemini")
     assert not hasattr(question_agent, "_build_gemini_client")
@@ -144,6 +193,98 @@ def test_generate_questions_via_llm_marks_fallback_errors(monkeypatch):
     assert result["fallback_used"] is True
     assert "timed out" in result["error"]
     assert len(result["questions"]) == 1
+
+
+def test_validate_generated_question_set_rejects_material_metadata_duplicates_and_tf_format():
+    questions = [
+        {
+            "question_type": "single_choice",
+            "stem": "根据本文，书中提出的隐私脱敏流程首先要完成哪一步？",
+            "options": {"A": "识别敏感字段", "B": "跳过清洗", "C": "直接发布", "D": "永久共享"},
+            "correct_answer": "A",
+            "explanation": "应先识别敏感字段。",
+            "knowledge_tags": ["隐私脱敏"],
+            "dimension": "AI伦理安全",
+        },
+        {
+            "question_type": "single_choice",
+            "stem": "一位产品经理准备上线推荐服务，以下哪项最符合隐私最小化原则？",
+            "options": {"A": "只保留必要字段", "B": "收集全部日志", "C": "长期留存原始数据", "D": "共享未脱敏数据"},
+            "correct_answer": "A",
+            "explanation": "最小化原则要求只保留必要字段。",
+            "knowledge_tags": ["隐私脱敏"],
+            "dimension": "AI伦理安全",
+        },
+        {
+            "question_type": "true_false",
+            "stem": "一位产品经理能否直接把公共网络数据接入推荐服务？",
+            "options": {"A": "是", "B": "否"},
+            "correct_answer": "B",
+            "explanation": "仍需合规审查。",
+            "knowledge_tags": ["公共数据合规"],
+            "dimension": "AI伦理安全",
+        },
+        {
+            "question_type": "single_choice",
+            "stem": "一位产品经理在设计推荐功能时，首要的合规动作是什么？",
+            "options": {"A": "做用途评估", "B": "忽略授权", "C": "跳过审计", "D": "扩大采集"},
+            "correct_answer": "A",
+            "explanation": "应先明确用途并评估合规性。",
+            "knowledge_tags": ["用途评估"],
+            "dimension": "AI伦理安全",
+        },
+    ]
+
+    result = question_agent._validate_generated_question_set(
+        questions,
+        strict_material_rules=True,
+    )
+
+    assert result["passed"] is False
+    assert any("素材元信息" in reason for reason in result["reasons"])
+    assert any("知识点重复" in reason for reason in result["reasons"])
+    assert any("判断题" in reason for reason in result["reasons"])
+    assert any("职业角色重复" in reason for reason in result["reasons"])
+
+
+def test_validate_generated_question_set_accepts_valid_material_questions():
+    questions = [
+        {
+            "question_type": "single_choice",
+            "stem": "推荐系统上线前，哪项做法最能降低个人信息误用风险？",
+            "options": {"A": "只保留必要字段", "B": "扩大原始日志采集", "C": "延长未脱敏数据留存", "D": "取消访问审计"},
+            "correct_answer": "A",
+            "explanation": "只保留必要字段符合最小化原则。",
+            "knowledge_tags": ["数据最小化"],
+            "dimension": "AI伦理安全",
+        },
+        {
+            "question_type": "true_false",
+            "stem": "公共来源的数据在接入推荐服务前，仍需完成隐私脱敏和合规审查。",
+            "options": {"A": "正确", "B": "错误"},
+            "correct_answer": "A",
+            "explanation": "公共来源不等于可以免除合规义务。",
+            "knowledge_tags": ["公共数据合规"],
+            "dimension": "AI伦理安全",
+        },
+        {
+            "question_type": "single_choice",
+            "stem": "一位数据分析师在训练推荐模型前，最应优先核查哪项内容？",
+            "options": {"A": "字段用途与授权范围是否一致", "B": "是否尽量收集更多个人信息", "C": "是否跳过样本清洗", "D": "是否忽略审计日志"},
+            "correct_answer": "A",
+            "explanation": "先核查用途与授权范围，才能判断数据是否可用。",
+            "knowledge_tags": ["授权范围"],
+            "dimension": "AI伦理安全",
+        },
+    ]
+
+    result = question_agent._validate_generated_question_set(
+        questions,
+        strict_material_rules=True,
+    )
+
+    assert result["passed"] is True
+    assert result["reasons"] == []
 
 
 def test_aggregate_helpers_count_types_and_dimensions():

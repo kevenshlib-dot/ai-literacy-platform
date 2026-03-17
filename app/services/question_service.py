@@ -9,7 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.question import Question, QuestionType, QuestionStatus, BloomLevel, ReviewRecord
 from app.models.material import Material, KnowledgeUnit
-from app.agents.question_agent import generate_questions_via_llm, classify_dimension
+from app.agents.question_agent import (
+    MATERIAL_GENERATION_MAX_ATTEMPTS,
+    _validate_generated_question_set,
+    classify_dimension,
+    generate_questions_via_llm,
+)
 from app.agents.model_registry import ModelConfig
 from app.agents.review_agent import ai_review_question
 
@@ -23,6 +28,24 @@ def _coerce_uuid(value: Optional[uuid.UUID | str]) -> Optional[uuid.UUID]:
     if isinstance(value, uuid.UUID):
         return value
     return uuid.UUID(value)
+
+
+def _build_material_retry_prompt(
+    custom_prompt: Optional[str],
+    reasons: list[str],
+    attempt: int,
+) -> Optional[str]:
+    sections = []
+    if custom_prompt:
+        sections.append(custom_prompt.strip())
+
+    reason_lines = "\n".join(f"- {reason}" for reason in reasons[:8])
+    sections.append(
+        f"【第{attempt}次重生要求】\n"
+        "上一轮整套题自检未通过，请重新生成整套题，不要沿用上轮题干、角色或重复知识点。\n"
+        f"{reason_lines}"
+    )
+    return "\n\n".join(section for section in sections if section)
 
 
 async def create_question(
@@ -480,48 +503,23 @@ async def build_question_bank_from_material(
     if not units:
         raise ValueError("该素材没有知识单元，请先解析素材")
 
-    all_questions: list[Question] = []
-    num_units = len(units)
-    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    type_counts: dict[str, int] = {}
-    errors: list[str] = []
-    fallback_count = 0
-    start_time = time.time()
-
-    for qtype, total_count in type_distribution.items():
-        if total_count <= 0:
-            continue
-        # Distribute count across units
-        base = total_count // num_units
-        remainder = total_count % num_units
-
-        for i, ku in enumerate(units):
-            count_for_unit = base + (1 if i < remainder else 0)
-            if count_for_unit <= 0:
-                continue
-            result = await generate_from_knowledge_unit(
-                db=db,
-                knowledge_unit_id=ku.id,
-                question_types=[qtype],
-                count=count_for_unit,
-                difficulty=difficulty,
-                bloom_level=bloom_level,
-                created_by=created_by,
-                custom_prompt=custom_prompt,
-                model_config=model_config,
-                prompt_seed=prompt_seed,
-            )
-            questions = result.get("questions", result) if isinstance(result, dict) else result
-            usage = result.get("usage", {}) if isinstance(result, dict) else {}
-            all_questions.extend(questions)
-            for k in total_usage:
-                total_usage[k] += usage.get(k, 0)
-
-        type_counts[qtype] = len([q for q in all_questions if q.question_type.value == qtype or q.question_type == qtype])
-
-    duration = round(time.time() - start_time, 2)
-    stats = {**total_usage, "duration_seconds": duration, "type_counts": type_counts}
-    return {"questions": all_questions, "stats": stats}
+    preview_result = await preview_question_bank_from_material(
+        db=db,
+        material_id=material_id,
+        type_distribution=type_distribution,
+        difficulty=difficulty,
+        bloom_level=bloom_level,
+        max_units=max_units,
+        custom_prompt=custom_prompt,
+        model_config=model_config,
+        prompt_seed=prompt_seed,
+    )
+    questions = await batch_create_from_raw(
+        db=db,
+        raw_questions=preview_result.get("questions", []),
+        created_by=created_by,
+    )
+    return {"questions": questions, "stats": preview_result.get("stats")}
 
 
 async def suggest_question_distribution(
@@ -704,82 +702,108 @@ async def preview_question_bank_from_material(
     if not units:
         raise ValueError("该素材没有知识单元，请先解析素材")
 
-    all_preview: list[dict] = []
     num_units = len(units)
-    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    type_counts: dict[str, int] = {}
-    errors: list[str] = []
-    fallback_count = 0
-    start_time = time.time()
+    last_result: dict | None = None
+    last_reasons: list[str] = []
 
-    for qtype, total_count in type_distribution.items():
-        if total_count <= 0:
-            continue
-        base = total_count // num_units
-        remainder = total_count % num_units
-        type_generated = 0
+    for attempt in range(1, MATERIAL_GENERATION_MAX_ATTEMPTS + 1):
+        attempt_prompt = custom_prompt
+        if last_reasons:
+            attempt_prompt = _build_material_retry_prompt(custom_prompt, last_reasons, attempt)
 
-        for i, ku in enumerate(units):
-            count_for_unit = base + (1 if i < remainder else 0)
-            if count_for_unit <= 0:
+        all_preview: list[dict] = []
+        total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        type_counts: dict[str, int] = {}
+        errors: list[str] = []
+        fallback_count = 0
+        start_time = time.time()
+
+        for qtype, total_count in type_distribution.items():
+            if total_count <= 0:
                 continue
+            base = total_count // num_units
+            remainder = total_count % num_units
+            type_generated = 0
 
-            llm_result = generate_questions_via_llm(
-                content=ku.content,
-                question_types=[qtype],
-                count=count_for_unit,
-                difficulty=difficulty,
-                bloom_level=bloom_level,
-                custom_prompt=custom_prompt,
-                model_config=model_config,
-                prompt_seed=prompt_seed,
-            )
-            raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
-            usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
-            if isinstance(llm_result, dict) and llm_result.get("fallback_used"):
-                fallback_count += 1
-                if llm_result.get("error"):
-                    errors.append(str(llm_result["error"]))
-            for k in total_usage:
-                total_usage[k] += usage.get(k, 0)
+            for i, ku in enumerate(units):
+                count_for_unit = base + (1 if i < remainder else 0)
+                if count_for_unit <= 0:
+                    continue
 
-            for raw in raw_questions:
-                tags = raw.get("knowledge_tags")
-                if isinstance(tags, str):
-                    tags = [tags]
-                if not isinstance(tags, list):
-                    tags = None
+                llm_result = generate_questions_via_llm(
+                    content=ku.content,
+                    question_types=[qtype],
+                    count=count_for_unit,
+                    difficulty=difficulty,
+                    bloom_level=bloom_level,
+                    custom_prompt=attempt_prompt,
+                    model_config=model_config,
+                    prompt_seed=prompt_seed,
+                )
+                raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
+                usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
+                if isinstance(llm_result, dict) and llm_result.get("fallback_used"):
+                    fallback_count += 1
+                    if llm_result.get("error"):
+                        errors.append(str(llm_result["error"]))
+                for k in total_usage:
+                    total_usage[k] += usage.get(k, 0)
 
-                dim = ku.dimension or raw.get("dimension")
-                if not dim:
-                    dim = classify_dimension(raw.get("stem", ""), tags)
+                for raw in raw_questions:
+                    tags = raw.get("knowledge_tags")
+                    if isinstance(tags, str):
+                        tags = [tags]
+                    if not isinstance(tags, list):
+                        tags = None
 
-                all_preview.append({
-                    "question_type": raw.get("question_type", qtype),
-                    "stem": raw.get("stem", ""),
-                    "options": raw.get("options"),
-                    "correct_answer": raw.get("correct_answer", ""),
-                    "explanation": raw.get("explanation", ""),
-                    "difficulty": difficulty,
-                    "dimension": dim,
-                    "knowledge_tags": tags,
-                    "bloom_level": bloom_level,
-                    "source_material_id": str(ku.material_id),
-                    "source_knowledge_unit_id": str(ku.id),
-                })
-                type_generated += 1
+                    dim = ku.dimension or raw.get("dimension")
+                    if not dim:
+                        dim = classify_dimension(raw.get("stem", ""), tags)
 
-        type_counts[qtype] = type_generated
+                    all_preview.append({
+                        "question_type": raw.get("question_type", qtype),
+                        "stem": raw.get("stem", ""),
+                        "options": raw.get("options"),
+                        "correct_answer": raw.get("correct_answer", ""),
+                        "explanation": raw.get("explanation", ""),
+                        "difficulty": difficulty,
+                        "dimension": dim,
+                        "knowledge_tags": tags,
+                        "bloom_level": bloom_level,
+                        "source_material_id": str(ku.material_id),
+                        "source_knowledge_unit_id": str(ku.id),
+                    })
+                    type_generated += 1
 
-    duration = round(time.time() - start_time, 2)
-    stats = {
-        **total_usage,
-        "duration_seconds": duration,
-        "type_counts": type_counts,
-        "fallback_count": fallback_count,
-        "errors": errors,
-    }
-    return {"questions": all_preview, "stats": stats}
+            type_counts[qtype] = type_generated
+
+        validation = _validate_generated_question_set(
+            all_preview,
+            strict_material_rules=True,
+        )
+        duration = round(time.time() - start_time, 2)
+        stats = {
+            **total_usage,
+            "duration_seconds": duration,
+            "type_counts": type_counts,
+            "fallback_count": fallback_count,
+            "errors": errors,
+            "generation_attempts": attempt,
+            "validation_reasons": validation["reasons"],
+        }
+        last_result = {"questions": all_preview, "stats": stats}
+        if validation["passed"]:
+            return last_result
+
+        last_reasons = validation["reasons"]
+        logger.warning(
+            "Material %s question generation failed validation on attempt %s: %s",
+            material_id,
+            attempt,
+            "; ".join(last_reasons),
+        )
+
+    return last_result or {"questions": [], "stats": {"validation_reasons": last_reasons}}
 
 
 def preview_questions_free(

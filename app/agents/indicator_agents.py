@@ -12,7 +12,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
-from app.agents.llm_utils import strip_thinking_tags
+from app.agents.llm_utils import strip_thinking_tags, build_disable_thinking_extra_body
 
 logger = logging.getLogger(__name__)
 
@@ -58,13 +58,20 @@ def research_agent(topic: Optional[str] = None) -> dict:
   ]
 }}
 ```"""
-        response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=1000,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        request_kwargs = {
+            "model": settings.LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_tokens": 1000,
+        }
+        extra_body = build_disable_thinking_extra_body(
+            settings.LLM_MODEL,
+            settings.LLM_BASE_URL,
         )
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        response = client.chat.completions.create(**request_kwargs)
         raw = response.choices[0].message.content.strip()
         raw = strip_thinking_tags(raw)
         json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
@@ -108,13 +115,20 @@ def consultant_agent(research_findings: dict) -> list[dict]:
   }}
 ]
 ```"""
-        response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5,
-            max_tokens=1000,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        request_kwargs = {
+            "model": settings.LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.5,
+            "max_tokens": 1000,
+        }
+        extra_body = build_disable_thinking_extra_body(
+            settings.LLM_MODEL,
+            settings.LLM_BASE_URL,
         )
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        response = client.chat.completions.create(**request_kwargs)
         raw = response.choices[0].message.content.strip()
         raw = strip_thinking_tags(raw)
         json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', raw, re.DOTALL)
@@ -161,13 +175,20 @@ def review_agent(proposals: list[dict]) -> list[dict]:
   }}
 ]
 ```"""
-        response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=1000,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        request_kwargs = {
+            "model": settings.LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 1000,
+        }
+        extra_body = build_disable_thinking_extra_body(
+            settings.LLM_MODEL,
+            settings.LLM_BASE_URL,
         )
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        response = client.chat.completions.create(**request_kwargs)
         raw = response.choices[0].message.content.strip()
         raw = strip_thinking_tags(raw)
         json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', raw, re.DOTALL)

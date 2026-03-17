@@ -39,6 +39,7 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+artifacts/
 
 # Alembic
 alembic/versions/*.pyc
