@@ -12,6 +12,7 @@ from app.models.organization import Organization
 from app.models.course import Course, CourseChapter
 from app.models.learning_path import LearningPath, LearningStep
 from app.models.sandbox import SandboxSession, SandboxAttempt
+from app.models.question_prompt_profile import QuestionPromptProfile
 
 __all__ = [
     "User",
@@ -38,4 +39,5 @@ __all__ = [
     "LearningStep",
     "SandboxSession",
     "SandboxAttempt",
+    "QuestionPromptProfile",
 ]

@@ -122,9 +122,10 @@ def test_get_compare_models_rejects_unknown_slug():
 def test_request_question_generation_routes_gemini_to_openai_compatible(monkeypatch):
     called = {}
 
-    def fake_openai(model_config, api_key, user_prompt, max_tokens, empty_usage):
+    def fake_openai(model_config, api_key, system_prompt, user_prompt, max_tokens, empty_usage):
         called["slug"] = model_config.slug
         called["api_key"] = api_key
+        called["system_prompt"] = system_prompt
         called["user_prompt"] = user_prompt
         called["max_tokens"] = max_tokens
         return {"content": "[]", "usage": empty_usage}
@@ -138,6 +139,7 @@ def test_request_question_generation_routes_gemini_to_openai_compatible(monkeypa
     result = question_agent._request_question_generation(
         model_config=get_compare_models(["gemini"])[0],
         api_key="test-key",
+        system_prompt="system",
         user_prompt="prompt",
         max_tokens=512,
         empty_usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
@@ -146,10 +148,46 @@ def test_request_question_generation_routes_gemini_to_openai_compatible(monkeypa
     assert called == {
         "slug": "gemini",
         "api_key": "test-key",
+        "system_prompt": "system",
         "user_prompt": "prompt",
         "max_tokens": 512,
     }
     assert result["content"] == "[]"
+
+
+def test_validate_user_prompt_template_rejects_unknown_placeholder():
+    with pytest.raises(ValueError, match="未知占位符"):
+        question_agent.validate_user_prompt_template("生成 {{unknown_field}} 道题")
+
+
+def test_validate_user_prompt_template_rejects_malformed_placeholder():
+    with pytest.raises(ValueError, match="未知占位符"):
+        question_agent.validate_user_prompt_template("生成 {{COUNT}} 道题")
+
+
+def test_build_user_prompt_supports_custom_template():
+    prompt = question_agent._build_user_prompt(
+        content="人工智能帮助提升工作效率。",
+        question_types=["single_choice"],
+        count=2,
+        difficulty=3,
+        custom_prompt="侧重工作场景",
+        prompt_seed=42,
+        user_prompt_template="题型={{question_types}} | 数量={{count}} | 要求={{custom_requirements}}",
+    )
+
+    assert "题型=单选题(single_choice)" in prompt
+    assert "数量=2" in prompt
+    assert "侧重工作场景" in prompt
+
+
+def test_render_user_prompt_keeps_backslashes_in_replacement_values():
+    rendered = question_agent.render_user_prompt(
+        "内容={{content_section}}",
+        {"content_section": r"C:\\temp\\demo\\1.txt"},
+    )
+
+    assert rendered == r"内容=C:\\temp\\demo\\1.txt"
 
 
 def test_disable_thinking_extra_body_skips_gemini_hosts():

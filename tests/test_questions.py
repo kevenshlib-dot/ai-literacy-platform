@@ -122,6 +122,7 @@ async def setup_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     async with engine.begin() as conn:
+        await conn.execute(text("TRUNCATE TABLE question_generation_prompt_profiles CASCADE"))
         await conn.execute(text("TRUNCATE TABLE questions CASCADE"))
         await conn.execute(text("TRUNCATE TABLE knowledge_units CASCADE"))
         await conn.execute(text("TRUNCATE TABLE materials CASCADE"))
@@ -175,6 +176,175 @@ async def upload_and_parse_material(client, token):
     ku_data = ku_resp.json()
     ku_id = ku_data["units"][0]["id"]
     return mid, ku_id
+
+
+@pytest.mark.asyncio
+async def test_prompt_config_defaults_round_trip():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        resp = await client.get("/api/v1/questions/generation/prompt-config", headers=headers)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["has_saved_config"] is False
+    assert data["system_prompt"] == data["defaults"]["system_prompt"]
+    assert data["user_prompt_template"] == data["defaults"]["user_prompt_template"]
+    assert any(item["key"] == "{{count}}" for item in data["placeholders"])
+
+
+@pytest.mark.asyncio
+async def test_prompt_config_save_and_delete():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        save_resp = await client.put(
+            "/api/v1/questions/generation/prompt-config",
+            json={
+                "system_prompt": "自定义系统提示词",
+                "user_prompt_template": "生成 {{count}} 道题目",
+            },
+            headers=headers,
+        )
+        get_resp = await client.get("/api/v1/questions/generation/prompt-config", headers=headers)
+        delete_resp = await client.delete("/api/v1/questions/generation/prompt-config", headers=headers)
+
+    assert save_resp.status_code == 200
+    assert get_resp.status_code == 200
+    assert delete_resp.status_code == 200
+    assert save_resp.json()["has_saved_config"] is True
+    assert get_resp.json()["system_prompt"] == "自定义系统提示词"
+    assert get_resp.json()["user_prompt_template"] == "生成 {{count}} 道题目"
+    assert delete_resp.json()["has_saved_config"] is False
+
+
+@pytest.mark.asyncio
+async def test_prompt_config_rejects_unknown_placeholder():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        resp = await client.put(
+            "/api/v1/questions/generation/prompt-config",
+            json={
+                "system_prompt": "自定义系统提示词",
+                "user_prompt_template": "生成 {{unknown_value}} 道题目",
+            },
+            headers=headers,
+        )
+
+    assert resp.status_code == 422
+    assert "未知占位符" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_preview_free_uses_saved_prompt_config(monkeypatch):
+    captured = {}
+
+    def fake_generate(**kwargs):
+        captured["system_prompt"] = kwargs.get("system_prompt")
+        captured["user_prompt_template"] = kwargs.get("user_prompt_template")
+        return {
+            "questions": [
+                {
+                    "question_type": "single_choice",
+                    "stem": "测试题目",
+                    "options": {"A": "选项A", "B": "选项B", "C": "选项C", "D": "选项D"},
+                    "correct_answer": "A",
+                    "explanation": "解释",
+                    "knowledge_tags": ["标签"],
+                    "dimension": "AI基础知识",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "fallback_used": False,
+            "error": None,
+        }
+
+    monkeypatch.setattr(question_service, "generate_questions_via_llm", fake_generate)
+
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        await client.put(
+            "/api/v1/questions/generation/prompt-config",
+            json={
+                "system_prompt": "保存的系统提示词",
+                "user_prompt_template": "保存的模板 {{count}}",
+            },
+            headers=headers,
+        )
+
+        resp = await client.post(
+            "/api/v1/questions/preview/free",
+            json={
+                "type_distribution": {"single_choice": 1},
+                "difficulty": 3,
+            },
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    assert captured["system_prompt"] == "保存的系统提示词"
+    assert captured["user_prompt_template"] == "保存的模板 {{count}}"
+
+
+@pytest.mark.asyncio
+async def test_preview_free_request_prompt_overrides_saved_defaults(monkeypatch):
+    captured = {}
+
+    def fake_generate(**kwargs):
+        captured["system_prompt"] = kwargs.get("system_prompt")
+        captured["user_prompt_template"] = kwargs.get("user_prompt_template")
+        return {
+            "questions": [
+                {
+                    "question_type": "single_choice",
+                    "stem": "测试题目",
+                    "options": {"A": "选项A", "B": "选项B", "C": "选项C", "D": "选项D"},
+                    "correct_answer": "A",
+                    "explanation": "解释",
+                    "knowledge_tags": ["标签"],
+                    "dimension": "AI基础知识",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "fallback_used": False,
+            "error": None,
+        }
+
+    monkeypatch.setattr(question_service, "generate_questions_via_llm", fake_generate)
+
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        await client.put(
+            "/api/v1/questions/generation/prompt-config",
+            json={
+                "system_prompt": "保存的系统提示词",
+                "user_prompt_template": "保存的模板 {{count}}",
+            },
+            headers=headers,
+        )
+
+        resp = await client.post(
+            "/api/v1/questions/preview/free",
+            json={
+                "type_distribution": {"single_choice": 1},
+                "difficulty": 3,
+                "system_prompt": "本次系统提示词",
+                "user_prompt_template": "本次模板 {{count}}",
+            },
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    assert captured["system_prompt"] == "本次系统提示词"
+    assert captured["user_prompt_template"] == "本次模板 {{count}}"
 
 
 # ---- CRUD Tests ----

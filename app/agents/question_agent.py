@@ -292,7 +292,7 @@ def classify_dimension(stem: str, knowledge_tags: list = None) -> str:
     return best_dim
 
 # ── System Prompt（含每种题型的严格示例） ────────────────────────────
-SYSTEM_PROMPT = """\
+DEFAULT_QUESTION_SYSTEM_PROMPT = """\
 # 角色定义
 
 你同时具备三个身份：
@@ -386,8 +386,54 @@ SYSTEM_PROMPT = """\
 12. **正确答案位置分散**：多道题时，正确答案应分布在不同选项位置（A/B/C/D），不能全部相同
 """
 
+DEFAULT_QUESTION_USER_PROMPT_TEMPLATE = """请生成 {{count}} 道题目，严格遵守系统提示中的输出格式和质量标准。
 
-def _build_user_prompt(
+【基本要求】
+- 题型：{{question_types}}
+{{difficulty_section}}{{bloom_section}}
+- 每道题必须包含 stem、correct_answer、explanation、knowledge_tags、dimension
+- 选择题和判断题必须包含 options（键为 A/B/C/D）
+- 直接输出 JSON 数组，不要包含任何其他文字{{diversity_rules}}{{content_section}}{{custom_requirements}}"""
+
+QUESTION_PROMPT_TEMPLATE_PLACEHOLDERS = [
+    {"key": "{{count}}", "description": "本次要生成的题目数量"},
+    {"key": "{{question_types}}", "description": "题型说明，如单选题(single_choice)"},
+    {"key": "{{difficulty_section}}", "description": "难度等级及出题要求"},
+    {"key": "{{bloom_section}}", "description": "布鲁姆认知层次说明"},
+    {"key": "{{diversity_rules}}", "description": "题干多样性与质量规则"},
+    {"key": "{{content_section}}", "description": "素材内容或自由出题范围"},
+    {"key": "{{custom_requirements}}", "description": "页面额外要求(custom_prompt)"},
+]
+
+ALLOWED_USER_PROMPT_TEMPLATE_KEYS = {
+    item["key"][2:-2] for item in QUESTION_PROMPT_TEMPLATE_PLACEHOLDERS
+}
+USER_PROMPT_TEMPLATE_PATTERN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+
+# Backwards-compatible alias for existing imports.
+SYSTEM_PROMPT = DEFAULT_QUESTION_SYSTEM_PROMPT
+
+
+def validate_user_prompt_template(template: str) -> str:
+    placeholders = [match.group(1).strip() for match in USER_PROMPT_TEMPLATE_PATTERN.finditer(template or "")]
+    unknown = sorted({name for name in placeholders if name not in ALLOWED_USER_PROMPT_TEMPLATE_KEYS})
+    if unknown:
+        rendered = ", ".join(f"{{{{{name}}}}}" for name in unknown)
+        raise ValueError(f"用户提示词模板包含未知占位符: {rendered}")
+    return template
+
+
+def render_user_prompt(template: str, context: dict[str, str]) -> str:
+    validate_user_prompt_template(template)
+
+    def replace(match: re.Match[str]) -> str:
+        key = match.group(1).strip()
+        return context.get(key, match.group(0))
+
+    return USER_PROMPT_TEMPLATE_PATTERN.sub(replace, template)
+
+
+def build_question_prompt_context(
     content: str,
     question_types: list[str],
     count: int,
@@ -395,8 +441,8 @@ def _build_user_prompt(
     bloom_level: Optional[str] = None,
     custom_prompt: Optional[str] = None,
     prompt_seed: Optional[int] = None,
-) -> str:
-    """Build user prompt for question generation with diversity and quality instructions."""
+) -> dict[str, str]:
+    """Build prompt context for question generation with diversity and quality instructions."""
     if prompt_seed is None:
         rng = random
     else:
@@ -463,9 +509,9 @@ def _build_user_prompt(
     context_section = "、".join(selected_contexts)
 
     # ── 额外要求 ──
-    custom_section = ""
+    custom_requirements = ""
     if custom_prompt:
-        custom_section = f"\n\n【额外要求】\n{custom_prompt}"
+        custom_requirements = f"\n\n【额外要求】\n{custom_prompt}"
 
     # ── 内容区 ──
     if content:
@@ -534,14 +580,40 @@ def _build_user_prompt(
 6. **干扰项质量**——每个干扰项都应对应一种常见误解，具有足够迷惑性
 7. **答案简明**——correct_answer（主观题除外）和explanation应简洁明了"""
 
-    return f"""请生成 {count} 道题目，严格遵守系统提示中的输出格式和质量标准。
+    return {
+        "count": str(count),
+        "question_types": type_str,
+        "difficulty_section": difficulty_section,
+        "bloom_section": bloom_section,
+        "diversity_rules": diversity_rules,
+        "content_section": content_section,
+        "custom_requirements": custom_requirements,
+    }
 
-【基本要求】
-- 题型：{type_str}
-{difficulty_section}{bloom_section}
-- 每道题必须包含 stem、correct_answer、explanation、knowledge_tags、dimension
-- 选择题和判断题必须包含 options（键为 A/B/C/D）
-- 直接输出 JSON 数组，不要包含任何其他文字{diversity_rules}{content_section}{custom_section}"""
+
+def _build_user_prompt(
+    content: str,
+    question_types: list[str],
+    count: int,
+    difficulty: int,
+    bloom_level: Optional[str] = None,
+    custom_prompt: Optional[str] = None,
+    prompt_seed: Optional[int] = None,
+    user_prompt_template: Optional[str] = None,
+) -> str:
+    context = build_question_prompt_context(
+        content=content,
+        question_types=question_types,
+        count=count,
+        difficulty=difficulty,
+        bloom_level=bloom_level,
+        custom_prompt=custom_prompt,
+        prompt_seed=prompt_seed,
+    )
+    return render_user_prompt(
+        user_prompt_template or DEFAULT_QUESTION_USER_PROMPT_TEMPLATE,
+        context,
+    )
 
 
 # ── LLM 返回结果后处理与校验 ────────────────────────────────────────
@@ -863,6 +935,8 @@ def generate_questions_via_llm(
     custom_prompt: Optional[str] = None,
     model_config: Optional[ModelConfig] = None,
     prompt_seed: Optional[int] = None,
+    system_prompt: Optional[str] = None,
+    user_prompt_template: Optional[str] = None,
 ) -> dict:
     """Generate questions using LLM API.
 
@@ -896,13 +970,16 @@ def generate_questions_via_llm(
             bloom_level,
             custom_prompt,
             prompt_seed=prompt_seed,
+            user_prompt_template=user_prompt_template,
         )
+        runtime_system_prompt = system_prompt or DEFAULT_QUESTION_SYSTEM_PROMPT
 
         # 根据题目数量动态调整 max_tokens，每题预留约 600 tokens
         max_tokens = max(4096, count * 600)
         response_data = _request_question_generation(
             runtime_model,
             api_key,
+            runtime_system_prompt,
             user_prompt,
             max_tokens,
             _empty_usage,
@@ -1001,6 +1078,7 @@ def _build_fallback_generation_result(
 def _request_question_generation(
     model_config: ModelConfig,
     api_key: str,
+    system_prompt: str,
     user_prompt: str,
     max_tokens: int,
     empty_usage: dict,
@@ -1009,6 +1087,7 @@ def _request_question_generation(
     return _request_question_generation_openai_compatible(
         model_config,
         api_key,
+        system_prompt,
         user_prompt,
         max_tokens,
         empty_usage,
@@ -1018,6 +1097,7 @@ def _request_question_generation(
 def _request_question_generation_openai_compatible(
     model_config: ModelConfig,
     api_key: str,
+    system_prompt: str,
     user_prompt: str,
     max_tokens: int,
     empty_usage: dict,
@@ -1031,7 +1111,7 @@ def _request_question_generation_openai_compatible(
     request_kwargs = {
         "model": model_config.model_name,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.85,

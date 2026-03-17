@@ -31,9 +31,12 @@ from app.schemas.question import (
     PreviewQuestionItem,
     PreviewResponse,
     BatchCreateFromRawRequest,
+    QuestionPromptConfigResponse,
+    QuestionPromptConfigUpdateRequest,
 )
 from app.core.config import settings
 from app.services import question_service
+from app.services import question_prompt_service
 from app.services.question_io_service import export_questions_to_md, parse_md_to_questions
 
 router = APIRouter(prefix="/questions", tags=["题库管理"])
@@ -67,6 +70,43 @@ def _to_response(q) -> QuestionResponse:
 
 
 # ---- Fixed-path routes MUST come before /{question_id} routes ----
+
+
+@router.get("/generation/prompt-config", response_model=QuestionPromptConfigResponse)
+async def get_generation_prompt_config(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    return await question_prompt_service.get_effective_prompt_config(db, current_user.id)
+
+
+@router.put("/generation/prompt-config", response_model=QuestionPromptConfigResponse)
+async def save_generation_prompt_config(
+    body: QuestionPromptConfigUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    try:
+        await question_prompt_service.save_prompt_profile(
+            db=db,
+            user_id=current_user.id,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    await db.commit()
+    return await question_prompt_service.get_effective_prompt_config(db, current_user.id)
+
+
+@router.delete("/generation/prompt-config", response_model=QuestionPromptConfigResponse)
+async def delete_generation_prompt_config(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    await question_prompt_service.delete_prompt_profile(db, current_user.id)
+    await db.commit()
+    return await question_prompt_service.get_effective_prompt_config(db, current_user.id)
 
 @router.post("", response_model=QuestionResponse, status_code=status.HTTP_201_CREATED)
 async def create_question(
@@ -220,7 +260,13 @@ async def generate_questions(
 ):
     """Generate questions from a knowledge unit using AI."""
     try:
-        questions = await question_service.generate_from_knowledge_unit(
+        prompt_config = await question_prompt_service.resolve_generation_prompts(
+            db=db,
+            user_id=current_user.id,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+        )
+        result = await question_service.generate_from_knowledge_unit(
             db=db,
             knowledge_unit_id=body.knowledge_unit_id,
             question_types=body.question_types,
@@ -228,13 +274,20 @@ async def generate_questions(
             difficulty=body.difficulty,
             bloom_level=body.bloom_level,
             created_by=current_user.id,
+            system_prompt=prompt_config["system_prompt"],
+            user_prompt_template=prompt_config["user_prompt_template"],
         )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        status_code = 422 if "占位符" in str(e) or "prompt" in str(e) else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
     await db.commit()
+    questions = result.get("questions", result) if isinstance(result, dict) else result
+    stats = result.get("usage") if isinstance(result, dict) else None
     return GenerateResponse(
         generated=len(questions),
         questions=[_to_response(q) for q in questions],
+        stats=stats,
+        model_name=settings.LLM_MODEL,
     )
 
 
@@ -247,6 +300,12 @@ async def batch_generate_from_material(
 ):
     """Batch generate questions from all knowledge units of a material."""
     try:
+        prompt_config = await question_prompt_service.resolve_generation_prompts(
+            db=db,
+            user_id=current_user.id,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+        )
         questions = await question_service.batch_generate_from_material(
             db=db,
             material_id=material_id,
@@ -256,9 +315,12 @@ async def batch_generate_from_material(
             bloom_level=body.bloom_level,
             max_units=body.max_units,
             created_by=current_user.id,
+            system_prompt=prompt_config["system_prompt"],
+            user_prompt_template=prompt_config["user_prompt_template"],
         )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        status_code = 422 if "占位符" in str(e) or "prompt" in str(e) else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
     await db.commit()
     return GenerateResponse(
         generated=len(questions),
@@ -327,6 +389,12 @@ async def build_question_bank(
 ):
     """Build question bank from a material with specific type distribution."""
     try:
+        prompt_config = await question_prompt_service.resolve_generation_prompts(
+            db=db,
+            user_id=current_user.id,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+        )
         result = await question_service.build_question_bank_from_material(
             db=db,
             material_id=material_id,
@@ -336,9 +404,12 @@ async def build_question_bank(
             max_units=body.max_units,
             created_by=current_user.id,
             custom_prompt=body.custom_prompt,
+            system_prompt=prompt_config["system_prompt"],
+            user_prompt_template=prompt_config["user_prompt_template"],
         )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        status_code = 422 if "占位符" in str(e) or "prompt" in str(e) else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
     await db.commit()
     questions = result.get("questions", result) if isinstance(result, dict) else result
     stats = result.get("stats") if isinstance(result, dict) else None
@@ -372,6 +443,12 @@ async def generate_free(
 ):
     """Generate questions without material, using LLM's own knowledge."""
     try:
+        prompt_config = await question_prompt_service.resolve_generation_prompts(
+            db=db,
+            user_id=current_user.id,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+        )
         result = await question_service.generate_questions_free(
             db=db,
             type_distribution=body.type_distribution,
@@ -379,9 +456,12 @@ async def generate_free(
             bloom_level=body.bloom_level,
             custom_prompt=body.custom_prompt,
             created_by=current_user.id,
+            system_prompt=prompt_config["system_prompt"],
+            user_prompt_template=prompt_config["user_prompt_template"],
         )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        status_code = 422 if "占位符" in str(e) or "prompt" in str(e) else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
     await db.commit()
     questions = result.get("questions", result) if isinstance(result, dict) else result
     stats = result.get("stats") if isinstance(result, dict) else None
@@ -403,6 +483,12 @@ async def preview_question_bank(
     """Generate question bank preview WITHOUT saving to DB.
     Returns raw question items for user review before committing."""
     try:
+        prompt_config = await question_prompt_service.resolve_generation_prompts(
+            db=db,
+            user_id=current_user.id,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+        )
         result = await question_service.preview_question_bank_from_material(
             db=db,
             material_id=material_id,
@@ -411,9 +497,12 @@ async def preview_question_bank(
             bloom_level=body.bloom_level,
             max_units=body.max_units,
             custom_prompt=body.custom_prompt,
+            system_prompt=prompt_config["system_prompt"],
+            user_prompt_template=prompt_config["user_prompt_template"],
         )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        status_code = 422 if "占位符" in str(e) or "prompt" in str(e) else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
 
     preview_items = result.get("questions", [])
     stats = result.get("stats")
@@ -428,18 +517,28 @@ async def preview_question_bank(
 @router.post("/preview/free", response_model=PreviewResponse)
 async def preview_free(
     body: FreeGenerateRequest,
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "organizer"])),
 ):
     """Generate preview questions without material (no DB save)."""
     try:
+        prompt_config = await question_prompt_service.resolve_generation_prompts(
+            db=db,
+            user_id=current_user.id,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+        )
         result = question_service.preview_questions_free(
             type_distribution=body.type_distribution,
             difficulty=body.difficulty,
             bloom_level=body.bloom_level,
             custom_prompt=body.custom_prompt,
+            system_prompt=prompt_config["system_prompt"],
+            user_prompt_template=prompt_config["user_prompt_template"],
         )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        status_code = 422 if "占位符" in str(e) or "prompt" in str(e) else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
 
     preview_items = result.get("questions", [])
     stats = result.get("stats")

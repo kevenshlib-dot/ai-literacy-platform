@@ -335,6 +335,8 @@ async def generate_from_knowledge_unit(
     custom_prompt: Optional[str] = None,
     model_config: Optional[ModelConfig] = None,
     prompt_seed: Optional[int] = None,
+    system_prompt: Optional[str] = None,
+    user_prompt_template: Optional[str] = None,
 ) -> list[Question]:
     """Generate questions from a knowledge unit using LLM."""
     # Fetch KU
@@ -355,6 +357,8 @@ async def generate_from_knowledge_unit(
         custom_prompt=custom_prompt,
         model_config=model_config,
         prompt_seed=prompt_seed,
+        system_prompt=system_prompt,
+        user_prompt_template=user_prompt_template,
     )
     raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
     usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
@@ -418,6 +422,8 @@ async def batch_generate_from_material(
     bloom_level: Optional[str] = None,
     max_units: int = 10,
     created_by: Optional[uuid.UUID] = None,
+    system_prompt: Optional[str] = None,
+    user_prompt_template: Optional[str] = None,
 ) -> list[Question]:
     """Generate questions from all knowledge units of a material."""
     # Verify material exists
@@ -451,6 +457,8 @@ async def batch_generate_from_material(
                 difficulty=difficulty,
                 bloom_level=bloom_level,
                 created_by=created_by,
+                system_prompt=system_prompt,
+                user_prompt_template=user_prompt_template,
             )
             all_questions.extend(questions)
         except Exception as e:
@@ -473,6 +481,8 @@ async def build_question_bank_from_material(
     custom_prompt: Optional[str] = None,
     model_config: Optional[ModelConfig] = None,
     prompt_seed: Optional[int] = None,
+    system_prompt: Optional[str] = None,
+    user_prompt_template: Optional[str] = None,
 ) -> list[Question]:
     """Build question bank from a material with specific type distribution.
 
@@ -513,6 +523,8 @@ async def build_question_bank_from_material(
         custom_prompt=custom_prompt,
         model_config=model_config,
         prompt_seed=prompt_seed,
+        system_prompt=system_prompt,
+        user_prompt_template=user_prompt_template,
     )
     questions = await batch_create_from_raw(
         db=db,
@@ -593,6 +605,8 @@ async def generate_questions_free(
     created_by: Optional[uuid.UUID] = None,
     model_config: Optional[ModelConfig] = None,
     prompt_seed: Optional[int] = None,
+    system_prompt: Optional[str] = None,
+    user_prompt_template: Optional[str] = None,
 ) -> list[Question]:
     """Generate questions without material, using LLM's own knowledge."""
     all_questions: list[Question] = []
@@ -612,6 +626,8 @@ async def generate_questions_free(
             custom_prompt=custom_prompt,
             model_config=model_config,
             prompt_seed=prompt_seed,
+            system_prompt=system_prompt,
+            user_prompt_template=user_prompt_template,
         )
         raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
         usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
@@ -674,6 +690,8 @@ async def preview_question_bank_from_material(
     custom_prompt: Optional[str] = None,
     model_config: Optional[ModelConfig] = None,
     prompt_seed: Optional[int] = None,
+    system_prompt: Optional[str] = None,
+    user_prompt_template: Optional[str] = None,
 ) -> dict:
     """Preview question bank generation WITHOUT saving to DB.
 
@@ -739,6 +757,8 @@ async def preview_question_bank_from_material(
                     custom_prompt=attempt_prompt,
                     model_config=model_config,
                     prompt_seed=prompt_seed,
+                    system_prompt=system_prompt,
+                    user_prompt_template=user_prompt_template,
                 )
                 raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
                 usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
@@ -813,6 +833,8 @@ def preview_questions_free(
     custom_prompt: Optional[str] = None,
     model_config: Optional[ModelConfig] = None,
     prompt_seed: Optional[int] = None,
+    system_prompt: Optional[str] = None,
+    user_prompt_template: Optional[str] = None,
 ) -> dict:
     """Preview question generation without material. No DB involvement."""
     all_preview: list[dict] = []
@@ -834,6 +856,8 @@ def preview_questions_free(
             custom_prompt=custom_prompt,
             model_config=model_config,
             prompt_seed=prompt_seed,
+            system_prompt=system_prompt,
+            user_prompt_template=user_prompt_template,
         )
         raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
         usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}

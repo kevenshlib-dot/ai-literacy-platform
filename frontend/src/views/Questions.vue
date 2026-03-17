@@ -606,7 +606,7 @@
           style="margin-bottom: 16px"
         />
 
-        <a-form-item label="出题提示词（可选）">
+        <a-form-item label="额外要求（会注入到用户提示词模板）">
           <a-textarea
             v-model:value="bankBuildModal.customPrompt"
             placeholder="可输入对出题的特殊要求，如：侧重考察应用能力、避免过于简单的记忆题、题目需贴近实际工作场景..."
@@ -615,6 +615,73 @@
             :rows="3"
           />
         </a-form-item>
+
+        <a-card size="small" :loading="bankBuildModal.promptConfigLoading" style="margin-bottom: 16px">
+          <template #title>高级提示词配置</template>
+          <template #extra>
+            <a-space>
+              <a-tag :color="bankBuildModal.hasSavedPromptConfig ? 'processing' : 'default'">
+                {{ bankBuildModal.hasSavedPromptConfig ? '使用我的默认提示词' : '使用系统默认提示词' }}
+              </a-tag>
+              <a-button size="small" @click="resetPromptEditorsToDefaults">
+                <template #icon><UndoOutlined /></template>
+                恢复系统默认
+              </a-button>
+              <a-button
+                size="small"
+                type="primary"
+                :loading="bankBuildModal.promptSaveLoading"
+                @click="savePromptConfig"
+              >
+                <template #icon><SaveOutlined /></template>
+                保存为我的默认提示词
+              </a-button>
+            </a-space>
+          </template>
+
+          <a-alert
+            type="info"
+            show-icon
+            style="margin-bottom: 12px"
+            :message="isUsingDefaultPromptConfig ? '当前编辑内容与系统默认一致，点击保存会清除个人默认配置。' : '当前编辑内容会直接用于本次生成；点击保存后，下次打开会自动带出。'"
+          />
+
+          <a-form-item label="系统提示词" style="margin-bottom: 12px">
+            <a-textarea
+              v-model:value="bankBuildModal.systemPrompt"
+              :maxlength="20000"
+              show-count
+              :auto-size="{ minRows: 8, maxRows: 16 }"
+              placeholder="请输入系统提示词"
+            />
+          </a-form-item>
+
+          <a-form-item label="用户提示词模板" style="margin-bottom: 12px">
+            <a-textarea
+              v-model:value="bankBuildModal.userPromptTemplate"
+              :maxlength="20000"
+              show-count
+              :auto-size="{ minRows: 10, maxRows: 18 }"
+              placeholder="请输入用户提示词模板，支持占位符"
+            />
+          </a-form-item>
+
+          <div>
+            <div style="font-weight: 600; margin-bottom: 8px">可用占位符</div>
+            <a-space wrap>
+              <a-tag
+                v-for="item in bankBuildModal.promptPlaceholders"
+                :key="item.key"
+                color="blue"
+                style="cursor: pointer"
+                @click="copyPromptPlaceholder(item.key)"
+              >
+                <CopyOutlined />
+                {{ item.key }} - {{ item.description }}
+              </a-tag>
+            </a-space>
+          </div>
+        </a-card>
 
         <a-button
           type="dashed"
@@ -1006,6 +1073,9 @@ import {
   EyeOutlined,
   EditOutlined,
   DeleteOutlined,
+  SaveOutlined,
+  CopyOutlined,
+  UndoOutlined,
 } from '@ant-design/icons-vue'
 import { message, Modal } from 'ant-design-vue'
 import request from '@/utils/request'
@@ -1700,16 +1770,36 @@ async function exportSelectedMd() {
 }
 
 // ---- Question Bank Build ----
+type PromptPlaceholder = {
+  key: string
+  description: string
+}
+
+type PromptDefaults = {
+  system_prompt: string
+  user_prompt_template: string
+}
+
 const bankBuildModal = reactive({
   visible: false,
   loading: false,
   suggestLoading: false,
   materialsLoading: false,
+  promptConfigLoading: false,
+  promptSaveLoading: false,
   materialIds: [] as string[],
   materialInfo: null as string | null,
   difficulty: 3,
   bloomLevel: undefined as string | undefined,
   customPrompt: '',
+  systemPrompt: '',
+  userPromptTemplate: '',
+  hasSavedPromptConfig: false,
+  promptDefaults: {
+    system_prompt: '',
+    user_prompt_template: '',
+  } as PromptDefaults,
+  promptPlaceholders: [] as PromptPlaceholder[],
 })
 
 const bankTypeDist = reactive({
@@ -1846,8 +1936,88 @@ const bankTotalCount = computed(() => {
   return Object.values(bankTypeDist).reduce((sum, v) => sum + (v || 0), 0)
 })
 
+const isUsingDefaultPromptConfig = computed(() => (
+  bankBuildModal.systemPrompt === bankBuildModal.promptDefaults.system_prompt
+  && bankBuildModal.userPromptTemplate === bankBuildModal.promptDefaults.user_prompt_template
+))
+
 function filterMaterialOption(input: string, option: any) {
   return (option?.children?.[0]?.children || '').toLowerCase().includes(input.toLowerCase())
+}
+
+async function loadPromptConfig() {
+  bankBuildModal.promptConfigLoading = true
+  try {
+    const data: any = await request.get('/questions/generation/prompt-config')
+    bankBuildModal.systemPrompt = data.system_prompt || ''
+    bankBuildModal.userPromptTemplate = data.user_prompt_template || ''
+    bankBuildModal.hasSavedPromptConfig = !!data.has_saved_config
+    bankBuildModal.promptDefaults = {
+      system_prompt: data.defaults?.system_prompt || '',
+      user_prompt_template: data.defaults?.user_prompt_template || '',
+    }
+    bankBuildModal.promptPlaceholders = data.placeholders || []
+  } catch {
+    message.error('加载提示词配置失败')
+  } finally {
+    bankBuildModal.promptConfigLoading = false
+  }
+}
+
+function resetPromptEditorsToDefaults() {
+  bankBuildModal.systemPrompt = bankBuildModal.promptDefaults.system_prompt || ''
+  bankBuildModal.userPromptTemplate = bankBuildModal.promptDefaults.user_prompt_template || ''
+}
+
+async function savePromptConfig() {
+  if (!bankBuildModal.systemPrompt.trim() || !bankBuildModal.userPromptTemplate.trim()) {
+    message.warning('系统提示词和用户提示词模板不能为空')
+    return
+  }
+
+  bankBuildModal.promptSaveLoading = true
+  try {
+    if (isUsingDefaultPromptConfig.value) {
+      const data: any = await request.delete('/questions/generation/prompt-config')
+      bankBuildModal.hasSavedPromptConfig = !!data.has_saved_config
+      bankBuildModal.promptDefaults = {
+        system_prompt: data.defaults?.system_prompt || bankBuildModal.promptDefaults.system_prompt,
+        user_prompt_template: data.defaults?.user_prompt_template || bankBuildModal.promptDefaults.user_prompt_template,
+      }
+      bankBuildModal.promptPlaceholders = data.placeholders || bankBuildModal.promptPlaceholders
+      bankBuildModal.systemPrompt = data.system_prompt || bankBuildModal.systemPrompt
+      bankBuildModal.userPromptTemplate = data.user_prompt_template || bankBuildModal.userPromptTemplate
+      message.success('已恢复为系统默认提示词')
+      return
+    }
+
+    const data: any = await request.put('/questions/generation/prompt-config', {
+      system_prompt: bankBuildModal.systemPrompt,
+      user_prompt_template: bankBuildModal.userPromptTemplate,
+    })
+    bankBuildModal.hasSavedPromptConfig = !!data.has_saved_config
+    bankBuildModal.promptDefaults = {
+      system_prompt: data.defaults?.system_prompt || bankBuildModal.promptDefaults.system_prompt,
+      user_prompt_template: data.defaults?.user_prompt_template || bankBuildModal.promptDefaults.user_prompt_template,
+    }
+    bankBuildModal.promptPlaceholders = data.placeholders || bankBuildModal.promptPlaceholders
+    bankBuildModal.systemPrompt = data.system_prompt || bankBuildModal.systemPrompt
+    bankBuildModal.userPromptTemplate = data.user_prompt_template || bankBuildModal.userPromptTemplate
+    message.success('已保存为我的默认提示词')
+  } catch (e: any) {
+    message.error(e?.response?.data?.detail || '保存提示词配置失败')
+  } finally {
+    bankBuildModal.promptSaveLoading = false
+  }
+}
+
+async function copyPromptPlaceholder(text: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    message.success(`已复制 ${text}`)
+  } catch {
+    message.error('复制失败')
+  }
 }
 
 async function showBankBuildModal() {
@@ -1856,6 +2026,11 @@ async function showBankBuildModal() {
   bankBuildModal.difficulty = 3
   bankBuildModal.bloomLevel = undefined
   bankBuildModal.customPrompt = ''
+  bankBuildModal.systemPrompt = ''
+  bankBuildModal.userPromptTemplate = ''
+  bankBuildModal.hasSavedPromptConfig = false
+  bankBuildModal.promptDefaults = { system_prompt: '', user_prompt_template: '' }
+  bankBuildModal.promptPlaceholders = []
   bankTypeDist.single_choice = 5
   bankTypeDist.multiple_choice = 2
   bankTypeDist.true_false = 3
@@ -1880,6 +2055,8 @@ async function showBankBuildModal() {
   } finally {
     bankBuildModal.materialsLoading = false
   }
+
+  await loadPromptConfig()
 }
 
 async function onMaterialChange(ids: string[]) {
@@ -1934,6 +2111,10 @@ async function handleBankBuild() {
     message.warning('请至少设置一种题型的数量')
     return
   }
+  if (!bankBuildModal.systemPrompt.trim() || !bankBuildModal.userPromptTemplate.trim()) {
+    message.warning('请先填写系统提示词和用户提示词模板')
+    return
+  }
 
   bankBuildModal.loading = true
   startGenProgress(bankTotalCount.value)
@@ -1950,6 +2131,8 @@ async function handleBankBuild() {
       difficulty: bankBuildModal.difficulty,
       bloom_level: bankBuildModal.bloomLevel || undefined,
       custom_prompt: bankBuildModal.customPrompt || undefined,
+      system_prompt: bankBuildModal.systemPrompt.trim() || undefined,
+      user_prompt_template: bankBuildModal.userPromptTemplate.trim() || undefined,
     }
 
     if (bankBuildModal.materialIds.length > 0) {

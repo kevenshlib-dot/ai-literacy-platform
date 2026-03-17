@@ -5,6 +5,11 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 
+class PromptOverrideMixin(BaseModel):
+    system_prompt: Optional[str] = Field(default=None, max_length=20000)
+    user_prompt_template: Optional[str] = Field(default=None, max_length=20000)
+
+
 class QuestionCreate(BaseModel):
     question_type: str
     stem: str
@@ -64,7 +69,7 @@ class QuestionListResponse(BaseModel):
     items: List[QuestionResponse]
 
 
-class GenerateRequest(BaseModel):
+class GenerateRequest(PromptOverrideMixin):
     """Request to generate questions from a knowledge unit."""
     knowledge_unit_id: UUID
     question_types: List[str] = Field(
@@ -76,7 +81,7 @@ class GenerateRequest(BaseModel):
     bloom_level: Optional[str] = None
 
 
-class BatchGenerateRequest(BaseModel):
+class BatchGenerateRequest(PromptOverrideMixin):
     """Request to generate questions from a material's knowledge units."""
     question_types: List[str] = Field(default=["single_choice"])
     count_per_unit: int = Field(default=2, ge=1, le=5)
@@ -142,7 +147,7 @@ class AIReviewResponse(BaseModel):
     comments: str
 
 
-class QuestionBankBuildRequest(BaseModel):
+class QuestionBankBuildRequest(PromptOverrideMixin):
     """Request to build question bank from a material with type distribution."""
     type_distribution: dict = Field(
         description="Question type to count mapping, e.g. {'single_choice': 10, 'true_false': 5}",
@@ -153,7 +158,7 @@ class QuestionBankBuildRequest(BaseModel):
     custom_prompt: Optional[str] = Field(default=None, max_length=500)
 
 
-class FreeGenerateRequest(BaseModel):
+class FreeGenerateRequest(PromptOverrideMixin):
     """Request to generate questions without material, using LLM knowledge."""
     type_distribution: dict = Field(
         description="Question type to count mapping",
@@ -199,3 +204,21 @@ class PreviewResponse(BaseModel):
 class BatchCreateFromRawRequest(BaseModel):
     """批量保存预览题目到数据库。"""
     questions: List[PreviewQuestionItem]
+
+
+class QuestionPromptPlaceholderResponse(BaseModel):
+    key: str
+    description: str
+
+
+class QuestionPromptConfigResponse(BaseModel):
+    system_prompt: str
+    user_prompt_template: str
+    has_saved_config: bool
+    defaults: dict
+    placeholders: List[QuestionPromptPlaceholderResponse]
+
+
+class QuestionPromptConfigUpdateRequest(BaseModel):
+    system_prompt: str = Field(..., min_length=1, max_length=20000)
+    user_prompt_template: str = Field(..., min_length=1, max_length=20000)
