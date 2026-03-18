@@ -5,11 +5,13 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.api.deps import get_current_active_user, require_role
 from app.models.user import User
+from app.models.question import QuestionLike, QuestionFavorite, QuestionFeedback
 from app.schemas.question import (
     QuestionCreate,
     QuestionUpdate,
@@ -35,6 +37,8 @@ from app.schemas.question import (
     QuestionPromptConfigUpdateRequest,
     QuestionPromptPreviewRequest,
     QuestionPromptPreviewResponse,
+    QuestionInteractionsResponse,
+    FeedbackRequest,
 )
 from app.core.config import settings
 from app.services import question_service
@@ -171,6 +175,7 @@ async def list_questions(
     dimension: Optional[str] = None,
     difficulty: Optional[int] = Query(None, ge=1, le=5),
     keyword: Optional[str] = None,
+    only_mine: bool = Query(False),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
@@ -184,6 +189,7 @@ async def list_questions(
         dimension=dimension,
         difficulty=difficulty,
         keyword=keyword,
+        created_by=current_user.id if only_mine else None,
     )
     return QuestionListResponse(
         total=total,
@@ -808,3 +814,138 @@ async def get_review_history(
         )
         for r in records
     ]
+
+
+# ---- Interaction endpoints (like, favorite, feedback) ----
+
+@router.get("/{question_id}/interactions", response_model=QuestionInteractionsResponse)
+async def get_question_interactions(
+    question_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Get current user's interaction state for a question."""
+    liked_result = await db.execute(
+        select(QuestionLike).where(
+            QuestionLike.question_id == question_id,
+            QuestionLike.user_id == current_user.id,
+        )
+    )
+    liked = liked_result.scalar_one_or_none() is not None
+
+    favorited_result = await db.execute(
+        select(QuestionFavorite).where(
+            QuestionFavorite.question_id == question_id,
+            QuestionFavorite.user_id == current_user.id,
+        )
+    )
+    favorited = favorited_result.scalar_one_or_none() is not None
+
+    like_count_result = await db.execute(
+        select(func.count()).where(QuestionLike.question_id == question_id)
+    )
+    like_count = like_count_result.scalar() or 0
+
+    favorite_count_result = await db.execute(
+        select(func.count()).where(QuestionFavorite.question_id == question_id)
+    )
+    favorite_count = favorite_count_result.scalar() or 0
+
+    return QuestionInteractionsResponse(
+        liked=liked,
+        favorited=favorited,
+        like_count=like_count,
+        favorite_count=favorite_count,
+    )
+
+
+@router.post("/{question_id}/like", response_model=dict)
+async def toggle_like(
+    question_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Toggle like for a question. Returns {liked, like_count}."""
+    existing = await db.execute(
+        select(QuestionLike).where(
+            QuestionLike.question_id == question_id,
+            QuestionLike.user_id == current_user.id,
+        )
+    )
+    record = existing.scalar_one_or_none()
+
+    if record is not None:
+        await db.execute(
+            delete(QuestionLike).where(
+                QuestionLike.question_id == question_id,
+                QuestionLike.user_id == current_user.id,
+            )
+        )
+        liked = False
+    else:
+        db.add(QuestionLike(question_id=question_id, user_id=current_user.id))
+        liked = True
+
+    await db.commit()
+
+    count_result = await db.execute(
+        select(func.count()).where(QuestionLike.question_id == question_id)
+    )
+    like_count = count_result.scalar() or 0
+
+    return {"liked": liked, "like_count": like_count}
+
+
+@router.post("/{question_id}/favorite", response_model=dict)
+async def toggle_favorite(
+    question_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Toggle favorite for a question. Returns {favorited, favorite_count}."""
+    existing = await db.execute(
+        select(QuestionFavorite).where(
+            QuestionFavorite.question_id == question_id,
+            QuestionFavorite.user_id == current_user.id,
+        )
+    )
+    record = existing.scalar_one_or_none()
+
+    if record is not None:
+        await db.execute(
+            delete(QuestionFavorite).where(
+                QuestionFavorite.question_id == question_id,
+                QuestionFavorite.user_id == current_user.id,
+            )
+        )
+        favorited = False
+    else:
+        db.add(QuestionFavorite(question_id=question_id, user_id=current_user.id))
+        favorited = True
+
+    await db.commit()
+
+    count_result = await db.execute(
+        select(func.count()).where(QuestionFavorite.question_id == question_id)
+    )
+    favorite_count = count_result.scalar() or 0
+
+    return {"favorited": favorited, "favorite_count": favorite_count}
+
+
+@router.post("/{question_id}/feedback", response_model=dict)
+async def submit_feedback(
+    question_id: UUID,
+    body: FeedbackRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Submit feedback for a question."""
+    db.add(QuestionFeedback(
+        question_id=question_id,
+        user_id=current_user.id,
+        feedback_type=body.feedback_type,
+        comment=body.comment,
+    ))
+    await db.commit()
+    return {"ok": True}

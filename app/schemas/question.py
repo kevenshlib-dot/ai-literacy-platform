@@ -248,3 +248,15 @@ class QuestionPromptPreviewResponse(BaseModel):
     placeholders: List[QuestionPromptPlaceholderResponse]
     preview_note: Optional[str] = None
     prompt_seed: int
+
+
+class QuestionInteractionsResponse(BaseModel):
+    liked: bool
+    favorited: bool
+    like_count: int
+    favorite_count: int
+
+
+class FeedbackRequest(BaseModel):
+    feedback_type: str
+    comment: Optional[str] = None

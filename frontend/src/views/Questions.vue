@@ -83,6 +83,7 @@
           </a-col>
           <a-col :span="4">
             <a-space>
+              <a-checkbox v-model:checked="filters.only_mine" @change="fetchQuestions">仅看自己</a-checkbox>
               <a-button type="primary" @click="fetchQuestions">查询</a-button>
               <a-button @click="resetFilters">重置</a-button>
             </a-space>
@@ -387,6 +388,27 @@
       title="题目详情"
       :width="640"
     >
+      <template #footer>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <a-button
+            :disabled="detailIndex <= 0"
+            @click="navigateDetail(-1)"
+          >
+            <template #icon><LeftOutlined /></template>
+            上一题
+          </a-button>
+          <span style="color: #999; font-size: 12px;">
+            {{ detailIndex >= 0 ? `${detailIndex + 1} / ${questions.length}` : '' }}
+          </span>
+          <a-button
+            :disabled="detailIndex < 0 || detailIndex >= questions.length - 1"
+            @click="navigateDetail(1)"
+          >
+            下一题
+            <template #icon><RightOutlined /></template>
+          </a-button>
+        </div>
+      </template>
       <template v-if="detailQuestion">
         <a-descriptions :column="1" bordered size="small">
           <a-descriptions-item label="题型">
@@ -420,48 +442,64 @@
         </a-descriptions>
 
         <!-- Action Buttons -->
-        <div style="margin-top: 16px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
-          <a-space wrap>
-            <a-button @click="runAICheck(detailQuestion.id)" :loading="aiCheckLoading">
-              <template #icon><RobotOutlined /></template>
-              AI质量检查
-            </a-button>
-            <a-button
-              v-if="detailQuestion.status === 'draft'"
-              type="primary"
-              style="background: #1f4e79; border-color: #1f4e79"
-              @click="submitForReview(detailQuestion.id)"
-            >提交审核</a-button>
-            <a-button
-              v-if="detailQuestion.status === 'draft' || detailQuestion.status === 'pending_review'"
-              type="primary"
-              style="background: #52c41a; border-color: #52c41a"
-              @click="reviewAction(detailQuestion.id, 'approve')"
-            >通过</a-button>
-            <a-button
-              v-if="detailQuestion.status === 'draft' || detailQuestion.status === 'pending_review'"
-              danger
-              @click="reviewAction(detailQuestion.id, 'reject')"
-            >拒绝</a-button>
-          </a-space>
-          <a-space>
-            <a-button
-              v-if="detailQuestion.status === 'draft' || detailQuestion.status === 'pending_review'"
-              @click="detailVisible = false; editQuestion(detailQuestion)"
-            >
-              <template #icon><EditOutlined /></template>
-              编辑
-            </a-button>
-            <a-popconfirm
-              title="确认删除该题目？"
-              @confirm="deleteQuestion(detailQuestion.id); detailVisible = false"
-            >
-              <a-button danger>
-                <template #icon><DeleteOutlined /></template>
-                删除
+        <div style="margin-top: 16px;">
+          <!-- Row 1: 互动 + 管理 -->
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <a-space>
+              <a-button @click="toggleLike">
+                <template #icon><LikeFilled v-if="detailInteractions.liked" /><LikeOutlined v-else /></template>
+                {{ detailInteractions.like_count }}
               </a-button>
-            </a-popconfirm>
-          </a-space>
+              <a-button @click="toggleFavorite">
+                <template #icon><StarFilled v-if="detailInteractions.favorited" /><StarOutlined v-else /></template>
+                收藏
+              </a-button>
+              <a-button @click="feedbackVisible = true">
+                <template #icon><FlagOutlined /></template>
+                反馈
+              </a-button>
+            </a-space>
+            <a-space>
+              <a-button
+                v-if="detailQuestion.status === 'draft' || detailQuestion.status === 'pending_review'"
+                @click="detailVisible = false; editQuestion(detailQuestion)"
+              >
+                <template #icon><EditOutlined /></template>编辑
+              </a-button>
+              <a-popconfirm title="确认删除该题目？" @confirm="deleteQuestion(detailQuestion.id); detailVisible = false">
+                <a-button danger><template #icon><DeleteOutlined /></template>删除</a-button>
+              </a-popconfirm>
+            </a-space>
+          </div>
+
+          <!-- Divider -->
+          <a-divider style="margin: 10px 0" />
+
+          <!-- Row 2: 工作流（右对齐） -->
+          <div style="display: flex; justify-content: flex-end;">
+            <a-space>
+              <a-button @click="runAICheck(detailQuestion.id)" :loading="aiCheckLoading">
+                <template #icon><RobotOutlined /></template>AI质量检查
+              </a-button>
+              <a-button
+                v-if="detailQuestion.status === 'draft'"
+                type="primary"
+                style="background: #1f4e79; border-color: #1f4e79"
+                @click="submitForReview(detailQuestion.id)"
+              >提交审核</a-button>
+              <a-button
+                v-if="detailQuestion.status === 'draft' || detailQuestion.status === 'pending_review'"
+                type="primary"
+                style="background: #52c41a; border-color: #52c41a"
+                @click="reviewAction(detailQuestion.id, 'approve')"
+              >通过</a-button>
+              <a-button
+                v-if="detailQuestion.status === 'draft' || detailQuestion.status === 'pending_review'"
+                danger
+                @click="reviewAction(detailQuestion.id, 'reject')"
+              >拒绝</a-button>
+            </a-space>
+          </div>
         </div>
 
         <!-- AI Check Result -->
@@ -499,6 +537,23 @@
         </a-card>
       </template>
     </a-drawer>
+
+    <!-- Feedback Modal -->
+    <a-modal
+      v-model:open="feedbackVisible"
+      title="提交反馈"
+      @ok="submitFeedback"
+      :confirm-loading="feedbackLoading"
+      :ok-button-props="{ disabled: !feedbackType }"
+    >
+      <a-radio-group v-model:value="feedbackType" style="margin-bottom: 12px; display: flex; flex-direction: column; gap: 8px">
+        <a-radio value="error">题目有误</a-radio>
+        <a-radio value="unclear">表述不清</a-radio>
+        <a-radio value="wrong_answer">答案有误</a-radio>
+        <a-radio value="other">其他</a-radio>
+      </a-radio-group>
+      <a-textarea v-model:value="feedbackComment" placeholder="补充说明（选填）" :rows="3" />
+    </a-modal>
 
     <!-- Review Comment Modal -->
     <a-modal
@@ -631,101 +686,83 @@
               <a-tag :color="bankBuildModal.hasSavedPromptConfig ? 'processing' : 'default'">
                 {{ bankBuildModal.hasSavedPromptConfig ? '使用我的默认提示词' : '使用系统默认提示词' }}
               </a-tag>
-              <a-button size="small" @click="resetPromptEditorsToDefaults">
-                <template #icon><UndoOutlined /></template>
-                恢复系统默认
-              </a-button>
               <a-button
                 size="small"
-                type="primary"
-                :loading="bankBuildModal.promptSaveLoading"
-                @click="savePromptConfig"
+                :loading="bankBuildModal.promptPreviewLoading"
+                @click="openPromptPreview"
               >
-                <template #icon><SaveOutlined /></template>
-                保存为我的默认提示词
+                <template #icon><EyeOutlined /></template>
+                预览最终提示词
+              </a-button>
+              <a-tag v-if="bankBuildModal.promptPreviewDirty" color="warning">预览未刷新</a-tag>
+              <a-button size="small" type="link" @click="bankBuildModal.promptConfigCollapsed = !bankBuildModal.promptConfigCollapsed">
+                {{ bankBuildModal.promptConfigCollapsed ? '展开' : '收起' }}
               </a-button>
             </a-space>
           </template>
 
-          <a-alert
-            type="info"
-            show-icon
-            style="margin-bottom: 12px"
-            :message="isUsingDefaultPromptConfig ? '当前编辑内容与系统默认一致，点击保存会清除个人默认配置。' : '当前编辑内容会直接用于本次生成；点击保存后，下次打开会自动带出。'"
-          />
-
-          <a-form-item label="系统提示词" style="margin-bottom: 12px">
-            <a-textarea
-              v-model:value="bankBuildModal.systemPrompt"
-              :maxlength="20000"
-              show-count
-              :auto-size="{ minRows: 8, maxRows: 16 }"
-              placeholder="请输入系统提示词"
+          <template v-if="!bankBuildModal.promptConfigCollapsed">
+            <a-alert
+              type="info"
+              show-icon
+              style="margin-bottom: 12px"
+              :message="isUsingDefaultPromptConfig ? '当前编辑内容与系统默认一致，点击保存会清除个人默认配置。' : '当前编辑内容会直接用于本次生成；点击保存后，下次打开会自动带出。'"
             />
-          </a-form-item>
 
-          <a-form-item label="用户提示词模板" style="margin-bottom: 12px">
-            <a-textarea
-              v-model:value="bankBuildModal.userPromptTemplate"
-              :maxlength="20000"
-              show-count
-              :auto-size="{ minRows: 10, maxRows: 18 }"
-              placeholder="请输入用户提示词模板，支持占位符"
-            />
-          </a-form-item>
-
-          <div>
-            <div style="font-weight: 600; margin-bottom: 8px">可用占位符</div>
-            <a-space wrap>
-              <a-tag
-                v-for="item in bankBuildModal.promptPlaceholders"
-                :key="item.key"
-                color="blue"
-                style="cursor: pointer"
-                @click="copyPromptPlaceholder(item.key)"
-              >
-                <CopyOutlined />
-                {{ item.key }} - {{ item.description }}（来源：{{ item.source }}）
-              </a-tag>
-            </a-space>
-          </div>
-
-          <div style="margin-top: 16px">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; gap: 12px; flex-wrap: wrap;">
-              <div style="font-weight: 600">最终用户提示词预览（按实际调用拆分）</div>
+            <div style="display: flex; justify-content: flex-end; margin-bottom: 12px;">
               <a-space>
-                <a-tag v-if="bankBuildModal.promptPreviewDirty" color="warning">预览未刷新</a-tag>
-                <a-button size="small" :loading="bankBuildModal.promptPreviewLoading" @click="refreshPromptPreview">
-                  <template #icon><ReloadOutlined /></template>
-                  刷新预览
+                <a-button size="small" @click="resetPromptEditorsToDefaults">
+                  <template #icon><UndoOutlined /></template>
+                  恢复系统默认
+                </a-button>
+                <a-button
+                  size="small"
+                  type="primary"
+                  :loading="bankBuildModal.promptSaveLoading"
+                  @click="savePromptConfig"
+                >
+                  <template #icon><SaveOutlined /></template>
+                  保存为我的默认提示词
                 </a-button>
               </a-space>
             </div>
-            <a-alert
-              v-if="bankBuildModal.promptPreviewNote"
-              type="info"
-              show-icon
-              :message="bankBuildModal.promptPreviewNote"
-              style="margin-bottom: 8px"
-            />
-            <a-empty
-              v-if="!bankBuildModal.renderedUserPrompts.length"
-              :description="bankBuildModal.promptPreviewLoading ? '正在生成预览...' : '点击“刷新预览”查看本次实际会发送给模型的用户提示词'"
-            />
-            <div v-else style="display: flex; flex-direction: column; gap: 12px;">
-              <div
-                v-for="(item, index) in bankBuildModal.renderedUserPrompts"
-                :key="`${index}-${item.title}`"
-              >
-                <div style="font-weight: 600; margin-bottom: 6px;">{{ item.title }}</div>
-                <a-textarea
-                  :value="item.rendered_user_prompt"
-                  readonly
-                  :auto-size="{ minRows: 6, maxRows: 14 }"
-                />
-              </div>
+
+            <a-form-item label="系统提示词" style="margin-bottom: 12px">
+              <a-textarea
+                v-model:value="bankBuildModal.systemPrompt"
+                :maxlength="20000"
+                show-count
+                :auto-size="{ minRows: 8, maxRows: 16 }"
+                placeholder="请输入系统提示词"
+              />
+            </a-form-item>
+
+            <a-form-item label="用户提示词模板" style="margin-bottom: 12px">
+              <a-textarea
+                v-model:value="bankBuildModal.userPromptTemplate"
+                :maxlength="20000"
+                show-count
+                :auto-size="{ minRows: 10, maxRows: 18 }"
+                placeholder="请输入用户提示词模板，支持占位符"
+              />
+            </a-form-item>
+
+            <div>
+              <div style="font-weight: 600; margin-bottom: 8px">可用占位符</div>
+              <a-space wrap>
+                <a-tag
+                  v-for="item in bankBuildModal.promptPlaceholders"
+                  :key="item.key"
+                  color="blue"
+                  style="cursor: pointer"
+                  @click="copyPromptPlaceholder(item.key)"
+                >
+                  <CopyOutlined />
+                  {{ item.key }} - {{ item.description }}（来源：{{ item.source }}）
+                </a-tag>
+              </a-space>
             </div>
-          </div>
+          </template>
         </a-card>
 
         <a-button
@@ -816,6 +853,46 @@
           已用时 {{ genProgress.elapsed }}，预计还需 {{ genProgress.remaining }}
         </div>
       </div>
+    </a-modal>
+
+    <a-modal
+      v-model:open="promptPreviewModal.visible"
+      title="最终用户提示词预览（按实际调用拆分）"
+      width="920px"
+      :confirm-loading="bankBuildModal.promptPreviewLoading"
+      ok-text="关闭"
+      @ok="promptPreviewModal.visible = false"
+      :cancel-button-props="{ style: { display: 'none' } }"
+    >
+      <div v-if="bankBuildModal.promptPreviewLoading" style="padding: 24px 0; text-align: center;">
+        <a-spin tip="正在生成预览..." />
+      </div>
+      <template v-else>
+        <a-alert
+          v-if="promptPreviewModal.note"
+          type="info"
+          show-icon
+          :message="promptPreviewModal.note"
+          style="margin-bottom: 12px"
+        />
+        <a-empty
+          v-if="!promptPreviewModal.items.length"
+          description="暂无预览内容"
+        />
+        <div v-else style="display: flex; flex-direction: column; gap: 12px; max-height: 65vh; overflow: auto; padding-right: 4px;">
+          <div
+            v-for="(item, index) in promptPreviewModal.items"
+            :key="`${index}-${item.title}`"
+          >
+            <div style="font-weight: 600; margin-bottom: 6px;">{{ item.title }}</div>
+            <a-textarea
+              :value="item.rendered_user_prompt"
+              readonly
+              :auto-size="{ minRows: 6, maxRows: 14 }"
+            />
+          </div>
+        </div>
+      </template>
     </a-modal>
 
     <!-- Generation Result Modal -->
@@ -1133,6 +1210,13 @@ import {
   SaveOutlined,
   CopyOutlined,
   UndoOutlined,
+  LeftOutlined,
+  RightOutlined,
+  LikeOutlined,
+  LikeFilled,
+  StarOutlined,
+  StarFilled,
+  FlagOutlined,
 } from '@ant-design/icons-vue'
 import { message, Modal } from 'ant-design-vue'
 import request from '@/utils/request'
@@ -1148,6 +1232,11 @@ const detailVisible = ref(false)
 const reviewModalVisible = ref(false)
 const editingQuestion = ref<any>(null)
 const detailQuestion = ref<any>(null)
+const detailInteractions = reactive({ liked: false, favorited: false, like_count: 0, favorite_count: 0 })
+const feedbackVisible = ref(false)
+const feedbackType = ref('')
+const feedbackComment = ref('')
+const feedbackLoading = ref(false)
 const aiCheckResult = ref<any>(null)
 const aiResultModalVisible = ref(false)
 const aiCheckQuestionId = ref('')
@@ -1182,6 +1271,7 @@ const filters = reactive({
   question_type: undefined as string | undefined,
   difficulty: undefined as number | undefined,
   dimension: '',
+  only_mine: false,
 })
 
 const pagination = reactive({
@@ -1332,6 +1422,7 @@ async function fetchQuestions() {
     if (filters.question_type) params.question_type = filters.question_type
     if (filters.difficulty) params.difficulty = filters.difficulty
     if (filters.dimension) params.dimension = filters.dimension
+    if (filters.only_mine) params.only_mine = true
 
     const data: any = await request.get('/questions', { params })
     questions.value = data.items || []
@@ -1359,6 +1450,7 @@ function resetFilters() {
   filters.question_type = undefined
   filters.difficulty = undefined
   filters.dimension = ''
+  filters.only_mine = false
   pagination.current = 1
   fetchQuestions()
 }
@@ -1509,11 +1601,31 @@ async function quickApprove(id: string) {
   }
 }
 
+async function loadInteractions(qid: string) {
+  try {
+    const data: any = await request.get(`/questions/${qid}/interactions`)
+    Object.assign(detailInteractions, data)
+  } catch {
+    // ignore
+  }
+}
+
 async function showDetail(q: any) {
   detailQuestion.value = q
   aiCheckResult.value = null
   detailVisible.value = true
-  await loadReviewHistory(q.id)
+  await Promise.all([loadReviewHistory(q.id), loadInteractions(q.id)])
+}
+
+const detailIndex = computed(() =>
+  detailQuestion.value ? questions.value.findIndex(q => q.id === detailQuestion.value.id) : -1
+)
+
+async function navigateDetail(offset: number) {
+  const idx = detailIndex.value + offset
+  if (idx >= 0 && idx < questions.value.length) {
+    await showDetail(questions.value[idx])
+  }
 }
 
 async function loadReviewHistory(qid: string) {
@@ -1521,6 +1633,39 @@ async function loadReviewHistory(qid: string) {
     reviewHistory.value = await request.get(`/questions/${qid}/review-history`) as any
   } catch {
     reviewHistory.value = []
+  }
+}
+
+async function toggleLike() {
+  if (!detailQuestion.value) return
+  const data: any = await request.post(`/questions/${detailQuestion.value.id}/like`)
+  detailInteractions.liked = data.liked
+  detailInteractions.like_count = data.like_count
+}
+
+async function toggleFavorite() {
+  if (!detailQuestion.value) return
+  const data: any = await request.post(`/questions/${detailQuestion.value.id}/favorite`)
+  detailInteractions.favorited = data.favorited
+  detailInteractions.favorite_count = data.favorite_count
+}
+
+async function submitFeedback() {
+  if (!detailQuestion.value || !feedbackType.value) return
+  feedbackLoading.value = true
+  try {
+    await request.post(`/questions/${detailQuestion.value.id}/feedback`, {
+      feedback_type: feedbackType.value,
+      comment: feedbackComment.value || null,
+    })
+    message.success('反馈已提交')
+    feedbackVisible.value = false
+    feedbackType.value = ''
+    feedbackComment.value = ''
+  } catch {
+    message.error('提交失败，请重试')
+  } finally {
+    feedbackLoading.value = false
   }
 }
 
@@ -1851,6 +1996,7 @@ const bankBuildModal = reactive({
   promptConfigLoading: false,
   promptSaveLoading: false,
   promptPreviewLoading: false,
+  promptConfigCollapsed: true,
   materialIds: [] as string[],
   materialInfo: null as string | null,
   difficulty: 3,
@@ -1864,10 +2010,14 @@ const bankBuildModal = reactive({
     user_prompt_template: '',
   } as PromptDefaults,
   promptPlaceholders: [] as PromptPlaceholder[],
-  renderedUserPrompts: [] as RenderedPromptPreview[],
-  promptPreviewNote: '',
   promptPreviewDirty: false,
   promptSeed: undefined as number | undefined,
+})
+
+const promptPreviewModal = reactive({
+  visible: false,
+  items: [] as RenderedPromptPreview[],
+  note: '',
 })
 
 const bankTypeDist = reactive({
@@ -2038,10 +2188,10 @@ function resetPromptEditorsToDefaults() {
 }
 
 function clearPromptPreview(markDirty = false) {
-  bankBuildModal.renderedUserPrompts = []
-  bankBuildModal.promptPreviewNote = ''
   bankBuildModal.promptPreviewDirty = markDirty
   bankBuildModal.promptSeed = undefined
+  promptPreviewModal.items = []
+  promptPreviewModal.note = ''
 }
 
 function buildPromptPreviewPayload() {
@@ -2103,7 +2253,7 @@ async function savePromptConfig() {
   }
 }
 
-async function refreshPromptPreview() {
+async function openPromptPreview() {
   if (!bankBuildModal.systemPrompt.trim() || !bankBuildModal.userPromptTemplate.trim()) {
     message.warning('请先填写系统提示词和用户提示词模板')
     return
@@ -2116,14 +2266,16 @@ async function refreshPromptPreview() {
   }
 
   bankBuildModal.promptPreviewLoading = true
+  promptPreviewModal.visible = true
   try {
     const data: any = await request.post('/questions/generation/prompt-preview', payload)
-    bankBuildModal.renderedUserPrompts = data.rendered_user_prompts || []
-    bankBuildModal.promptPreviewNote = data.preview_note || ''
+    promptPreviewModal.items = data.rendered_user_prompts || []
+    promptPreviewModal.note = data.preview_note || ''
     bankBuildModal.promptPlaceholders = data.placeholders || bankBuildModal.promptPlaceholders
     bankBuildModal.promptPreviewDirty = false
     bankBuildModal.promptSeed = data.prompt_seed
   } catch (e: any) {
+    promptPreviewModal.visible = false
     message.error(e?.response?.data?.detail || '刷新提示词预览失败')
   } finally {
     bankBuildModal.promptPreviewLoading = false
@@ -2147,6 +2299,7 @@ async function showBankBuildModal() {
   bankBuildModal.customPrompt = ''
   bankBuildModal.systemPrompt = ''
   bankBuildModal.userPromptTemplate = ''
+  bankBuildModal.promptConfigCollapsed = true
   bankBuildModal.hasSavedPromptConfig = false
   bankBuildModal.promptDefaults = { system_prompt: '', user_prompt_template: '' }
   bankBuildModal.promptPlaceholders = []
@@ -2211,6 +2364,7 @@ watch(
     const prevVisible = previous[0]
     if (!prevVisible) return
     bankBuildModal.promptPreviewDirty = true
+    bankBuildModal.promptSeed = undefined
   },
 )
 
