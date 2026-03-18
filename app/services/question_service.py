@@ -422,6 +422,7 @@ async def batch_generate_from_material(
     bloom_level: Optional[str] = None,
     max_units: int = 10,
     created_by: Optional[uuid.UUID] = None,
+    prompt_seed: Optional[int] = None,
     system_prompt: Optional[str] = None,
     user_prompt_template: Optional[str] = None,
 ) -> list[Question]:
@@ -449,7 +450,7 @@ async def batch_generate_from_material(
     all_questions = []
     for ku in units:
         try:
-            questions = await generate_from_knowledge_unit(
+            result = await generate_from_knowledge_unit(
                 db=db,
                 knowledge_unit_id=ku.id,
                 question_types=question_types,
@@ -457,9 +458,11 @@ async def batch_generate_from_material(
                 difficulty=difficulty,
                 bloom_level=bloom_level,
                 created_by=created_by,
+                prompt_seed=prompt_seed,
                 system_prompt=system_prompt,
                 user_prompt_template=user_prompt_template,
             )
+            questions = result.get("questions", result) if isinstance(result, dict) else result
             all_questions.extend(questions)
         except Exception as e:
             logger.error(

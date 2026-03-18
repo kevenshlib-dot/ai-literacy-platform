@@ -581,7 +581,11 @@
       :ok-text="bankBuildModal.loading ? '生成中...' : '开始生成'"
     >
       <a-form layout="vertical">
-        <a-form-item label="选择素材（可多选，不选则直接用AI出题）">
+        <a-form-item>
+          <template #label>
+            选择素材（可多选，不选则直接用AI出题）
+            <span style="color: #999; font-weight: 400">（影响 &#123;&#123;content_section&#125;&#125;）</span>
+          </template>
           <a-select
             v-model:value="bankBuildModal.materialIds"
             placeholder="可选，不选则直接用AI知识出题"
@@ -606,7 +610,11 @@
           style="margin-bottom: 16px"
         />
 
-        <a-form-item label="额外要求（会注入到用户提示词模板）">
+        <a-form-item>
+          <template #label>
+            额外要求（会注入到用户提示词模板）
+            <span style="color: #999; font-weight: 400">（对应 &#123;&#123;custom_requirements&#125;&#125;）</span>
+          </template>
           <a-textarea
             v-model:value="bankBuildModal.customPrompt"
             placeholder="可输入对出题的特殊要求，如：侧重考察应用能力、避免过于简单的记忆题、题目需贴近实际工作场景..."
@@ -677,9 +685,46 @@
                 @click="copyPromptPlaceholder(item.key)"
               >
                 <CopyOutlined />
-                {{ item.key }} - {{ item.description }}
+                {{ item.key }} - {{ item.description }}（来源：{{ item.source }}）
               </a-tag>
             </a-space>
+          </div>
+
+          <div style="margin-top: 16px">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; gap: 12px; flex-wrap: wrap;">
+              <div style="font-weight: 600">最终用户提示词预览（按实际调用拆分）</div>
+              <a-space>
+                <a-tag v-if="bankBuildModal.promptPreviewDirty" color="warning">预览未刷新</a-tag>
+                <a-button size="small" :loading="bankBuildModal.promptPreviewLoading" @click="refreshPromptPreview">
+                  <template #icon><ReloadOutlined /></template>
+                  刷新预览
+                </a-button>
+              </a-space>
+            </div>
+            <a-alert
+              v-if="bankBuildModal.promptPreviewNote"
+              type="info"
+              show-icon
+              :message="bankBuildModal.promptPreviewNote"
+              style="margin-bottom: 8px"
+            />
+            <a-empty
+              v-if="!bankBuildModal.renderedUserPrompts.length"
+              :description="bankBuildModal.promptPreviewLoading ? '正在生成预览...' : '点击“刷新预览”查看本次实际会发送给模型的用户提示词'"
+            />
+            <div v-else style="display: flex; flex-direction: column; gap: 12px;">
+              <div
+                v-for="(item, index) in bankBuildModal.renderedUserPrompts"
+                :key="`${index}-${item.title}`"
+              >
+                <div style="font-weight: 600; margin-bottom: 6px;">{{ item.title }}</div>
+                <a-textarea
+                  :value="item.rendered_user_prompt"
+                  readonly
+                  :auto-size="{ minRows: 6, maxRows: 14 }"
+                />
+              </div>
+            </div>
           </div>
         </a-card>
 
@@ -694,7 +739,11 @@
           一键自动生成（AI推荐最佳配比）
         </a-button>
 
-        <a-form-item label="题型分配">
+        <a-form-item>
+          <template #label>
+            题型分配
+            <span style="color: #999; font-weight: 400">（影响 &#123;&#123;count&#125;&#125; 和 &#123;&#123;question_types&#125;&#125;）</span>
+          </template>
           <a-row :gutter="[8, 8]">
             <a-col :span="8">
               <a-input-number v-model:value="bankTypeDist.single_choice" :min="0" :max="30" addon-before="单选题" style="width: 100%" />
@@ -721,12 +770,20 @@
 
         <a-row :gutter="16">
           <a-col :span="12">
-            <a-form-item label="难度等级">
+            <a-form-item>
+              <template #label>
+                难度等级
+                <span style="color: #999; font-weight: 400">（影响 &#123;&#123;difficulty_section&#125;&#125;）</span>
+              </template>
               <a-slider v-model:value="bankBuildModal.difficulty" :min="1" :max="5" :marks="{1:'入门',3:'中等',5:'专家'}" />
             </a-form-item>
           </a-col>
           <a-col :span="12">
-            <a-form-item label="认知层次（可选）">
+            <a-form-item>
+              <template #label>
+                认知层次（可选）
+                <span style="color: #999; font-weight: 400">（影响 &#123;&#123;bloom_section&#125;&#125;）</span>
+              </template>
               <a-select v-model:value="bankBuildModal.bloomLevel" placeholder="不限" allow-clear style="width: 100%">
                 <a-select-option value="remember">记忆</a-select-option>
                 <a-select-option value="understand">理解</a-select-option>
@@ -1055,7 +1112,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   PlusOutlined,
@@ -1773,11 +1830,17 @@ async function exportSelectedMd() {
 type PromptPlaceholder = {
   key: string
   description: string
+  source: string
 }
 
 type PromptDefaults = {
   system_prompt: string
   user_prompt_template: string
+}
+
+type RenderedPromptPreview = {
+  title: string
+  rendered_user_prompt: string
 }
 
 const bankBuildModal = reactive({
@@ -1787,6 +1850,7 @@ const bankBuildModal = reactive({
   materialsLoading: false,
   promptConfigLoading: false,
   promptSaveLoading: false,
+  promptPreviewLoading: false,
   materialIds: [] as string[],
   materialInfo: null as string | null,
   difficulty: 3,
@@ -1800,6 +1864,10 @@ const bankBuildModal = reactive({
     user_prompt_template: '',
   } as PromptDefaults,
   promptPlaceholders: [] as PromptPlaceholder[],
+  renderedUserPrompts: [] as RenderedPromptPreview[],
+  promptPreviewNote: '',
+  promptPreviewDirty: false,
+  promptSeed: undefined as number | undefined,
 })
 
 const bankTypeDist = reactive({
@@ -1969,6 +2037,30 @@ function resetPromptEditorsToDefaults() {
   bankBuildModal.userPromptTemplate = bankBuildModal.promptDefaults.user_prompt_template || ''
 }
 
+function clearPromptPreview(markDirty = false) {
+  bankBuildModal.renderedUserPrompts = []
+  bankBuildModal.promptPreviewNote = ''
+  bankBuildModal.promptPreviewDirty = markDirty
+  bankBuildModal.promptSeed = undefined
+}
+
+function buildPromptPreviewPayload() {
+  const dist: Record<string, number> = {}
+  for (const [k, v] of Object.entries(bankTypeDist)) {
+    if (v > 0) dist[k] = v
+  }
+
+  return {
+    type_distribution: dist,
+    difficulty: bankBuildModal.difficulty,
+    bloom_level: bankBuildModal.bloomLevel || undefined,
+    custom_prompt: bankBuildModal.customPrompt || undefined,
+    system_prompt: bankBuildModal.systemPrompt.trim() || undefined,
+    user_prompt_template: bankBuildModal.userPromptTemplate.trim() || undefined,
+    material_ids: bankBuildModal.materialIds,
+  }
+}
+
 async function savePromptConfig() {
   if (!bankBuildModal.systemPrompt.trim() || !bankBuildModal.userPromptTemplate.trim()) {
     message.warning('系统提示词和用户提示词模板不能为空')
@@ -2011,6 +2103,33 @@ async function savePromptConfig() {
   }
 }
 
+async function refreshPromptPreview() {
+  if (!bankBuildModal.systemPrompt.trim() || !bankBuildModal.userPromptTemplate.trim()) {
+    message.warning('请先填写系统提示词和用户提示词模板')
+    return
+  }
+
+  const payload = buildPromptPreviewPayload()
+  if (Object.keys(payload.type_distribution).length === 0) {
+    message.warning('请至少设置一种题型的数量')
+    return
+  }
+
+  bankBuildModal.promptPreviewLoading = true
+  try {
+    const data: any = await request.post('/questions/generation/prompt-preview', payload)
+    bankBuildModal.renderedUserPrompts = data.rendered_user_prompts || []
+    bankBuildModal.promptPreviewNote = data.preview_note || ''
+    bankBuildModal.promptPlaceholders = data.placeholders || bankBuildModal.promptPlaceholders
+    bankBuildModal.promptPreviewDirty = false
+    bankBuildModal.promptSeed = data.prompt_seed
+  } catch (e: any) {
+    message.error(e?.response?.data?.detail || '刷新提示词预览失败')
+  } finally {
+    bankBuildModal.promptPreviewLoading = false
+  }
+}
+
 async function copyPromptPlaceholder(text: string) {
   try {
     await navigator.clipboard.writeText(text)
@@ -2031,6 +2150,7 @@ async function showBankBuildModal() {
   bankBuildModal.hasSavedPromptConfig = false
   bankBuildModal.promptDefaults = { system_prompt: '', user_prompt_template: '' }
   bankBuildModal.promptPlaceholders = []
+  clearPromptPreview(false)
   bankTypeDist.single_choice = 5
   bankTypeDist.multiple_choice = 2
   bankTypeDist.true_false = 3
@@ -2070,6 +2190,29 @@ async function onMaterialChange(ids: string[]) {
   }).filter(Boolean)
   bankBuildModal.materialInfo = `已选 ${ids.length} 个素材：${names.join('、')}`
 }
+
+watch(
+  () => [
+    bankBuildModal.visible,
+    bankBuildModal.materialIds.join(','),
+    bankBuildModal.difficulty,
+    bankBuildModal.bloomLevel || '',
+    bankBuildModal.customPrompt,
+    bankBuildModal.systemPrompt,
+    bankBuildModal.userPromptTemplate,
+    bankTypeDist.single_choice,
+    bankTypeDist.multiple_choice,
+    bankTypeDist.true_false,
+    bankTypeDist.fill_blank,
+    bankTypeDist.short_answer,
+  ],
+  (_, previous) => {
+    if (!bankBuildModal.visible || !previous) return
+    const prevVisible = previous[0]
+    if (!prevVisible) return
+    bankBuildModal.promptPreviewDirty = true
+  },
+)
 
 async function autoSuggest() {
   bankBuildModal.suggestLoading = true
@@ -2133,6 +2276,7 @@ async function handleBankBuild() {
       custom_prompt: bankBuildModal.customPrompt || undefined,
       system_prompt: bankBuildModal.systemPrompt.trim() || undefined,
       user_prompt_template: bankBuildModal.userPromptTemplate.trim() || undefined,
+      prompt_seed: bankBuildModal.promptSeed,
     }
 
     if (bankBuildModal.materialIds.length > 0) {

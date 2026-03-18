@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 class PromptOverrideMixin(BaseModel):
     system_prompt: Optional[str] = Field(default=None, max_length=20000)
     user_prompt_template: Optional[str] = Field(default=None, max_length=20000)
+    prompt_seed: Optional[int] = None
 
 
 class QuestionCreate(BaseModel):
@@ -209,6 +210,7 @@ class BatchCreateFromRawRequest(BaseModel):
 class QuestionPromptPlaceholderResponse(BaseModel):
     key: str
     description: str
+    source: str
 
 
 class QuestionPromptConfigResponse(BaseModel):
@@ -222,3 +224,27 @@ class QuestionPromptConfigResponse(BaseModel):
 class QuestionPromptConfigUpdateRequest(BaseModel):
     system_prompt: str = Field(..., min_length=1, max_length=20000)
     user_prompt_template: str = Field(..., min_length=1, max_length=20000)
+
+
+class QuestionPromptPreviewRequest(PromptOverrideMixin):
+    type_distribution: dict = Field(description="Question type to count mapping")
+    difficulty: int = Field(default=3, ge=1, le=5)
+    bloom_level: Optional[str] = None
+    custom_prompt: Optional[str] = Field(default=None, max_length=500)
+    max_units: int = Field(default=10, ge=1, le=50)
+    material_ids: List[UUID] = Field(default_factory=list)
+
+
+class QuestionPromptPreviewItemResponse(BaseModel):
+    title: str
+    rendered_user_prompt: str
+
+
+class QuestionPromptPreviewResponse(BaseModel):
+    system_prompt: str
+    user_prompt_template: str
+    rendered_user_prompt: str
+    rendered_user_prompts: List[QuestionPromptPreviewItemResponse]
+    placeholders: List[QuestionPromptPlaceholderResponse]
+    preview_note: Optional[str] = None
+    prompt_seed: int

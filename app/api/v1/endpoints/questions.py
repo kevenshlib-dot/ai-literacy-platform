@@ -33,6 +33,8 @@ from app.schemas.question import (
     BatchCreateFromRawRequest,
     QuestionPromptConfigResponse,
     QuestionPromptConfigUpdateRequest,
+    QuestionPromptPreviewRequest,
+    QuestionPromptPreviewResponse,
 )
 from app.core.config import settings
 from app.services import question_service
@@ -107,6 +109,31 @@ async def delete_generation_prompt_config(
     await question_prompt_service.delete_prompt_profile(db, current_user.id)
     await db.commit()
     return await question_prompt_service.get_effective_prompt_config(db, current_user.id)
+
+
+@router.post("/generation/prompt-preview", response_model=QuestionPromptPreviewResponse)
+async def preview_generation_prompt(
+    body: QuestionPromptPreviewRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    try:
+        return await question_prompt_service.render_generation_prompt_preview(
+            db=db,
+            user_id=current_user.id,
+            type_distribution=body.type_distribution,
+            difficulty=body.difficulty,
+            bloom_level=body.bloom_level,
+            custom_prompt=body.custom_prompt,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+            prompt_seed=body.prompt_seed,
+            material_ids=body.material_ids,
+            max_units=body.max_units,
+        )
+    except ValueError as e:
+        status_code = 422 if "占位符" in str(e) or "prompt" in str(e) else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
 
 @router.post("", response_model=QuestionResponse, status_code=status.HTTP_201_CREATED)
 async def create_question(
@@ -274,6 +301,7 @@ async def generate_questions(
             difficulty=body.difficulty,
             bloom_level=body.bloom_level,
             created_by=current_user.id,
+            prompt_seed=body.prompt_seed,
             system_prompt=prompt_config["system_prompt"],
             user_prompt_template=prompt_config["user_prompt_template"],
         )
@@ -315,6 +343,7 @@ async def batch_generate_from_material(
             bloom_level=body.bloom_level,
             max_units=body.max_units,
             created_by=current_user.id,
+            prompt_seed=body.prompt_seed,
             system_prompt=prompt_config["system_prompt"],
             user_prompt_template=prompt_config["user_prompt_template"],
         )
@@ -404,6 +433,7 @@ async def build_question_bank(
             max_units=body.max_units,
             created_by=current_user.id,
             custom_prompt=body.custom_prompt,
+            prompt_seed=body.prompt_seed,
             system_prompt=prompt_config["system_prompt"],
             user_prompt_template=prompt_config["user_prompt_template"],
         )
@@ -456,6 +486,7 @@ async def generate_free(
             bloom_level=body.bloom_level,
             custom_prompt=body.custom_prompt,
             created_by=current_user.id,
+            prompt_seed=body.prompt_seed,
             system_prompt=prompt_config["system_prompt"],
             user_prompt_template=prompt_config["user_prompt_template"],
         )
@@ -497,6 +528,7 @@ async def preview_question_bank(
             bloom_level=body.bloom_level,
             max_units=body.max_units,
             custom_prompt=body.custom_prompt,
+            prompt_seed=body.prompt_seed,
             system_prompt=prompt_config["system_prompt"],
             user_prompt_template=prompt_config["user_prompt_template"],
         )
@@ -533,6 +565,7 @@ async def preview_free(
             difficulty=body.difficulty,
             bloom_level=body.bloom_level,
             custom_prompt=body.custom_prompt,
+            prompt_seed=body.prompt_seed,
             system_prompt=prompt_config["system_prompt"],
             user_prompt_template=prompt_config["user_prompt_template"],
         )

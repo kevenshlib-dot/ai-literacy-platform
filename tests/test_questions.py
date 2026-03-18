@@ -191,7 +191,8 @@ async def test_prompt_config_defaults_round_trip():
     assert data["has_saved_config"] is False
     assert data["system_prompt"] == data["defaults"]["system_prompt"]
     assert data["user_prompt_template"] == data["defaults"]["user_prompt_template"]
-    assert any(item["key"] == "{{count}}" for item in data["placeholders"])
+    count_placeholder = next(item for item in data["placeholders"] if item["key"] == "{{count}}")
+    assert count_placeholder["source"] == "题型分配合计数量"
 
 
 @pytest.mark.asyncio
@@ -237,6 +238,104 @@ async def test_prompt_config_rejects_unknown_placeholder():
 
     assert resp.status_code == 422
     assert "未知占位符" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_prompt_preview_renders_free_generation_prompt():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        resp = await client.post(
+            "/api/v1/questions/generation/prompt-preview",
+            json={
+                "type_distribution": {"single_choice": 2, "true_false": 1},
+                "difficulty": 4,
+                "bloom_level": "apply",
+                "custom_prompt": "侧重工作流自动化",
+                "user_prompt_template": (
+                    "题型={{question_types}}\n"
+                    "数量={{count}}\n"
+                    "{{difficulty_section}}\n"
+                    "{{bloom_section}}\n"
+                    "{{custom_requirements}}\n"
+                    "{{content_section}}"
+                ),
+                "material_ids": [],
+            },
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["prompt_seed"] > 0
+    assert data["rendered_user_prompt"] == ""
+    assert len(data["rendered_user_prompts"]) == 2
+    assert data["rendered_user_prompts"][0]["title"] == "自由出题 / 单选题 / 2 题"
+    assert "题型=单选题(single_choice)" in data["rendered_user_prompts"][0]["rendered_user_prompt"]
+    assert "数量=2" in data["rendered_user_prompts"][0]["rendered_user_prompt"]
+    assert "侧重工作流自动化" in data["rendered_user_prompts"][0]["rendered_user_prompt"]
+    assert "【出题范围】" in data["rendered_user_prompts"][0]["rendered_user_prompt"]
+    assert "按实际调用顺序向模型发送 2 条用户提示词" in data["preview_note"]
+    assert any(item["source"] == "额外要求" for item in data["placeholders"])
+
+
+@pytest.mark.asyncio
+async def test_prompt_preview_uses_actual_material_split_for_preview():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+        material_id, _ = await upload_and_parse_material(client, token)
+
+        resp = await client.post(
+            "/api/v1/questions/generation/prompt-preview",
+            json={
+                "type_distribution": {"single_choice": 1},
+                "difficulty": 3,
+                "user_prompt_template": "内容={{content_section}}",
+                "material_ids": [material_id],
+            },
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["rendered_user_prompts"]) == 1
+    assert "【参考素材】" in data["rendered_user_prompts"][0]["rendered_user_prompt"]
+    assert "人工智能是计算机科学的一个分支" in data["rendered_user_prompts"][0]["rendered_user_prompt"]
+    assert "按实际调用顺序向模型发送 1 条用户提示词" in data["preview_note"]
+
+
+@pytest.mark.asyncio
+async def test_prompt_preview_seed_can_be_reused_for_stable_rendering():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        first_resp = await client.post(
+            "/api/v1/questions/generation/prompt-preview",
+            json={
+                "type_distribution": {"single_choice": 1},
+                "difficulty": 3,
+                "user_prompt_template": "内容={{content_section}}\n规则={{diversity_rules}}",
+            },
+            headers=headers,
+        )
+        seed = first_resp.json()["prompt_seed"]
+        second_resp = await client.post(
+            "/api/v1/questions/generation/prompt-preview",
+            json={
+                "type_distribution": {"single_choice": 1},
+                "difficulty": 3,
+                "user_prompt_template": "内容={{content_section}}\n规则={{diversity_rules}}",
+                "prompt_seed": seed,
+            },
+            headers=headers,
+        )
+
+    assert first_resp.status_code == 200
+    assert second_resp.status_code == 200
+    assert first_resp.json()["rendered_user_prompts"] == second_resp.json()["rendered_user_prompts"]
 
 
 @pytest.mark.asyncio
