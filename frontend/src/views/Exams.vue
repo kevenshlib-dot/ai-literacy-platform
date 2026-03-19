@@ -232,12 +232,13 @@
 
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { PlusOutlined, SearchOutlined, FolderOutlined, RollbackOutlined } from '@ant-design/icons-vue'
 import request from '@/utils/request'
 
 const router = useRouter()
+const route = useRoute()
 const loading = ref(false)
 const exams = ref<any[]>([])
 const archiveMode = ref(false)
@@ -310,9 +311,38 @@ function formatDate(d: string) {
   return new Date(d).toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
-async function fetchExams() {
+function parsePositiveInt(value: unknown, fallback: number) {
+  const parsed = Number(value)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback
+}
+
+function applyRouteState() {
+  archiveMode.value = route.query.archive === '1'
+  filters.keyword = typeof route.query.keyword === 'string' ? route.query.keyword : ''
+  filters.status = typeof route.query.status === 'string' ? route.query.status : undefined
+  pagination.current = parsePositiveInt(route.query.page, 1)
+  pagination.pageSize = parsePositiveInt(route.query.page_size, 20)
+}
+
+function buildRouteQuery() {
+  const query: Record<string, string> = {}
+  if (archiveMode.value) {
+    query.archive = '1'
+  } else {
+    if (filters.keyword) query.keyword = filters.keyword
+    if (filters.status) query.status = filters.status
+  }
+  if (pagination.current > 1) query.page = String(pagination.current)
+  if (pagination.pageSize !== 20) query.page_size = String(pagination.pageSize)
+  return query
+}
+
+async function fetchExams(syncRoute = true) {
   loading.value = true
   try {
+    if (syncRoute) {
+      await router.replace({ name: 'Exams', query: buildRouteQuery() })
+    }
     const params: any = { skip: (pagination.current - 1) * pagination.pageSize, limit: pagination.pageSize }
     if (archiveMode.value) {
       params.archive = true
@@ -331,6 +361,8 @@ async function fetchExams() {
 
 function enterArchiveMode() {
   archiveMode.value = true
+  filters.keyword = ''
+  filters.status = undefined
   pagination.current = 1
   fetchExams()
 }
@@ -374,7 +406,11 @@ function showEditModal(record: any) {
 }
 
 function openComposer(record: any) {
-  router.push({ name: 'ExamCompose', params: { examId: record.id } })
+  router.push({
+    name: 'ExamCompose',
+    params: { examId: record.id },
+    query: { returnTo: route.fullPath },
+  })
 }
 
 async function handleFormSubmit() {
@@ -495,7 +531,10 @@ async function deleteExam(record: any) {
   } catch { /* handled */ }
 }
 
-onMounted(() => { fetchExams() })
+onMounted(() => {
+  applyRouteState()
+  fetchExams(false)
+})
 </script>
 
 <style scoped>
