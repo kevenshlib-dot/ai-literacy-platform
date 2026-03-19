@@ -50,6 +50,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '考试管理', roles: ['admin', 'organizer'] },
       },
       {
+        path: 'exams/:examId/compose',
+        name: 'ExamCompose',
+        component: () => import('@/views/ExamCompose.vue'),
+        meta: { title: '试卷编排', roles: ['admin', 'organizer'] },
+      },
+      {
         path: 'take-exam',
         name: 'TakeExam',
         component: () => import('@/views/TakeExam.vue'),

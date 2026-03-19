@@ -1,6 +1,5 @@
 """Exam service - handles exam CRUD, assembly strategy, and lifecycle management."""
 import math
-import random
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -11,6 +10,87 @@ from sqlalchemy.orm import selectinload
 
 from app.models.exam import Exam, ExamQuestion, ExamStatus
 from app.models.question import Question, QuestionType, QuestionStatus
+
+
+async def _get_draft_exam(db: AsyncSession, exam_id: uuid.UUID) -> Exam:
+    exam = await get_exam_by_id(db, exam_id)
+    if not exam:
+        raise ValueError("试卷不存在")
+    if exam.status != ExamStatus.DRAFT:
+        raise ValueError("只能编辑草稿状态的试卷")
+    return exam
+
+
+async def _validate_composition_items(
+    db: AsyncSession,
+    items: list[dict],
+) -> dict[uuid.UUID, Question]:
+    if not items:
+        raise ValueError("试卷至少需要 1 道题")
+
+    question_ids: list[uuid.UUID] = []
+    seen_question_ids: set[uuid.UUID] = set()
+    seen_orders: set[int] = set()
+
+    for item in items:
+        question_id = item["question_id"]
+        order_num = item["order_num"]
+        score = item.get("score", 0)
+
+        if question_id in seen_question_ids:
+            raise ValueError("试卷中不能重复添加同一道题")
+        if order_num in seen_orders:
+            raise ValueError("题号必须唯一")
+        if score <= 0:
+            raise ValueError("每题分值必须大于 0")
+
+        seen_question_ids.add(question_id)
+        seen_orders.add(order_num)
+        question_ids.append(question_id)
+
+    expected_orders = set(range(1, len(items) + 1))
+    if seen_orders != expected_orders:
+        raise ValueError("题号必须从 1 开始连续且唯一")
+
+    result = await db.execute(select(Question).where(Question.id.in_(question_ids)))
+    questions = list(result.scalars().all())
+    question_map = {q.id: q for q in questions}
+
+    if len(question_map) != len(question_ids):
+        raise ValueError("试卷中包含不存在的题目")
+
+    invalid_questions = [
+        q for q in questions if q.status != QuestionStatus.APPROVED
+    ]
+    if invalid_questions:
+        raise ValueError("只能添加已审核通过的题目")
+
+    return question_map
+
+
+async def _replace_exam_questions(
+    db: AsyncSession,
+    exam: Exam,
+    items: list[dict],
+) -> list[ExamQuestion]:
+    await db.execute(delete(ExamQuestion).where(ExamQuestion.exam_id == exam.id))
+
+    exam_questions = []
+    total_score = 0.0
+    for item in sorted(items, key=lambda entry: entry["order_num"]):
+        eq = ExamQuestion(
+            exam_id=exam.id,
+            question_id=item["question_id"],
+            order_num=item["order_num"],
+            score=item.get("score", 5.0),
+        )
+        db.add(eq)
+        exam_questions.append(eq)
+        total_score += eq.score
+
+    exam.total_score = total_score
+    await db.flush()
+    return exam_questions
 
 
 async def create_exam(
@@ -117,11 +197,14 @@ async def delete_exam(db: AsyncSession, exam_id: uuid.UUID) -> bool:
 
 
 async def publish_exam(db: AsyncSession, exam_id: uuid.UUID) -> Optional[Exam]:
-    exam = await get_exam_by_id(db, exam_id, load_questions=True)
+    exam = await get_exam_by_id(db, exam_id)
     if not exam:
         return None
-    if not exam.questions:
-        raise ValueError("试卷没有题目，无法发布")
+    if exam.status != ExamStatus.DRAFT:
+        raise ValueError("只有草稿状态的试卷才能发布")
+    items = await get_exam_composition_payload(db, exam_id)
+    await _validate_composition_items(db, items)
+    exam.total_score = sum(item["score"] for item in items)
     exam.status = ExamStatus.PUBLISHED
     await db.flush()
     return exam
@@ -144,33 +227,9 @@ async def manual_assemble(
     questions: list[dict],
 ) -> list[ExamQuestion]:
     """Manually add questions to an exam."""
-    exam = await get_exam_by_id(db, exam_id)
-    if not exam:
-        raise ValueError("试卷不存在")
-    if exam.status != ExamStatus.DRAFT:
-        raise ValueError("只能为草稿状态的试卷添加题目")
-
-    # Clear existing questions
-    await db.execute(
-        delete(ExamQuestion).where(ExamQuestion.exam_id == exam_id)
-    )
-
-    exam_questions = []
-    total_score = 0.0
-    for item in questions:
-        eq = ExamQuestion(
-            exam_id=exam_id,
-            question_id=item["question_id"],
-            order_num=item["order_num"],
-            score=item.get("score", 5.0),
-        )
-        db.add(eq)
-        exam_questions.append(eq)
-        total_score += eq.score
-
-    exam.total_score = total_score
-    await db.flush()
-    return exam_questions
+    exam = await _get_draft_exam(db, exam_id)
+    await _validate_composition_items(db, questions)
+    return await _replace_exam_questions(db, exam, questions)
 
 
 async def auto_assemble(
@@ -241,21 +300,7 @@ async def auto_assemble(
             })
             order += 1
 
-    # Create ExamQuestion records
-    exam_questions = []
-    total_score = 0.0
-    for item in selected_questions:
-        eq = ExamQuestion(
-            exam_id=exam_id,
-            question_id=item["question_id"],
-            order_num=item["order_num"],
-            score=item["score"],
-        )
-        db.add(eq)
-        exam_questions.append(eq)
-        total_score += eq.score
-
-    exam.total_score = total_score
+    exam_questions = await _replace_exam_questions(db, exam, selected_questions)
     exam.params = {
         "type_distribution": type_distribution,
         "difficulty_target": difficulty_target,
@@ -266,6 +311,45 @@ async def auto_assemble(
     await db.flush()
 
     return exam_questions
+
+
+async def get_exam_composition(
+    db: AsyncSession, exam_id: uuid.UUID
+) -> list[tuple[ExamQuestion, Question]]:
+    result = await db.execute(
+        select(ExamQuestion, Question)
+        .join(Question, ExamQuestion.question_id == Question.id)
+        .where(ExamQuestion.exam_id == exam_id)
+        .order_by(ExamQuestion.order_num)
+    )
+    return list(result.all())
+
+
+async def get_exam_composition_payload(
+    db: AsyncSession, exam_id: uuid.UUID
+) -> list[dict]:
+    rows = await get_exam_composition(db, exam_id)
+    return [
+        {
+            "question_id": eq.question_id,
+            "order_num": eq.order_num,
+            "score": eq.score,
+        }
+        for eq, _ in rows
+    ]
+
+
+async def save_exam_composition(
+    db: AsyncSession,
+    exam_id: uuid.UUID,
+    items: list[dict],
+) -> tuple[Exam, list[tuple[ExamQuestion, Question]]]:
+    exam = await _get_draft_exam(db, exam_id)
+    question_map = await _validate_composition_items(db, items)
+    exam_questions = await _replace_exam_questions(db, exam, items)
+    rows = [(eq, question_map[eq.question_id]) for eq in exam_questions]
+    rows.sort(key=lambda row: row[0].order_num)
+    return exam, rows
 
 
 async def get_exam_questions(

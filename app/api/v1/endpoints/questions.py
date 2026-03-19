@@ -176,6 +176,7 @@ async def list_questions(
     difficulty: Optional[int] = Query(None, ge=1, le=5),
     keyword: Optional[str] = None,
     only_mine: bool = Query(False),
+    exclude_ids: Optional[list[UUID]] = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
@@ -190,6 +191,7 @@ async def list_questions(
         difficulty=difficulty,
         keyword=keyword,
         created_by=current_user.id if only_mine else None,
+        exclude_ids=exclude_ids,
     )
     return QuestionListResponse(
         total=total,

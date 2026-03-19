@@ -110,15 +110,20 @@ const router = useRouter()
 const route = useRoute()
 const userStore = useUserStore()
 const collapsed = ref(false)
-const selectedKeys = ref<string[]>([route.name as string || 'Home'])
+const selectedKeys = ref<string[]>([(route.name === 'ExamCompose' ? 'Exams' : route.name as string) || 'Home'])
 
 const visibleMenuItems = computed(() => {
   const role = userStore.userInfo?.role || ''
   return allMenuItems.filter(item => item.roles.includes(role))
 })
 
+function resolveSelectedKey(name: string | undefined) {
+  if (name === 'ExamCompose') return 'Exams'
+  return name || 'Home'
+}
+
 watch(() => route.name, (name) => {
-  selectedKeys.value = [name as string]
+  selectedKeys.value = [resolveSelectedKey(name as string | undefined)]
 })
 
 function onMenuClick({ key }: { key: string }) {

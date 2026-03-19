@@ -105,6 +105,7 @@ async def list_questions(
     difficulty: Optional[int] = None,
     keyword: Optional[str] = None,
     created_by: Optional[uuid.UUID] = None,
+    exclude_ids: Optional[list[uuid.UUID]] = None,
 ) -> tuple[list[Question], int]:
     """List questions with filters and pagination."""
     conditions = []
@@ -120,6 +121,8 @@ async def list_questions(
         conditions.append(Question.stem.ilike(f"%{keyword}%"))
     if created_by:
         conditions.append(Question.created_by == created_by)
+    if exclude_ids:
+        conditions.append(Question.id.notin_(exclude_ids))
 
     where_clause = and_(*conditions) if conditions else True
 

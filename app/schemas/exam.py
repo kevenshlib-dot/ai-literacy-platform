@@ -55,6 +55,26 @@ class ExamQuestionResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ExamQuestionSummaryResponse(BaseModel):
+    id: UUID
+    question_type: str
+    stem: str
+    options: Optional[dict] = None
+    correct_answer: str
+    explanation: Optional[str] = None
+    difficulty: int
+    dimension: Optional[str] = None
+    status: str
+
+
+class ExamCompositionItemResponse(ExamQuestionResponse):
+    question: ExamQuestionSummaryResponse
+
+
+class ExamCompositionUpdateRequest(BaseModel):
+    items: List[ExamQuestionItem]
+
+
 class ExamResponse(BaseModel):
     id: UUID
     title: str
@@ -74,6 +94,11 @@ class ExamResponse(BaseModel):
 
 class ExamDetailResponse(ExamResponse):
     questions: List[ExamQuestionResponse] = []
+
+
+class ExamCompositionResponse(BaseModel):
+    exam: ExamResponse
+    items: List[ExamCompositionItemResponse]
 
 
 class ExamListResponse(BaseModel):

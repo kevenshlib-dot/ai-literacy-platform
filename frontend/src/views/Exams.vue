@@ -78,6 +78,7 @@
             <a-space v-else>
               <a @click="viewExam(record)">详情</a>
               <a @click="showEditModal(record)" v-if="record.status === 'draft'">编辑</a>
+              <a @click="openComposer(record)" v-if="record.status === 'draft'">编排</a>
               <a @click="showAssembleModal(record)" v-if="record.status === 'draft'">组卷</a>
               <a-popconfirm title="确定发布此考试？" @confirm="publishExam(record)" v-if="record.status === 'draft'">
                 <a style="color: #52c41a">发布</a>
@@ -231,10 +232,12 @@
 
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { PlusOutlined, SearchOutlined, FolderOutlined, RollbackOutlined } from '@ant-design/icons-vue'
 import request from '@/utils/request'
 
+const router = useRouter()
 const loading = ref(false)
 const exams = ref<any[]>([])
 const archiveMode = ref(false)
@@ -368,6 +371,10 @@ function showEditModal(record: any) {
     total_score: record.total_score,
   }
   formModal.visible = true
+}
+
+function openComposer(record: any) {
+  router.push({ name: 'ExamCompose', params: { examId: record.id } })
 }
 
 async function handleFormSubmit() {
