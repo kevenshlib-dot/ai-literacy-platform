@@ -63,6 +63,8 @@ def _to_response(q) -> QuestionResponse:
         bloom_level=q.bloom_level.value if q.bloom_level and hasattr(q.bloom_level, 'value') else q.bloom_level,
         source_material_id=q.source_material_id,
         source_knowledge_unit_id=q.source_knowledge_unit_id,
+        source_material_title=getattr(q, "source_material_title", None),
+        source_knowledge_unit_title=getattr(q, "source_knowledge_unit_title", None),
         status=q.status.value if hasattr(q.status, 'value') else q.status,
         usage_count=q.usage_count,
         correct_rate=q.correct_rate,
@@ -73,6 +75,16 @@ def _to_response(q) -> QuestionResponse:
         created_at=q.created_at,
         updated_at=q.updated_at,
     )
+
+
+async def _to_enriched_response(db: AsyncSession, q) -> QuestionResponse:
+    await question_service.enrich_question_source_titles(db, [q])
+    return _to_response(q)
+
+
+async def _to_enriched_responses(db: AsyncSession, questions) -> list[QuestionResponse]:
+    await question_service.enrich_question_source_titles(db, questions)
+    return [_to_response(q) for q in questions]
 
 
 # ---- Fixed-path routes MUST come before /{question_id} routes ----
@@ -163,7 +175,7 @@ async def create_question(
         created_by=current_user.id,
     )
     await db.commit()
-    return _to_response(q)
+    return await _to_enriched_response(db, q)
 
 
 @router.get("", response_model=QuestionListResponse)
@@ -193,10 +205,7 @@ async def list_questions(
         created_by=current_user.id if only_mine else None,
         exclude_ids=exclude_ids,
     )
-    return QuestionListResponse(
-        total=total,
-        items=[_to_response(q) for q in items],
-    )
+    return QuestionListResponse(total=total, items=await _to_enriched_responses(db, items))
 
 
 @router.get("/stats")
@@ -281,10 +290,7 @@ async def get_pending_reviews(
 ):
     """Get questions pending review."""
     items, total = await question_service.get_pending_reviews(db, skip, limit)
-    return QuestionListResponse(
-        total=total,
-        items=[_to_response(q) for q in items],
-    )
+    return QuestionListResponse(total=total, items=await _to_enriched_responses(db, items))
 
 
 @router.post("/generate", response_model=GenerateResponse)
@@ -321,7 +327,7 @@ async def generate_questions(
     stats = result.get("usage") if isinstance(result, dict) else None
     return GenerateResponse(
         generated=len(questions),
-        questions=[_to_response(q) for q in questions],
+        questions=await _to_enriched_responses(db, questions),
         stats=stats,
         model_name=settings.LLM_MODEL,
     )
@@ -361,7 +367,7 @@ async def batch_generate_from_material(
     await db.commit()
     return GenerateResponse(
         generated=len(questions),
-        questions=[_to_response(q) for q in questions],
+        questions=await _to_enriched_responses(db, questions),
     )
 
 
@@ -379,7 +385,7 @@ async def batch_submit_for_review(
     await db.commit()
     return QuestionListResponse(
         total=len(questions),
-        items=[_to_response(q) for q in questions],
+        items=await _to_enriched_responses(db, questions),
     )
 
 
@@ -401,7 +407,7 @@ async def batch_review(
     await db.commit()
     return QuestionListResponse(
         total=len(questions),
-        items=[_to_response(q) for q in questions],
+        items=await _to_enriched_responses(db, questions),
     )
 
 
@@ -453,7 +459,7 @@ async def build_question_bank(
     stats = result.get("stats") if isinstance(result, dict) else None
     return GenerateResponse(
         generated=len(questions),
-        questions=[_to_response(q) for q in questions],
+        questions=await _to_enriched_responses(db, questions),
         stats=stats,
         model_name=settings.LLM_MODEL,
     )
@@ -506,7 +512,7 @@ async def generate_free(
     stats = result.get("stats") if isinstance(result, dict) else None
     return GenerateResponse(
         generated=len(questions),
-        questions=[_to_response(q) for q in questions],
+        questions=await _to_enriched_responses(db, questions),
         stats=stats,
         model_name=settings.LLM_MODEL,
     )
@@ -606,7 +612,7 @@ async def batch_create_from_raw(
     await db.commit()
     return GenerateResponse(
         generated=len(questions),
-        questions=[_to_response(q) for q in questions],
+        questions=await _to_enriched_responses(db, questions),
     )
 
 
@@ -703,7 +709,7 @@ async def get_question(
     q = await question_service.get_question_by_id(db, question_id)
     if not q:
         raise HTTPException(status_code=404, detail="题目不存在")
-    return _to_response(q)
+    return await _to_enriched_response(db, q)
 
 
 @router.put("/{question_id}", response_model=QuestionResponse)
@@ -722,7 +728,7 @@ async def update_question(
     if not q:
         raise HTTPException(status_code=404, detail="题目不存在")
     await db.commit()
-    return _to_response(q)
+    return await _to_enriched_response(db, q)
 
 
 @router.delete("/{question_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -752,7 +758,7 @@ async def submit_for_review(
     if not q:
         raise HTTPException(status_code=404, detail="题目不存在")
     await db.commit()
-    return _to_response(q)
+    return await _to_enriched_response(db, q)
 
 
 @router.post("/{question_id}/review", response_model=QuestionResponse)
@@ -778,7 +784,7 @@ async def review_question(
     if not q:
         raise HTTPException(status_code=404, detail="题目不存在")
     await db.commit()
-    return _to_response(q)
+    return await _to_enriched_response(db, q)
 
 
 @router.post("/{question_id}/ai-check", response_model=AIReviewResponse)

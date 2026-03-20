@@ -30,6 +30,61 @@ def _coerce_uuid(value: Optional[uuid.UUID | str]) -> Optional[uuid.UUID]:
     return uuid.UUID(value)
 
 
+async def enrich_question_source_titles(
+    db: AsyncSession,
+    questions: list[Question],
+) -> list[Question]:
+    """Attach source titles to question objects for API serialization."""
+    if not questions:
+        return questions
+
+    knowledge_unit_ids = {
+        q.source_knowledge_unit_id
+        for q in questions
+        if q.source_knowledge_unit_id is not None
+    }
+    material_ids = {
+        q.source_material_id
+        for q in questions
+        if q.source_material_id is not None
+    }
+
+    knowledge_unit_map: dict[uuid.UUID, dict[str, Optional[uuid.UUID | str]]] = {}
+    if knowledge_unit_ids:
+        result = await db.execute(
+            select(KnowledgeUnit.id, KnowledgeUnit.title, KnowledgeUnit.material_id)
+            .where(KnowledgeUnit.id.in_(knowledge_unit_ids))
+        )
+        for ku_id, ku_title, material_id in result.all():
+            knowledge_unit_map[ku_id] = {
+                "title": ku_title,
+                "material_id": material_id,
+            }
+            if material_id is not None:
+                material_ids.add(material_id)
+
+    material_title_map: dict[uuid.UUID, str] = {}
+    if material_ids:
+        result = await db.execute(
+            select(Material.id, Material.title).where(Material.id.in_(material_ids))
+        )
+        material_title_map = {material_id: title for material_id, title in result.all()}
+
+    for question in questions:
+        knowledge_unit = knowledge_unit_map.get(question.source_knowledge_unit_id)
+        knowledge_unit_title = knowledge_unit["title"] if knowledge_unit else None
+        material_id = (
+            knowledge_unit["material_id"]
+            if knowledge_unit and knowledge_unit.get("material_id") is not None
+            else question.source_material_id
+        )
+        material_title = material_title_map.get(material_id) if material_id else None
+        setattr(question, "source_knowledge_unit_title", knowledge_unit_title)
+        setattr(question, "source_material_title", material_title)
+
+    return questions
+
+
 def _build_material_retry_prompt(
     custom_prompt: Optional[str],
     reasons: list[str],
@@ -798,6 +853,8 @@ async def preview_question_bank_from_material(
                         "bloom_level": bloom_level,
                         "source_material_id": str(ku.material_id),
                         "source_knowledge_unit_id": str(ku.id),
+                        "source_material_title": mat.title,
+                        "source_knowledge_unit_title": ku.title,
                     })
                     type_generated += 1
 

@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from app.main import app
 from app.core.database import Base, get_db
 from app.core.config import settings
+from app.core.security import create_access_token
 from app.services import question_service
 from app.models.material import Material, MaterialFormat, MaterialStatus, KnowledgeUnit
 from app.services.user_service import create_user, init_roles
@@ -140,15 +141,25 @@ def get_client():
 
 
 async def register_user(client, role="organizer"):
-    import uuid
     unique = uuid.uuid4().hex[:8]
-    resp = await client.post("/api/v1/auth/register", json={
-        "username": f"user_{unique}",
-        "email": f"{unique}@test.com",
-        "password": "password123",
-        "role": role,
-    })
-    return resp.json()["access_token"]
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = await create_user(
+            session,
+            username=f"user_{unique}",
+            email=f"{unique}@test.com",
+            password="password123",
+            role_name=role,
+            is_active=True,
+        )
+        await session.commit()
+        token = create_access_token(
+            subject=str(user.id),
+            extra_claims={"role": user.role.name.value},
+        )
+    await engine.dispose()
+    return token
 
 
 async def upload_and_parse_material(client, token):
@@ -525,6 +536,47 @@ async def test_list_questions_with_filter():
 
 
 @pytest.mark.asyncio
+async def test_list_questions_includes_source_titles():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        mid, ku_id = await upload_and_parse_material(client, token)
+        ku_resp = await client.get(
+            f"/api/v1/materials/{mid}/knowledge-units",
+            headers=headers,
+        )
+        ku_title = ku_resp.json()["units"][0]["title"]
+
+        await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": "来源题目",
+            "correct_answer": "A",
+            "options": {"A": "1", "B": "2"},
+            "source_material_id": mid,
+            "source_knowledge_unit_id": ku_id,
+        }, headers=headers)
+        await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": "自由题目",
+            "correct_answer": "A",
+            "options": {"A": "1", "B": "2"},
+        }, headers=headers)
+
+        resp = await client.get("/api/v1/questions", headers=headers)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 2
+    source_item = next(item for item in data["items"] if item["stem"] == "来源题目")
+    free_item = next(item for item in data["items"] if item["stem"] == "自由题目")
+    assert source_item["source_material_title"] == "AI基础教材"
+    assert source_item["source_knowledge_unit_title"] == ku_title
+    assert free_item["source_material_title"] is None
+    assert free_item["source_knowledge_unit_title"] is None
+
+
+@pytest.mark.asyncio
 async def test_preview_bank_retries_invalid_material_question_set(monkeypatch):
     engine = create_async_engine(settings.DATABASE_URL, echo=False)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -659,6 +711,37 @@ async def test_get_question_by_id():
 
 
 @pytest.mark.asyncio
+async def test_get_question_by_id_includes_source_titles():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        mid, ku_id = await upload_and_parse_material(client, token)
+        ku_resp = await client.get(
+            f"/api/v1/materials/{mid}/knowledge-units",
+            headers=headers,
+        )
+        ku_title = ku_resp.json()["units"][0]["title"]
+
+        create_resp = await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": "带来源题目",
+            "correct_answer": "A",
+            "options": {"A": "对", "B": "错"},
+            "source_material_id": mid,
+            "source_knowledge_unit_id": ku_id,
+        }, headers=headers)
+        qid = create_resp.json()["id"]
+
+        resp = await client.get(f"/api/v1/questions/{qid}", headers=headers)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["source_material_title"] == "AI基础教材"
+    assert data["source_knowledge_unit_title"] == ku_title
+
+
+@pytest.mark.asyncio
 async def test_get_question_not_found():
     async with get_client() as client:
         token = await register_user(client, "organizer")
@@ -784,6 +867,46 @@ async def test_reject_question():
 
 
 @pytest.mark.asyncio
+async def test_pending_review_list_includes_source_titles():
+    async with get_client() as client:
+        org_token = await register_user(client, "organizer")
+        rev_token = await register_user(client, "reviewer")
+        headers = {"Authorization": f"Bearer {org_token}"}
+
+        mid, ku_id = await upload_and_parse_material(client, org_token)
+        ku_resp = await client.get(
+            f"/api/v1/materials/{mid}/knowledge-units",
+            headers=headers,
+        )
+        ku_title = ku_resp.json()["units"][0]["title"]
+
+        create_resp = await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": "待审核来源题",
+            "correct_answer": "A",
+            "options": {"A": "1", "B": "2"},
+            "source_material_id": mid,
+            "source_knowledge_unit_id": ku_id,
+        }, headers=headers)
+        qid = create_resp.json()["id"]
+
+        await client.post(
+            f"/api/v1/questions/{qid}/submit",
+            headers=headers,
+        )
+        resp = await client.get(
+            "/api/v1/questions/review/pending",
+            headers={"Authorization": f"Bearer {rev_token}"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 1
+    assert data["items"][0]["source_material_title"] == "AI基础教材"
+    assert data["items"][0]["source_knowledge_unit_title"] == ku_title
+
+
+@pytest.mark.asyncio
 async def test_examinee_cannot_create_question():
     """Examinees should not be able to create questions."""
     async with get_client() as client:
@@ -807,6 +930,11 @@ async def test_generate_from_knowledge_unit():
         headers = {"Authorization": f"Bearer {token}"}
 
         mid, ku_id = await upload_and_parse_material(client, token)
+        ku_resp = await client.get(
+            f"/api/v1/materials/{mid}/knowledge-units",
+            headers=headers,
+        )
+        ku_title = ku_resp.json()["units"][0]["title"]
 
         resp = await client.post("/api/v1/questions/generate", json={
             "knowledge_unit_id": ku_id,
@@ -823,6 +951,8 @@ async def test_generate_from_knowledge_unit():
     for q in data["questions"]:
         assert q["source_material_id"] == mid
         assert q["source_knowledge_unit_id"] == ku_id
+        assert q["source_material_title"] == "AI基础教材"
+        assert q["source_knowledge_unit_title"] == ku_title
 
 
 @pytest.mark.asyncio
@@ -858,6 +988,11 @@ async def test_batch_create_from_raw_accepts_uuid_source_fields():
         headers = {"Authorization": f"Bearer {token}"}
 
         mid, ku_id = await upload_and_parse_material(client, token)
+        ku_resp = await client.get(
+            f"/api/v1/materials/{mid}/knowledge-units",
+            headers=headers,
+        )
+        ku_title = ku_resp.json()["units"][0]["title"]
 
         resp = await client.post(
             "/api/v1/questions/batch/create-raw",
@@ -886,6 +1021,8 @@ async def test_batch_create_from_raw_accepts_uuid_source_fields():
     assert data["generated"] == 1
     assert data["questions"][0]["source_material_id"] == mid
     assert data["questions"][0]["source_knowledge_unit_id"] == ku_id
+    assert data["questions"][0]["source_material_title"] == "AI基础教材"
+    assert data["questions"][0]["source_knowledge_unit_title"] == ku_title
 
 
 @pytest.mark.asyncio

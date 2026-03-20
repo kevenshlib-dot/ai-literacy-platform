@@ -134,6 +134,9 @@
               <a-tag v-if="record.dimension" :color="dimensionColor(record.dimension)">{{ record.dimension }}</a-tag>
               <span v-else style="color: #ccc">未分类</span>
             </template>
+            <template v-if="column.key === 'source'">
+              <span class="source-cell" :title="formatQuestionSource(record)">{{ formatQuestionSource(record) }}</span>
+            </template>
             <template v-if="column.key === 'status'">
               <a-tag :color="statusColor(record.status)">{{ statusLabel(record.status) }}</a-tag>
             </template>
@@ -268,6 +271,9 @@
             <template v-if="column.key === 'bloom_level'">
               <a-tag v-if="record.bloom_level" color="geekblue">{{ bloomLabel(record.bloom_level) }}</a-tag>
               <span v-else style="color: #ccc">-</span>
+            </template>
+            <template v-if="column.key === 'source'">
+              <span class="source-cell" :title="formatQuestionSource(record)">{{ formatQuestionSource(record) }}</span>
             </template>
             <template v-if="column.key === 'created_at'">
               {{ formatDate(record.created_at) }}
@@ -437,6 +443,7 @@
           </a-descriptions-item>
           <a-descriptions-item v-if="detailQuestion.dimension" label="维度">{{ detailQuestion.dimension }}</a-descriptions-item>
           <a-descriptions-item v-if="detailQuestion.bloom_level" label="认知层次">{{ bloomLabel(detailQuestion.bloom_level) }}</a-descriptions-item>
+          <a-descriptions-item label="来源">{{ formatQuestionSource(detailQuestion) }}</a-descriptions-item>
           <a-descriptions-item v-if="detailQuestion.review_comment" label="审核意见">{{ detailQuestion.review_comment }}</a-descriptions-item>
           <a-descriptions-item label="创建时间">{{ formatDate(detailQuestion.created_at) }}</a-descriptions-item>
         </a-descriptions>
@@ -1304,6 +1311,7 @@ const columns = [
   { title: '题型', key: 'question_type', dataIndex: 'question_type', width: 90 },
   { title: '难度', key: 'difficulty', dataIndex: 'difficulty', width: 140 },
   { title: '维度', key: 'dimension', dataIndex: 'dimension', width: 120, ellipsis: true },
+  { title: '来源', key: 'source', width: 240, ellipsis: true },
   { title: '状态', key: 'status', dataIndex: 'status', width: 90 },
   { title: '创建时间', key: 'created_at', dataIndex: 'created_at', width: 120 },
   { title: '操作', key: 'actions', width: 200, fixed: 'right' as const },
@@ -1316,6 +1324,7 @@ const reviewColumns = [
   { title: '难度', key: 'difficulty', dataIndex: 'difficulty', width: 140 },
   { title: '维度', key: 'dimension', dataIndex: 'dimension', width: 120, ellipsis: true },
   { title: '认知层次', key: 'bloom_level', dataIndex: 'bloom_level', width: 90 },
+  { title: '来源', key: 'source', width: 240, ellipsis: true },
   { title: '创建时间', key: 'created_at', dataIndex: 'created_at', width: 110 },
   { title: '操作', key: 'review_actions', width: 260, fixed: 'right' as const },
 ]
@@ -1407,6 +1416,30 @@ function formatDate(d: string) {
   const h = String(dt.getHours()).padStart(2, '0')
   const m = String(dt.getMinutes()).padStart(2, '0')
   return `${M}-${D} ${h}:${m}`
+}
+
+function formatQuestionSource(question: any) {
+  const materialTitle = question?.source_material_title?.trim?.() || ''
+  const knowledgeUnitTitle = question?.source_knowledge_unit_title?.trim?.() || ''
+  const materialId = question?.source_material_id || ''
+  const knowledgeUnitId = question?.source_knowledge_unit_id || ''
+
+  if (knowledgeUnitTitle) {
+    return knowledgeUnitTitle
+  }
+  if (materialTitle) {
+    return materialTitle
+  }
+  if (materialId && knowledgeUnitId) {
+    return `素材ID: ${materialId} / 知识单元ID: ${knowledgeUnitId}`
+  }
+  if (knowledgeUnitId) {
+    return `知识单元ID: ${knowledgeUnitId}`
+  }
+  if (materialId) {
+    return `素材ID: ${materialId}`
+  }
+  return 'AI自由生成'
 }
 
 // ---- API Calls ----
@@ -2627,6 +2660,8 @@ function addCandidatesToPreview() {
       bloom_level: q.bloom_level,
       source_material_id: q.source_material_id,
       source_knowledge_unit_id: q.source_knowledge_unit_id,
+      source_material_title: q.source_material_title,
+      source_knowledge_unit_title: q.source_knowledge_unit_title,
       _fromExisting: true,
     }))
     addedCount++
@@ -2693,6 +2728,15 @@ onMounted(() => {
   line-height: 1.5;
   max-height: 3em;
   word-break: break-all;
+}
+
+.source-cell {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #666;
 }
 
 /* Generation progress - animated robot */

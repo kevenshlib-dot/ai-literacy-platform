@@ -52,6 +52,8 @@ class QuestionResponse(BaseModel):
     bloom_level: Optional[str] = None
     source_material_id: Optional[UUID] = None
     source_knowledge_unit_id: Optional[UUID] = None
+    source_material_title: Optional[str] = None
+    source_knowledge_unit_title: Optional[str] = None
     status: str
     usage_count: int
     correct_rate: Optional[float] = None
@@ -192,6 +194,8 @@ class PreviewQuestionItem(BaseModel):
     bloom_level: Optional[str] = None
     source_material_id: Optional[UUID] = None
     source_knowledge_unit_id: Optional[UUID] = None
+    source_material_title: Optional[str] = None
+    source_knowledge_unit_title: Optional[str] = None
 
 
 class PreviewResponse(BaseModel):
