@@ -127,7 +127,7 @@ async def setup_db():
         await conn.execute(text("TRUNCATE TABLE questions CASCADE"))
         await conn.execute(text("TRUNCATE TABLE knowledge_units CASCADE"))
         await conn.execute(text("TRUNCATE TABLE materials CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE users CASCADE"))
+        # Preserve existing users when tests run against a shared local database.
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as session:
         await init_roles(session)
@@ -689,6 +689,75 @@ async def test_preview_bank_retries_invalid_material_question_set(monkeypatch):
     assert call_count["value"] == 2
     assert len(result["questions"]) == 2
     assert result["questions"][0]["stem"] == "推荐系统上线前，哪项做法最能降低个人信息误用风险？"
+
+
+@pytest.mark.asyncio
+async def test_preview_question_bank_includes_source_titles(monkeypatch):
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    material_id = uuid.uuid4()
+
+    def fake_generate(*args, **kwargs):
+        return {
+            "questions": [
+                {
+                    "question_type": "single_choice",
+                    "stem": "预览来源题目",
+                    "options": {"A": "正确", "B": "错误"},
+                    "correct_answer": "A",
+                    "explanation": "测试预览来源标题",
+                    "knowledge_tags": ["来源测试"],
+                    "dimension": "AI基础知识",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            "fallback_used": False,
+            "error": None,
+        }
+
+    monkeypatch.setattr(question_service, "generate_questions_via_llm", fake_generate)
+
+    async with session_factory() as session:
+        uploader = await create_user(
+            session,
+            username=f"preview_owner_{uuid.uuid4().hex[:8]}",
+            email=f"{uuid.uuid4().hex[:8]}@test.com",
+            password="password123",
+            role_name="organizer",
+        )
+        material = Material(
+            id=material_id,
+            title="AI基础教材",
+            format=MaterialFormat.MARKDOWN,
+            file_path="materials/test.md",
+            file_size=128,
+            status=MaterialStatus.PARSED,
+            uploaded_by=uploader.id,
+        )
+        session.add(material)
+        session.add(
+            KnowledgeUnit(
+                material_id=material_id,
+                title="AI基础教材 - 片段 1",
+                content="知识单元内容",
+                chunk_index=0,
+                dimension="AI基础知识",
+            )
+        )
+        await session.commit()
+
+        result = await question_service.preview_question_bank_from_material(
+            db=session,
+            material_id=material_id,
+            type_distribution={"single_choice": 1},
+            difficulty=3,
+        )
+
+    await engine.dispose()
+
+    assert len(result["questions"]) == 1
+    assert result["questions"][0]["source_material_title"] == "AI基础教材"
+    assert result["questions"][0]["source_knowledge_unit_title"] == "AI基础教材 - 片段 1"
 
 
 @pytest.mark.asyncio

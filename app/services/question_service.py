@@ -853,7 +853,7 @@ async def preview_question_bank_from_material(
                         "bloom_level": bloom_level,
                         "source_material_id": str(ku.material_id),
                         "source_knowledge_unit_id": str(ku.id),
-                        "source_material_title": mat.title,
+                        "source_material_title": material.title,
                         "source_knowledge_unit_title": ku.title,
                     })
                     type_generated += 1
