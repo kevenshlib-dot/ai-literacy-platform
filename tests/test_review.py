@@ -99,7 +99,7 @@ async def setup_db():
     async with engine.begin() as conn:
         await conn.execute(text("TRUNCATE TABLE review_records CASCADE"))
         await conn.execute(text("TRUNCATE TABLE questions CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE users CASCADE"))
+        # await conn.execute(text("TRUNCATE TABLE users CASCADE"))
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as session:
         await init_roles(session)

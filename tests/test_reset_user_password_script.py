@@ -14,7 +14,7 @@ async def db_session():
     engine = create_async_engine(settings.DATABASE_URL, echo=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        await conn.execute(text("TRUNCATE TABLE users CASCADE"))
+        # await conn.execute(text("TRUNCATE TABLE users CASCADE"))
 
     session_factory = async_sessionmaker(
         engine,
