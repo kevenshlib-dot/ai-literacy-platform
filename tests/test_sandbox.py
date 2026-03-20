@@ -81,6 +81,7 @@ async def setup_db():
         await conn.run_sync(Base.metadata.create_all)
     async with engine.begin() as conn:
         # await conn.execute(text("TRUNCATE TABLE users CASCADE"))
+        pass
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as session:
         await init_roles(session)

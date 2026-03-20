@@ -10,24 +10,69 @@ class Settings(BaseSettings):
     API_V1_PREFIX: str = "/api/v1"
 
     # PostgreSQL
+    TESTING: bool = False
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432
     POSTGRES_USER: str = "ai_literacy"
     POSTGRES_PASSWORD: str = "ai_literacy_pass"
     POSTGRES_DB: str = "ai_literacy_db"
+    TEST_POSTGRES_HOST: str | None = None
+    TEST_POSTGRES_PORT: int | None = None
+    TEST_POSTGRES_USER: str | None = None
+    TEST_POSTGRES_PASSWORD: str | None = None
+    TEST_POSTGRES_DB: str = "ai_literacy_test"
+
+    def _build_postgres_url(
+        self,
+        *,
+        async_driver: bool,
+        host: str,
+        port: int,
+        user: str,
+        password: str,
+        database: str,
+    ) -> str:
+        driver = "postgresql+asyncpg" if async_driver else "postgresql"
+        return f"{driver}://{user}:{password}@{host}:{port}/{database}"
 
     @property
     def DATABASE_URL(self) -> str:
-        return (
-            f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
-            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        if self.TESTING:
+            return self._build_postgres_url(
+                async_driver=True,
+                host=self.TEST_POSTGRES_HOST or self.POSTGRES_HOST,
+                port=self.TEST_POSTGRES_PORT or self.POSTGRES_PORT,
+                user=self.TEST_POSTGRES_USER or self.POSTGRES_USER,
+                password=self.TEST_POSTGRES_PASSWORD or self.POSTGRES_PASSWORD,
+                database=self.TEST_POSTGRES_DB,
+            )
+        return self._build_postgres_url(
+            async_driver=True,
+            host=self.POSTGRES_HOST,
+            port=self.POSTGRES_PORT,
+            user=self.POSTGRES_USER,
+            password=self.POSTGRES_PASSWORD,
+            database=self.POSTGRES_DB,
         )
 
     @property
     def SYNC_DATABASE_URL(self) -> str:
-        return (
-            f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
-            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        if self.TESTING:
+            return self._build_postgres_url(
+                async_driver=False,
+                host=self.TEST_POSTGRES_HOST or self.POSTGRES_HOST,
+                port=self.TEST_POSTGRES_PORT or self.POSTGRES_PORT,
+                user=self.TEST_POSTGRES_USER or self.POSTGRES_USER,
+                password=self.TEST_POSTGRES_PASSWORD or self.POSTGRES_PASSWORD,
+                database=self.TEST_POSTGRES_DB,
+            )
+        return self._build_postgres_url(
+            async_driver=False,
+            host=self.POSTGRES_HOST,
+            port=self.POSTGRES_PORT,
+            user=self.POSTGRES_USER,
+            password=self.POSTGRES_PASSWORD,
+            database=self.POSTGRES_DB,
         )
 
     # Elasticsearch
