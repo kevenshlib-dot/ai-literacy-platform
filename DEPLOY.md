@@ -225,7 +225,7 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 300s;  # LLM 调用可能较慢
+        proxy_read_timeout 600s;  # LLM 调用可能较慢
         proxy_connect_timeout 60s;
 
         # 文件上传大小限制

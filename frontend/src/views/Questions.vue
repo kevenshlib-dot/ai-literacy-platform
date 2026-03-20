@@ -2472,7 +2472,7 @@ async function handleBankBuild() {
         const result: any = await request.post(
           `/questions/preview/bank/${matId}`,
           payload,
-          { timeout: 300000 },
+          { timeout: 600000 },
         )
         allPreviewItems.push(...(result.questions || []))
         if (result.model_name) modelName = result.model_name
@@ -2488,7 +2488,7 @@ async function handleBankBuild() {
       const result: any = await request.post(
         '/questions/preview/free',
         payload,
-        { timeout: 300000 },
+        { timeout: 600000 },
       )
       allPreviewItems = result.questions || []
       if (result.model_name) modelName = result.model_name

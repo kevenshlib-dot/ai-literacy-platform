@@ -1133,7 +1133,7 @@ def _request_question_generation_openai_compatible(
     client = OpenAI(
         api_key=api_key,
         base_url=resolve_base_url(model_config),
-        timeout=Timeout(300.0, connect=10.0),
+        timeout=Timeout(600.0, connect=10.0),
     )
 
     request_kwargs = {
