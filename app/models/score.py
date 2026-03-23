@@ -46,5 +46,6 @@ class ScoreDetail(Base):
     max_score: Mapped[float] = mapped_column(Float, nullable=False)
     is_correct: Mapped[bool] = mapped_column(nullable=True)
     feedback: Mapped[str] = mapped_column(Text, nullable=True)
+    analysis: Mapped[dict] = mapped_column(JSONB, nullable=True)
 
     score: Mapped["Score"] = relationship(back_populates="details")

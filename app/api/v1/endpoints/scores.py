@@ -21,6 +21,7 @@ from app.services import score_service
 from app.services import diagnostic_service
 from app.services import evaluation_service
 from app.agents.scoring_agent import multi_model_score
+from app.services.score_service import serialize_score_detail
 
 router = APIRouter(prefix="/scores", tags=["评分管理"])
 
@@ -502,6 +503,8 @@ async def grade_answer_sheet(
     """Score a submitted answer sheet."""
     try:
         score = await score_service.score_answer_sheet(db, sheet_id)
+        await score_service.generate_report(db, score.id, force_refresh=True)
+        await diagnostic_service.generate_diagnostic_report(db, score.id, force_refresh=True)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     await db.commit()
@@ -531,13 +534,7 @@ async def get_score_by_sheet(
         "level": score.level,
         "dimension_scores": score.dimension_scores,
         "details": [
-            {
-                "question_id": str(d.question_id),
-                "earned_score": d.earned_score,
-                "max_score": d.max_score,
-                "is_correct": d.is_correct,
-                "feedback": d.feedback,
-            }
+            serialize_score_detail(d)
             for d in score.details
         ],
     }
@@ -667,13 +664,7 @@ async def get_score(
         "level": score.level,
         "dimension_scores": score.dimension_scores,
         "details": [
-            {
-                "question_id": str(d.question_id),
-                "earned_score": d.earned_score,
-                "max_score": d.max_score,
-                "is_correct": d.is_correct,
-                "feedback": d.feedback,
-            }
+            serialize_score_detail(d)
             for d in score.details
         ],
     }

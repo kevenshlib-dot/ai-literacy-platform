@@ -1,3 +1,4 @@
+import pytest
 import os
 from pathlib import Path
 
@@ -13,9 +14,17 @@ def _load_env_file(path: Path) -> None:
             os.environ[key] = value
 
 
-# Load repository-local test overrides before any app settings are imported.
 _load_env_file(Path(__file__).resolve().parent.parent / ".env.test")
-
-# Force pytest runs into testing mode before test modules import app settings.
 os.environ["TESTING"] = "true"
 os.environ.setdefault("TEST_POSTGRES_DB", "ai_literacy_test")
+
+
+@pytest.fixture(autouse=True)
+def disable_diagnostic_llm(monkeypatch):
+    """Keep tests deterministic by forcing diagnostic report fallback generation."""
+    from app.services import diagnostic_service
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("diagnostic llm disabled in tests")
+
+    monkeypatch.setattr(diagnostic_service, "generate_structured_diagnostic_sections", _raise)

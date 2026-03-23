@@ -1,13 +1,14 @@
 """Tests for five-dimensional diagnostic report (T022)."""
 import pytest
 from httpx import AsyncClient, ASGITransport
-from sqlalchemy import text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from app.main import app
 from app.core.database import Base, get_db
 from app.core.config import settings
 from app.services.user_service import init_roles
+from app.models.user import User
 
 
 async def override_get_db():
@@ -30,17 +31,8 @@ app.dependency_overrides[get_db] = override_get_db
 async def setup_db():
     engine = create_async_engine(settings.DATABASE_URL, echo=False)
     async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
-    async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE TABLE score_details CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE scores CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE answers CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE answer_sheets CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE exam_questions CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE exams CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE review_records CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE questions CASCADE"))
-        # await conn.execute(text("TRUNCATE TABLE users CASCADE"))
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as session:
         await init_roles(session)
@@ -62,7 +54,24 @@ async def register_user(client, role="organizer"):
         "password": "password123",
         "role": role,
     })
-    return resp.json()["access_token"]
+    data = resp.json()
+    if data.get("access_token"):
+        return data["access_token"]
+
+    user_id = data["user"]["id"]
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = (await session.execute(select(User).where(User.id == user_id))).scalar_one()
+        user.is_active = True
+        await session.commit()
+    await engine.dispose()
+
+    login_resp = await client.post("/api/v1/auth/login", json={
+        "username": f"user_{unique}",
+        "password": "password123",
+    })
+    return login_resp.json()["access_token"]
 
 
 async def create_scored_exam(client, org_token, ex_token, answers):
@@ -113,9 +122,12 @@ async def create_scored_exam(client, org_token, ex_token, answers):
             }, headers=ex_headers)
 
     await client.post(f"/api/v1/sessions/{sid}/submit", headers=ex_headers)
-
-    grade_resp = await client.post(f"/api/v1/scores/grade/{sid}", headers=org_headers)
-    return grade_resp.json()["score_id"]
+    score_resp = await client.get(
+        f"/api/v1/scores/sheet/{sid}",
+        headers={"Authorization": f"Bearer {ex_token}"},
+    )
+    assert score_resp.status_code == 200
+    return score_resp.json()["score_id"]
 
 
 @pytest.mark.asyncio
@@ -142,6 +154,11 @@ async def test_diagnostic_report_basic():
     assert "weaknesses" in data
     assert "recommendations" in data
     assert "comparison" in data
+    assert "wrong_answer_summary" in data
+    assert "personalized_summary" in data
+    assert "improvement_priorities" in data
+    assert "actionable_suggestions" in data
+    assert "recommended_resources" in data
 
 
 @pytest.mark.asyncio
@@ -207,10 +224,34 @@ async def test_diagnostic_recommendations():
     data = resp.json()
     recs = data["recommendations"]
     assert len(recs) > 0
-    for rec in recs:
-        assert "dimension" in rec
-        assert "priority" in rec
-        assert "suggestion" in rec
+    assert isinstance(recs[0], str)
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_wrong_answer_summary_contains_reason_details():
+    async with get_client() as client:
+        org_token = await register_user(client, "organizer")
+        ex_token = await register_user(client, "examinee")
+
+        score_id = await create_scored_exam(client, org_token, ex_token, [
+            ("A", "B"),
+            ("B", "C"),
+        ])
+
+        resp = await client.get(
+            f"/api/v1/scores/{score_id}/diagnostic",
+            headers={"Authorization": f"Bearer {ex_token}"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    wrong_summary = data["wrong_answer_summary"]
+    assert "overview" in wrong_summary
+    assert len(wrong_summary["items"]) > 0
+    item = wrong_summary["items"][0]
+    assert "question_id" in item
+    assert "reason_summary" in item
+    assert "improvement_tip" in item
 
 
 @pytest.mark.asyncio
@@ -266,11 +307,16 @@ async def test_diagnostic_percentile():
         await client.post(f"/api/v1/sessions/{sid2}/submit",
                          headers={"Authorization": f"Bearer {ex2_token}"})
 
-        # Grade both
-        g1 = await client.post(f"/api/v1/scores/grade/{sid1}", headers=org_headers)
-        g2 = await client.post(f"/api/v1/scores/grade/{sid2}", headers=org_headers)
-        score_id_1 = g1.json()["score_id"]
-        score_id_2 = g2.json()["score_id"]
+        score_1 = await client.get(
+            f"/api/v1/scores/sheet/{sid1}",
+            headers={"Authorization": f"Bearer {ex1_token}"},
+        )
+        score_2 = await client.get(
+            f"/api/v1/scores/sheet/{sid2}",
+            headers={"Authorization": f"Bearer {ex2_token}"},
+        )
+        score_id_1 = score_1.json()["score_id"]
+        score_id_2 = score_2.json()["score_id"]
 
         # Check diagnostics - ex1 should rank higher
         d1 = await client.get(f"/api/v1/scores/{score_id_1}/diagnostic",

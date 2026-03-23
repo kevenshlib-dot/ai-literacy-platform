@@ -323,10 +323,57 @@
         </a-col>
       </a-row>
 
+      <!-- Wrong Answer Analysis -->
+      <a-card title="错题分析" :bordered="false" style="margin-bottom: 16px">
+        <a-alert
+          v-if="!(diagnostic.wrong_answer_summary?.items || []).length"
+          type="success"
+          message="本次测评没有失分题。"
+          show-icon
+        />
+        <template v-else>
+          <a-alert
+            type="info"
+            :message="diagnostic.wrong_answer_summary?.overview || '已根据失分题汇总主要问题。'"
+            show-icon
+            style="margin-bottom: 12px"
+          />
+          <div
+            v-for="item in (diagnostic.wrong_answer_summary?.items || [])"
+            :key="item.question_id"
+            style="padding: 16px; border: 1px solid #f0f0f0; border-radius: 8px; margin-bottom: 12px;"
+          >
+            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px;">
+              <a-tag color="orange">{{ item.dimension || '未分类' }}</a-tag>
+              <a-tag>{{ typeLabel(item.question_type) }}</a-tag>
+              <a-tag color="red">{{ item.earned_score }}/{{ item.max_score }}分</a-tag>
+            </div>
+            <div style="font-weight: 600; margin-bottom: 8px;">{{ item.stem }}</div>
+            <div style="margin-bottom: 6px;"><strong>你的答案：</strong>{{ item.user_answer || '(未作答)' }}</div>
+            <div style="margin-bottom: 6px;"><strong>参考答案：</strong>{{ item.reference_answer || item.correct_answer || '-' }}</div>
+            <div style="margin-bottom: 6px;" v-if="item.reason_summary"><strong>错误原因：</strong>{{ item.reason_summary }}</div>
+            <div style="margin-bottom: 6px;" v-if="item.improvement_tip"><strong>改进提示：</strong>{{ item.improvement_tip }}</div>
+            <div v-if="item.missed_points?.length" style="margin-bottom: 6px;">
+              <strong>遗漏要点：</strong>{{ item.missed_points.join('；') }}
+            </div>
+            <div style="color: #666;" v-if="item.explanation"><strong>题目解析：</strong>{{ item.explanation }}</div>
+          </div>
+          <a-alert
+            v-if="diagnostic.wrong_answer_summary?.patterns?.length"
+            type="warning"
+            show-icon
+          >
+            <template #message>
+              高频问题：{{ diagnostic.wrong_answer_summary.patterns.join('；') }}
+            </template>
+          </a-alert>
+        </template>
+      </a-card>
+
       <!-- Dimension Analysis -->
       <a-card title="维度分析" :bordered="false" style="margin-bottom: 16px">
         <a-row :gutter="16">
-          <a-col :span="8" v-for="(item, index) in (diagnostic.radar_data || [])" :key="index">
+          <a-col :span="8" v-for="item in dimensionAnalysisList" :key="item.dimension">
             <a-card size="small" :bordered="true" style="margin-bottom: 12px">
               <template #title>
                 <a-tag :color="levelColor(item.level)">{{ item.level }}</a-tag>
@@ -335,7 +382,38 @@
               <div style="margin-bottom: 8px">
                 <a-progress :percent="item.score" :stroke-color="getProgressColor(item.score)" size="small" />
               </div>
-              <p style="color: #666; font-size: 13px; margin: 0">{{ item.description }}</p>
+              <p style="color: #666; font-size: 13px; margin: 0 0 8px 0">{{ item.description }}</p>
+              <p style="font-size: 13px; margin: 0 0 8px 0">{{ item.summary || item.detail }}</p>
+              <p v-if="item.evidence?.length" style="color: #999; font-size: 12px; margin: 0;">
+                依据：{{ item.evidence.join('；') }}
+              </p>
+            </a-card>
+          </a-col>
+        </a-row>
+      </a-card>
+
+      <!-- Personalized Summary -->
+      <a-card title="个性化总结" :bordered="false" style="margin-bottom: 16px">
+        <p style="margin-bottom: 12px; line-height: 1.8;">
+          {{ diagnostic.personalized_summary?.summary || '暂无个性化总结。' }}
+        </p>
+        <a-row :gutter="16">
+          <a-col :span="12">
+            <a-card size="small" title="表现亮点">
+              <a-list :data-source="diagnostic.personalized_summary?.highlights || []" size="small">
+                <template #renderItem="{ item }">
+                  <a-list-item>{{ item }}</a-list-item>
+                </template>
+              </a-list>
+            </a-card>
+          </a-col>
+          <a-col :span="12">
+            <a-card size="small" title="关注点">
+              <a-list :data-source="diagnostic.personalized_summary?.cautions || []" size="small">
+                <template #renderItem="{ item }">
+                  <a-list-item>{{ item }}</a-list-item>
+                </template>
+              </a-list>
             </a-card>
           </a-col>
         </a-row>
@@ -360,14 +438,21 @@
         </a-col>
         <a-col :span="12">
           <a-card title="提升方向" :bordered="false">
-            <a-list :data-source="diagnostic.weaknesses || []" size="small">
+            <a-list :data-source="diagnostic.improvement_priorities || []" size="small">
               <template #renderItem="{ item }">
                 <a-list-item>
-                  <a-tag color="orange">{{ item.dimension }}</a-tag>
-                  <span>{{ item.comment }} ({{ item.score }}分)</span>
+                  <div style="width: 100%;">
+                    <div style="margin-bottom: 4px;">
+                      <a-tag color="orange">{{ item.dimension }}</a-tag>
+                      <strong>{{ item.reason }}</strong>
+                    </div>
+                    <div v-if="item.actions?.length" style="color: #666;">
+                      建议动作：{{ item.actions.join('；') }}
+                    </div>
+                  </div>
                 </a-list-item>
               </template>
-              <template #header v-if="!(diagnostic.weaknesses || []).length">
+              <template #header v-if="!(diagnostic.improvement_priorities || []).length">
                 <span style="color: #999">暂无数据</span>
               </template>
             </a-list>
@@ -377,14 +462,43 @@
 
       <!-- Recommendations -->
       <a-card title="个性化学习建议" :bordered="false">
-        <a-list :data-source="diagnostic.recommendations || []" size="small">
+        <a-list :data-source="diagnostic.actionable_suggestions || []" size="small">
           <template #renderItem="{ item }">
             <a-list-item>
-              <a-tag :color="item.priority === '高' ? 'red' : item.priority === '中' ? 'orange' : 'blue'">
-                {{ item.priority }}优先
-              </a-tag>
-              <strong>{{ item.dimension }}</strong>：{{ item.suggestion }}
+              <div style="width: 100%;">
+                <div style="margin-bottom: 4px;">
+                  <a-tag color="blue">{{ item.dimension }}</a-tag>
+                  <strong>{{ item.title }}</strong>
+                </div>
+                <div>{{ item.suggestion }}</div>
+                <div v-if="item.actions?.length" style="color: #666; margin-top: 4px;">
+                  可执行动作：{{ item.actions.join('；') }}
+                </div>
+              </div>
             </a-list-item>
+          </template>
+          <template #header v-if="!(diagnostic.actionable_suggestions || []).length">
+            <span style="color: #999">暂无建议</span>
+          </template>
+        </a-list>
+      </a-card>
+
+      <a-card title="推荐资源" :bordered="false" style="margin-top: 16px">
+        <a-list :data-source="diagnostic.recommended_resources || []" size="small">
+          <template #renderItem="{ item }">
+            <a-list-item>
+              <div style="width: 100%;">
+                <div style="margin-bottom: 4px;">
+                  <a-tag color="purple">{{ item.dimension }}</a-tag>
+                  <strong>{{ item.title }}</strong>
+                  <span style="color: #999; margin-left: 8px;">难度 {{ item.difficulty }}</span>
+                </div>
+                <div style="color: #666;">{{ item.match_reason }}</div>
+              </div>
+            </a-list-item>
+          </template>
+          <template #header v-if="!(diagnostic.recommended_resources || []).length">
+            <span style="color: #999">暂无匹配课程资源</span>
           </template>
         </a-list>
       </a-card>
@@ -693,6 +807,14 @@ const diagnosticUserName = computed(() => {
     return selectedScore.value.full_name || selectedScore.value.username || '用户'
   }
   return userStore.userInfo?.full_name || userStore.userInfo?.username || '用户'
+})
+
+const dimensionAnalysisList = computed(() => {
+  const analysis = diagnostic.value?.dimension_analysis || {}
+  return Object.entries(analysis).map(([dimension, item]: [string, any]) => ({
+    dimension,
+    ...item,
+  }))
 })
 
 const certDate = computed(() => {

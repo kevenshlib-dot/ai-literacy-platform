@@ -10,29 +10,55 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
-from app.agents.llm_utils import strip_thinking_tags, build_disable_thinking_extra_body
+from app.agents.llm_utils import (
+    extract_json_text,
+    strip_thinking_tags,
+    build_disable_thinking_extra_body,
+)
 
 logger = logging.getLogger(__name__)
 
-SCORING_SYSTEM_PROMPT = """你是一个专业的AI素养评测评分专家。你需要根据题目、参考答案和学生作答，给出评分和反馈。
+SCORING_SYSTEM_PROMPT = """你是一个专业、严格且客观的AI素养评测评分专家。你需要根据题目、参考答案、评分标准和学生作答进行评分。
 
 评分规则：
-1. 根据参考答案的覆盖程度给分
-2. 关键概念必须准确
-3. 表述清晰、逻辑连贯可适当加分
-4. 存在明显错误应扣分
+1. 只依据输入中的题目、参考答案、评分标准和学生作答评分
+2. 不允许引用输入中不存在的知识点或事实
+3. 关键概念必须准确，存在明显事实错误应扣分
+4. 不要因为作答长度、礼貌措辞或语气而额外加分
+5. 如果学生未作答或几乎未回应，应明确给低分
 
 请严格按照以下JSON格式输出：
 ```json
 {
   "earned_ratio": 0.8,
-  "feedback": "评分反馈说明..."
+  "judgement": "一句客观评分结论",
+  "positive_points": ["答对的点1"],
+  "missed_points": ["遗漏的要点1"],
+  "error_reasons": ["incomplete_answer"],
+  "feedback": "面向考生的反馈",
+  "confidence": 0.85,
+  "evidence": ["基于学生答案可直接观察到的依据1"]
 }
 ```
 
 earned_ratio：得分比例（0.0-1.0），1.0为满分
-feedback：评分反馈，包含优点和不足
+judgement：一句客观结论，不要夸大
+positive_points：回答中的有效点，最多3条
+missed_points：相对参考答案遗漏的关键点，最多4条
+error_reasons：仅允许使用以下枚举：concept_error, incomplete_answer, logic_gap, scenario_misjudgment, unsupported_claim, no_answer
+feedback：简洁说明优点和不足
+confidence：模型对本次评分的置信度（0.0-1.0）
+evidence：只能引用学生答案、参考答案、评分标准中可以直接支持评分的依据，最多3条
 """
+
+ALLOWED_ERROR_REASONS = {
+    "concept_error",
+    "incomplete_answer",
+    "logic_gap",
+    "scenario_misjudgment",
+    "unsupported_claim",
+    "no_answer",
+}
 
 
 def score_subjective_answer(
@@ -45,70 +71,176 @@ def score_subjective_answer(
 ) -> dict:
     """Score a subjective answer using LLM or rule-based fallback.
 
-    Returns dict with earned_score, is_correct, and feedback.
+    Returns dict with earned_score, is_correct, feedback, and analysis.
     """
+    if not student_answer or not student_answer.strip():
+        return _empty_answer_result()
+
     if settings.LLM_API_KEY == "your-api-key":
-        return _rule_based_scoring(
-            stem, correct_answer, student_answer, question_type, max_score
+        return _with_scoring_source(
+            _rule_based_scoring(
+                stem, correct_answer, student_answer, question_type, max_score
+            ),
+            "fallback",
         )
 
     try:
-        client = OpenAI(
-            api_key=settings.LLM_API_KEY,
-            base_url=settings.LLM_BASE_URL,
+        result = _call_subjective_scoring_llm(
+            stem=stem,
+            correct_answer=correct_answer,
+            student_answer=student_answer,
+            max_score=max_score,
+            rubric=rubric,
+        )
+        normalized = _normalize_subjective_scoring_result(
+            result,
+            max_score=max_score,
+            student_answer=student_answer,
+        )
+        return _with_scoring_source(normalized, "llm")
+
+    except Exception as e:
+        logger.error(f"LLM scoring failed: {e}")
+        return _with_scoring_source(
+            _rule_based_scoring(
+                stem, correct_answer, student_answer, question_type, max_score
+            ),
+            "fallback",
         )
 
-        rubric_text = ""
-        if rubric:
-            rubric_text = f"\n评分标准：{json.dumps(rubric, ensure_ascii=False)}"
 
-        user_prompt = f"""题目：{stem}
+def _call_subjective_scoring_llm(
+    *,
+    stem: str,
+    correct_answer: str,
+    student_answer: str,
+    max_score: float,
+    rubric: Optional[dict],
+) -> dict:
+    client = OpenAI(
+        api_key=settings.LLM_API_KEY,
+        base_url=settings.LLM_BASE_URL,
+    )
+
+    rubric_text = ""
+    if rubric:
+        rubric_text = f"\n评分标准：{json.dumps(rubric, ensure_ascii=False)}"
+
+    user_prompt = f"""题目：{stem}
 参考答案：{correct_answer}{rubric_text}
 学生作答：{student_answer}
 满分：{max_score}
 
-请评分并给出反馈。"""
+请输出严格符合要求的JSON评分结果。"""
 
-        request_kwargs = {
-            "model": settings.LLM_MODEL,
-            "messages": [
-                {"role": "system", "content": SCORING_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.2,
-            "max_tokens": 512,
-        }
-        extra_body = build_disable_thinking_extra_body(
-            settings.LLM_MODEL,
-            settings.LLM_BASE_URL,
-        )
-        if extra_body:
-            request_kwargs["extra_body"] = extra_body
+    request_kwargs = {
+        "model": settings.LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": SCORING_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 700,
+    }
+    extra_body = build_disable_thinking_extra_body(
+        settings.LLM_MODEL,
+        settings.LLM_BASE_URL,
+    )
+    if extra_body:
+        request_kwargs["extra_body"] = extra_body
 
-        response = client.chat.completions.create(**request_kwargs)
+    response = client.chat.completions.create(**request_kwargs)
+    raw = extract_json_text(response.choices[0].message.content.strip())
+    return json.loads(raw)
 
-        raw = response.choices[0].message.content.strip()
-        raw = strip_thinking_tags(raw)
-        if "```json" in raw:
-            raw = raw.split("```json", 1)[1].split("```", 1)[0].strip()
-        elif "```" in raw:
-            raw = raw.split("```", 1)[1].split("```", 1)[0].strip()
 
-        result = json.loads(raw)
-        earned_ratio = max(0.0, min(1.0, float(result.get("earned_ratio", 0))))
-        earned_score = round(earned_ratio * max_score, 1)
+def _normalize_subjective_scoring_result(
+    result: dict,
+    *,
+    max_score: float,
+    student_answer: str,
+) -> dict:
+    earned_ratio = max(0.0, min(1.0, float(result.get("earned_ratio", 0.0))))
+    if not student_answer.strip():
+        earned_ratio = 0.0
 
-        return {
-            "earned_score": earned_score,
-            "is_correct": earned_ratio >= 0.6,
-            "feedback": result.get("feedback", ""),
-        }
+    earned_score = round(earned_ratio * max_score, 1)
+    positive_points = _normalize_string_list(result.get("positive_points"), limit=3)
+    missed_points = _normalize_string_list(result.get("missed_points"), limit=4)
+    evidence = _normalize_string_list(result.get("evidence"), limit=3)
+    error_reasons = [
+        reason
+        for reason in _normalize_string_list(result.get("error_reasons"), limit=4)
+        if reason in ALLOWED_ERROR_REASONS
+    ]
 
-    except Exception as e:
-        logger.error(f"LLM scoring failed: {e}")
-        return _rule_based_scoring(
-            stem, correct_answer, student_answer, question_type, max_score
-        )
+    if earned_score <= 0 and not error_reasons:
+        error_reasons = ["no_answer" if not student_answer.strip() else "incomplete_answer"]
+    if earned_ratio >= 0.8:
+        missed_points = missed_points[:2]
+
+    judgement = str(result.get("judgement") or "").strip()
+    feedback = str(result.get("feedback") or "").strip()
+    confidence = max(0.0, min(1.0, float(result.get("confidence", 0.5))))
+
+    if not judgement:
+        judgement = "回答覆盖了部分参考要点。"
+    if not feedback:
+        feedback = judgement
+
+    return {
+        "earned_score": earned_score,
+        "is_correct": earned_ratio >= 0.6,
+        "feedback": feedback,
+        "analysis": {
+            "earned_ratio": round(earned_ratio, 4),
+            "judgement": judgement,
+            "positive_points": positive_points,
+            "missed_points": missed_points,
+            "error_reasons": error_reasons,
+            "confidence": confidence,
+            "evidence": evidence,
+        },
+    }
+
+
+def _normalize_string_list(value, *, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items = []
+    for item in value:
+        text = str(item).strip()
+        if text:
+            items.append(text)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _with_scoring_source(result: dict, source: str) -> dict:
+    normalized = dict(result)
+    analysis = dict(normalized.get("analysis") or {})
+    analysis["scoring_source"] = source
+    normalized["analysis"] = analysis
+    return normalized
+
+
+def _empty_answer_result() -> dict:
+    return {
+        "earned_score": 0.0,
+        "is_correct": False,
+        "feedback": "未作答",
+        "analysis": {
+            "earned_ratio": 0.0,
+            "judgement": "未作答。",
+            "positive_points": [],
+            "missed_points": [],
+            "error_reasons": ["no_answer"],
+            "confidence": 1.0,
+            "evidence": [],
+            "scoring_source": "rule",
+        },
+    }
 
 
 def _rule_based_scoring(
@@ -120,11 +252,7 @@ def _rule_based_scoring(
 ) -> dict:
     """Simple keyword-matching fallback for subjective scoring."""
     if not student_answer or not student_answer.strip():
-        return {
-            "earned_score": 0.0,
-            "is_correct": False,
-            "feedback": "未作答",
-        }
+        return _empty_answer_result()
 
     # Split reference answer into key phrases
     ref_keywords = set()
@@ -155,10 +283,26 @@ def _rule_based_scoring(
     else:
         feedback_parts.append("回答不够完整，需要补充关键概念")
 
+    error_reasons = []
+    if ratio < 0.8:
+        error_reasons.append("incomplete_answer")
+    if ratio < 0.4:
+        error_reasons.append("concept_error")
+
     return {
         "earned_score": earned_score,
         "is_correct": ratio >= 0.6,
         "feedback": "；".join(feedback_parts),
+        "analysis": {
+            "earned_ratio": round(ratio, 4),
+            "judgement": feedback_parts[0],
+            "positive_points": [f"命中参考答案关键词 {matched}/{total} 个"] if matched else [],
+            "missed_points": [kw for kw in sorted(ref_keywords) if kw not in student_answer][:4],
+            "error_reasons": error_reasons,
+            "confidence": 0.45,
+            "evidence": [f"学生答案包含关键词：{kw}" for kw in sorted(ref_keywords) if kw in student_answer][:3],
+            "scoring_source": "rule",
+        },
     }
 
 
