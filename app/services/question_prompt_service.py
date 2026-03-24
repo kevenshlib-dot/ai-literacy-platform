@@ -407,6 +407,7 @@ async def render_generation_prompt_preview(
             f"本次生成将按实际调用顺序向模型发送 {len(rendered_items)} 条用户提示词。"
             f"已选素材模式下，系统会先生成知识点规划，再按“素材 / 知识单元 / 题型”拆分调用最终出题提示词。"
             f"当前知识片段策略：{selection_mode_label}。"
+            f"知识片段设置值为 {max_units}，若目标题量超过该值，系统会自动扩展候选片段以保证每题使用不同知识点。"
         )
     else:
         rendered_items = _build_free_prompt_preview_items(

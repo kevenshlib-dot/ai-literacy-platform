@@ -1,4 +1,5 @@
 """Question service - handles question CRUD, generation, and review."""
+import asyncio
 from difflib import SequenceMatcher
 import logging
 import re
@@ -17,10 +18,12 @@ from app.agents.question_agent import (
     MATERIAL_GENERATION_MAX_ATTEMPTS,
     _validate_generated_question_set,
     classify_dimension,
+    generate_question_plan_batch_via_llm,
     generate_questions_via_llm,
 )
 from app.agents.model_registry import ModelConfig
 from app.agents.review_agent import ai_review_question
+from app.services.preview_review_store import preview_review_store
 
 logger = logging.getLogger(__name__)
 MATERIAL_PLACEHOLDER_MARKERS = ("待OCR处理", "待转录处理", "待ASR处理")
@@ -34,6 +37,7 @@ COVERAGE_RECENCY_PENALTIES = {
     3: 1.0,
 }
 COVERAGE_PENALTY_CAP = 4.0
+PREVIEW_GENERATION_CONCURRENCY = 3
 BLOOM_LEVEL_ORDER = {
     "remember": 0,
     "understand": 1,
@@ -120,6 +124,22 @@ def _build_knowledge_unit_prompt_content(ku: KnowledgeUnit) -> str:
     if keyword_text:
         parts.append(f"【知识关键词】\n{keyword_text}")
     parts.append(f"【知识单元正文】\n{ku.content}")
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def _build_knowledge_unit_planner_content(ku: KnowledgeUnit, body_limit: int = 360) -> str:
+    parts: list[str] = []
+    if ku.title:
+        parts.append(f"【知识单元标题】\n{ku.title}")
+    if ku.summary:
+        parts.append(f"【知识单元摘要】\n{ku.summary}")
+    keyword_text = _format_keywords(ku.keywords)
+    if keyword_text:
+        parts.append(f"【知识关键词】\n{keyword_text}")
+    body = (ku.content or "").strip()
+    if len(body) > body_limit:
+        body = f"{body[:body_limit].rstrip()}..."
+    parts.append(f"【知识单元正文】\n{body}")
     return "\n\n".join(part for part in parts if part.strip())
 
 
@@ -300,6 +320,21 @@ def _count_requested_questions(
     return sum(count for _, count in items if count > 0)
 
 
+def _estimate_suggested_question_target(total_units: int, total_content_length: int) -> int:
+    if total_units <= 0:
+        return 0
+    if total_units <= 3:
+        total_questions = min(max(total_units * 3, 6), 12)
+    elif total_units <= 8:
+        total_questions = min(total_units * 3, 25)
+    else:
+        total_questions = min(total_units * 3, 40)
+
+    if total_content_length > 5000:
+        total_questions = min(total_questions + 5, 40)
+    return total_questions
+
+
 def _effective_material_generation_max_units(
     max_units: Optional[int],
     requested_total: int,
@@ -386,6 +421,60 @@ async def _record_material_generation_run(
         )
     await db.flush()
     return run
+
+
+def _build_material_generation_slots(
+    units: list[KnowledgeUnit],
+    type_distribution: dict[str, int],
+    unit_type_plan: dict[uuid.UUID, dict[str, int]],
+) -> list[dict]:
+    slots: list[dict] = []
+    for question_type, total_count in type_distribution.items():
+        if total_count <= 0:
+            continue
+        for ku in units:
+            count_for_unit = unit_type_plan.get(ku.id, {}).get(question_type, 0)
+            if count_for_unit <= 0:
+                continue
+            for slot_offset in range(count_for_unit):
+                slots.append({
+                    "slot_index": len(slots) + 1,
+                    "question_type": question_type,
+                    "knowledge_unit_id": ku.id,
+                    "knowledge_unit": ku,
+                    "planner_content": _build_knowledge_unit_planner_content(ku),
+                    "generator_content": _build_knowledge_unit_prompt_content(ku),
+                    "slot_offset": slot_offset,
+                })
+    return slots
+
+
+def _build_slot_batch_generator_content(slots: list[dict]) -> str:
+    sections: list[str] = []
+    for slot in slots:
+        sections.append(
+            f"【题目槽位 {slot['slot_index']} 参考素材】\n"
+            f"{slot['generator_content']}"
+        )
+    return "\n\n".join(sections)
+
+
+async def _run_generation_jobs(
+    jobs: list[dict],
+    max_concurrency: int = PREVIEW_GENERATION_CONCURRENCY,
+) -> list[dict]:
+    if not jobs:
+        return []
+
+    semaphore = asyncio.Semaphore(max(1, max_concurrency))
+    results: list[Optional[dict]] = [None] * len(jobs)
+
+    async def _run(index: int, kwargs: dict) -> None:
+        async with semaphore:
+            results[index] = await asyncio.to_thread(generate_questions_via_llm, **kwargs)
+
+    await asyncio.gather(*(_run(index, kwargs) for index, kwargs in enumerate(jobs)))
+    return [result or {} for result in results]
 
 
 def _material_generation_weight(units: list[KnowledgeUnit]) -> float:
@@ -923,6 +1012,124 @@ def _review_preview_questions(raw_questions: list[dict]) -> dict:
     }
 
 
+def _attach_preview_item_ids(raw_questions: list[dict]) -> list[dict]:
+    for question in raw_questions:
+        preview_item_id = question.get("preview_item_id")
+        if preview_item_id:
+            question["preview_item_id"] = str(preview_item_id)
+            continue
+        question["preview_item_id"] = str(uuid.uuid4())
+    return raw_questions
+
+
+def _build_preview_review_items(raw_questions: list[dict]) -> list[dict]:
+    items: list[dict] = []
+    for question in raw_questions:
+        preview_item_id = question.get("preview_item_id")
+        if not preview_item_id:
+            continue
+        items.append({
+            "preview_item_id": str(preview_item_id),
+            "quality_review": question.get("quality_review"),
+        })
+    return items
+
+
+def create_preview_review_batch(raw_questions: list[dict], stats: dict) -> Optional[uuid.UUID]:
+    if not raw_questions:
+        return None
+    _attach_preview_item_ids(raw_questions)
+    return preview_review_store.create_batch(raw_questions, stats)
+
+
+def get_preview_review_batch(batch_id: uuid.UUID | str) -> Optional[dict]:
+    payload = preview_review_store.get_batch(batch_id)
+    if not payload:
+        return None
+    return {
+        "preview_batch_id": payload.get("preview_batch_id"),
+        "pending": payload.get("pending", False),
+        "completed": payload.get("completed", False),
+        "failed": payload.get("failed", False),
+        "error": payload.get("error"),
+        "questions": _build_preview_review_items(payload.get("questions", [])),
+        "stats": payload.get("stats"),
+    }
+
+
+async def populate_preview_ai_review(batch_id: uuid.UUID | str) -> None:
+    payload = preview_review_store.get_batch(batch_id)
+    if not payload or not payload.get("pending"):
+        return
+
+    raw_questions = payload.get("questions", [])
+    stats = dict(payload.get("stats") or {})
+    if not raw_questions:
+        stats["ai_review_pending"] = False
+        stats["ai_review_completed"] = True
+        preview_review_store.update_batch(
+            batch_id,
+            stats=stats,
+            pending=False,
+            completed=True,
+            failed=False,
+            error=None,
+        )
+        return
+
+    try:
+        review_summary = await asyncio.to_thread(_review_preview_questions, raw_questions)
+        warnings = list(
+            dict.fromkeys(
+                [
+                    *(stats.get("warnings") or []),
+                    *review_summary["warnings"],
+                    *review_summary["blocked_items"],
+                ]
+            )
+        )
+        stats.update({
+            "quality_review_count": review_summary["reviewed_count"],
+            "quality_review_blocked": len(review_summary["blocked_items"]),
+            "quality_gate_failed": bool(stats.get("quality_gate_failed")) or bool(review_summary["blocked_items"]),
+            "ai_review_pending": False,
+            "ai_review_completed": True,
+            "warnings": warnings,
+        })
+        preview_review_store.update_batch(
+            batch_id,
+            questions=raw_questions,
+            stats=stats,
+            pending=False,
+            completed=True,
+            failed=False,
+            error=None,
+        )
+    except Exception as exc:
+        logger.exception("Preview AI review failed for batch %s", batch_id)
+        warnings = list(
+            dict.fromkeys(
+                [
+                    *(stats.get("warnings") or []),
+                    f"AI质检回填失败：{exc}",
+                ]
+            )
+        )
+        stats.update({
+            "ai_review_pending": False,
+            "ai_review_completed": False,
+            "warnings": warnings,
+        })
+        preview_review_store.update_batch(
+            batch_id,
+            stats=stats,
+            pending=False,
+            completed=False,
+            failed=True,
+            error=str(exc),
+        )
+
+
 async def enrich_question_source_titles(
     db: AsyncSession,
     questions: list[Question],
@@ -1288,6 +1495,7 @@ async def generate_from_knowledge_unit(
     prompt_seed: Optional[int] = None,
     system_prompt: Optional[str] = None,
     user_prompt_template: Optional[str] = None,
+    question_plan: Optional[list[dict]] = None,
 ) -> list[Question]:
     """Generate questions from a knowledge unit using LLM."""
     # Fetch KU
@@ -1311,6 +1519,7 @@ async def generate_from_knowledge_unit(
         prompt_seed=prompt_seed,
         system_prompt=system_prompt,
         user_prompt_template=user_prompt_template,
+        question_plan=question_plan,
     )
     raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
     usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
@@ -1524,10 +1733,11 @@ async def suggest_question_distribution(
         .where(KnowledgeUnit.material_id == material_id)
         .order_by(KnowledgeUnit.chunk_index)
     )
+    all_units = list(ku_result.scalars().all())
     units, selection_stats = await _select_material_generation_units(
         db=db,
         material_id=material_id,
-        units=list(ku_result.scalars().all()),
+        units=all_units,
         max_units=max_units,
         selection_mode=selection_mode,
     )
@@ -1537,20 +1747,33 @@ async def suggest_question_distribution(
         raise ValueError("该素材没有知识单元，请先解析素材")
     _ensure_material_generation_ready(material, units)
 
+    configured_max_units = max_units or 0
+    effective_max_units = max_units
+
+    for _ in range(3):
+        total_content_length = sum(len(u.content or "") for u in units)
+        total_questions = _estimate_suggested_question_target(total_units, total_content_length)
+        next_effective_max_units = _effective_material_generation_max_units(max_units, total_questions)
+        if next_effective_max_units == effective_max_units:
+            break
+        effective_max_units = next_effective_max_units
+        units, selection_stats = await _select_material_generation_units(
+            db=db,
+            material_id=material_id,
+            units=all_units,
+            max_units=effective_max_units,
+            selection_mode=selection_mode,
+        )
+        total_units = len(units)
+        if total_units == 0:
+            raise ValueError("该素材没有知识单元，请先解析素材")
+        _ensure_material_generation_ready(material, units)
+
     total_content_length = sum(len(u.content or "") for u in units)
-
-    # Determine total question count based on material size
-    if total_units <= 3:
-        total_questions = min(max(total_units * 3, 6), 12)
-    elif total_units <= 8:
-        total_questions = min(total_units * 3, 25)
-    else:
-        total_questions = min(total_units * 3, 40)
-
-    # Boost for longer content
-    if total_content_length > 5000:
-        total_questions = min(total_questions + 5, 40)
-    total_questions = min(total_questions, total_units)
+    total_questions = min(
+        _estimate_suggested_question_target(total_units, total_content_length),
+        total_units,
+    )
 
     # Distribute by type ratios: single 40%, true_false 20%, multiple 15%, short_answer 15%, fill_blank 10%
     dist = _allocate_counts_by_weights(
@@ -1574,6 +1797,8 @@ async def suggest_question_distribution(
         "material_id": str(material_id),
         "material_title": material.title,
         "total_units": total_units,
+        "configured_max_units": configured_max_units,
+        "effective_max_units": total_units,
         "suggested_distribution": dist,
         "suggested_total": actual_total,
         "difficulty": avg_difficulty,
@@ -1736,71 +1961,116 @@ async def preview_question_bank_from_material(
 
         all_preview: list[dict] = []
         total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        type_counts: dict[str, int] = {}
+        type_counts: dict[str, int] = {
+            question_type: 0
+            for question_type, total_count in type_distribution.items()
+            if total_count > 0
+        }
         errors: list[str] = []
         fallback_count = 0
         start_time = time.time()
+        generation_slots = _build_material_generation_slots(
+            units,
+            type_distribution,
+            unit_type_plan,
+        )
+        planner_result = generate_question_plan_batch_via_llm(
+            slot_requests=[
+                {
+                    "slot_index": slot["slot_index"],
+                    "question_type": slot["question_type"],
+                    "content": slot["planner_content"],
+                }
+                for slot in generation_slots
+            ],
+            difficulty=difficulty,
+            bloom_level=bloom_level,
+            custom_prompt=attempt_prompt,
+            model_config=model_config,
+            prompt_seed=prompt_seed,
+        )
+        planner_usage = planner_result.get("usage", {}) if isinstance(planner_result, dict) else {}
+        for key in total_usage:
+            total_usage[key] += planner_usage.get(key, 0)
 
-        for qtype, total_count in type_distribution.items():
-            if total_count <= 0:
-                continue
-            type_generated = 0
+        planned_items = planner_result.get("question_plan", []) if isinstance(planner_result, dict) else []
+        if planner_result.get("fallback_used") and planner_result.get("error"):
+            errors.append(f"planner: {planner_result['error']}")
+        slots_by_type: dict[str, list[dict]] = {}
+        for slot_index, slot in enumerate(generation_slots):
+            question_plan = [planned_items[slot_index]] if slot_index < len(planned_items) else None
+            slot_with_plan = {**slot, "question_plan": question_plan}
+            slots_by_type.setdefault(slot["question_type"], []).append(slot_with_plan)
 
-            for ku in units:
-                count_for_unit = unit_type_plan.get(ku.id, {}).get(qtype, 0)
-                if count_for_unit <= 0:
-                    continue
+        generation_batches: list[tuple[str, list[dict]]] = [
+            (qtype, slots)
+            for qtype, slots in slots_by_type.items()
+        ]
+        generation_results = await _run_generation_jobs(
+            [
+                {
+                    "content": _build_slot_batch_generator_content(slots),
+                    "question_types": [qtype],
+                    "count": len(slots),
+                    "difficulty": difficulty,
+                    "bloom_level": bloom_level,
+                    "custom_prompt": attempt_prompt,
+                    "model_config": model_config,
+                    "prompt_seed": prompt_seed,
+                    "system_prompt": system_prompt,
+                    "user_prompt_template": user_prompt_template,
+                    "question_plan": [
+                        slot["question_plan"][0]
+                        for slot in slots
+                        if slot.get("question_plan")
+                    ] if all(slot.get("question_plan") for slot in slots) else None,
+                }
+                for qtype, slots in generation_batches
+            ]
+        )
 
-                llm_result = generate_questions_via_llm(
-                    content=_build_knowledge_unit_prompt_content(ku),
-                    question_types=[qtype],
-                    count=count_for_unit,
-                    difficulty=difficulty,
-                    bloom_level=bloom_level,
-                    custom_prompt=attempt_prompt,
-                    model_config=model_config,
-                    prompt_seed=prompt_seed,
-                    system_prompt=system_prompt,
-                    user_prompt_template=user_prompt_template,
+        for (qtype, slots), llm_result in zip(generation_batches, generation_results):
+            raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
+            usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
+            if isinstance(llm_result, dict) and llm_result.get("fallback_used"):
+                fallback_count += 1
+                if llm_result.get("error"):
+                    errors.append(str(llm_result["error"]))
+            if len(raw_questions) != len(slots):
+                errors.append(
+                    f"{qtype}: 计划生成 {len(slots)} 道，实际返回 {len(raw_questions)} 道"
                 )
-                raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
-                usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
-                if isinstance(llm_result, dict) and llm_result.get("fallback_used"):
-                    fallback_count += 1
-                    if llm_result.get("error"):
-                        errors.append(str(llm_result["error"]))
-                for k in total_usage:
-                    total_usage[k] += usage.get(k, 0)
+            for key in total_usage:
+                total_usage[key] += usage.get(key, 0)
 
-                for raw in raw_questions:
-                    tags = raw.get("knowledge_tags")
-                    if isinstance(tags, str):
-                        tags = [tags]
-                    if not isinstance(tags, list):
-                        tags = None
+            for raw, slot in zip(raw_questions, slots):
+                ku = slot["knowledge_unit"]
+                tags = raw.get("knowledge_tags")
+                if isinstance(tags, str):
+                    tags = [tags]
+                if not isinstance(tags, list):
+                    tags = None
 
-                    dim = ku.dimension or raw.get("dimension")
-                    if not dim:
-                        dim = classify_dimension(raw.get("stem", ""), tags)
+                dim = ku.dimension or raw.get("dimension")
+                if not dim:
+                    dim = classify_dimension(raw.get("stem", ""), tags)
 
-                    all_preview.append({
-                        "question_type": raw.get("question_type", qtype),
-                        "stem": raw.get("stem", ""),
-                        "options": raw.get("options"),
-                        "correct_answer": raw.get("correct_answer", ""),
-                        "explanation": raw.get("explanation", ""),
-                        "difficulty": difficulty,
-                        "dimension": dim,
-                        "knowledge_tags": tags,
-                        "bloom_level": bloom_level,
-                        "source_material_id": str(ku.material_id),
-                        "source_knowledge_unit_id": str(ku.id),
-                        "source_material_title": material.title,
-                        "source_knowledge_unit_title": ku.title,
-                    })
-                    type_generated += 1
-
-            type_counts[qtype] = type_generated
+                all_preview.append({
+                    "question_type": raw.get("question_type", qtype),
+                    "stem": raw.get("stem", ""),
+                    "options": raw.get("options"),
+                    "correct_answer": raw.get("correct_answer", ""),
+                    "explanation": raw.get("explanation", ""),
+                    "difficulty": difficulty,
+                    "dimension": dim,
+                    "knowledge_tags": tags,
+                    "bloom_level": bloom_level,
+                    "source_material_id": str(ku.material_id),
+                    "source_knowledge_unit_id": str(ku.id),
+                    "source_material_title": material.title,
+                    "source_knowledge_unit_title": ku.title,
+                })
+                type_counts[qtype] = type_counts.get(qtype, 0) + 1
 
         validation = _validate_generated_question_set(
             all_preview,
@@ -1813,7 +2083,6 @@ async def preview_question_bank_from_material(
         ]
         near_duplicate_warnings = _collect_near_duplicate_pairs(all_preview)
         existing_near_duplicate_warnings = await _collect_existing_near_duplicate_pairs(db, all_preview)
-        quality_review_summary = _review_preview_questions(all_preview)
         calibration_summary = _review_preview_calibration(all_preview)
         generated_total = len(all_preview)
         quality_gate_failed = (
@@ -1821,7 +2090,6 @@ async def preview_question_bank_from_material(
             or bool(existing_duplicates)
             or bool(near_duplicate_warnings)
             or bool(existing_near_duplicate_warnings)
-            or bool(quality_review_summary["blocked_items"])
             or fallback_count > 0
             or generated_total < requested_total
         )
@@ -1836,8 +2104,6 @@ async def preview_question_bank_from_material(
         warnings.extend(existing_duplicate_warnings)
         warnings.extend(near_duplicate_warnings)
         warnings.extend(existing_near_duplicate_warnings)
-        warnings.extend(quality_review_summary["warnings"])
-        warnings.extend(quality_review_summary["blocked_items"])
         warnings.extend(calibration_summary["warnings"])
         duration = round(time.time() - start_time, 2)
         stats = {
@@ -1852,8 +2118,8 @@ async def preview_question_bank_from_material(
             "generated_total": generated_total,
             "quality_gate_failed": quality_gate_failed,
             "save_blocked": save_blocked,
-            "quality_review_count": quality_review_summary["reviewed_count"],
-            "quality_review_blocked": len(quality_review_summary["blocked_items"]),
+            "quality_review_count": 0,
+            "quality_review_blocked": 0,
             "near_duplicate_count": len(near_duplicate_warnings),
             "existing_near_duplicate_count": len(existing_near_duplicate_warnings),
             "calibration_review_count": calibration_summary["reviewed_count"],
@@ -1863,11 +2129,20 @@ async def preview_question_bank_from_material(
             "bloom_mismatch_count": calibration_summary["bloom_mismatch_count"],
             "bloom_severe_mismatch_count": calibration_summary["bloom_severe_mismatch_count"],
             "selection_mode": selection_stats["selection_mode"],
+            "configured_max_units": max_units,
+            "effective_max_units": len(units),
+            "selected_unit_count": len(units),
             "history_window_size": selection_stats["history_window_size"],
             "cooled_unit_count": selection_stats["cooled_unit_count"],
+            "ai_review_pending": generated_total > 0,
+            "ai_review_completed": False,
             "warnings": list(dict.fromkeys(warnings)),
         }
-        last_result = {"questions": all_preview, "stats": stats}
+        last_result = {
+            "preview_batch_id": None,
+            "questions": all_preview,
+            "stats": stats,
+        }
         if validation["passed"] and not quality_gate_failed:
             if generated_total > 0 and planned_unit_ids:
                 await _record_material_generation_run(
@@ -1877,6 +2152,7 @@ async def preview_question_bank_from_material(
                     selection_mode=selection_stats["selection_mode"],
                     created_by=created_by,
                 )
+            last_result["preview_batch_id"] = create_preview_review_batch(all_preview, stats)
             return last_result
 
         last_reasons = validation["reasons"]
@@ -1895,10 +2171,22 @@ async def preview_question_bank_from_material(
             selection_mode=selection_stats["selection_mode"],
             created_by=created_by,
         )
-    return last_result or {"questions": [], "stats": {"validation_reasons": last_reasons}}
+        last_result["preview_batch_id"] = create_preview_review_batch(
+            last_result.get("questions", []),
+            last_result.get("stats", {}),
+        )
+    return last_result or {
+        "preview_batch_id": None,
+        "questions": [],
+        "stats": {
+            "validation_reasons": last_reasons,
+            "ai_review_pending": False,
+            "ai_review_completed": False,
+        },
+    }
 
 
-def preview_questions_free(
+async def preview_questions_free(
     type_distribution: dict[str, int],
     difficulty: int = 3,
     bloom_level: Optional[str] = None,
@@ -1911,27 +2199,40 @@ def preview_questions_free(
     """Preview question generation without material. No DB involvement."""
     all_preview: list[dict] = []
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    type_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {
+        qtype: count
+        for qtype, count in type_distribution.items()
+        if count > 0
+    }
     errors: list[str] = []
     fallback_count = 0
     start_time = time.time()
     requested_total = sum(count for count in type_distribution.values() if count > 0)
 
-    for qtype, count in type_distribution.items():
-        if count <= 0:
-            continue
-        llm_result = generate_questions_via_llm(
-            content="",
-            question_types=[qtype],
-            count=count,
-            difficulty=difficulty,
-            bloom_level=bloom_level,
-            custom_prompt=custom_prompt,
-            model_config=model_config,
-            prompt_seed=prompt_seed,
-            system_prompt=system_prompt,
-            user_prompt_template=user_prompt_template,
-        )
+    generation_batches = [
+        (qtype, count)
+        for qtype, count in type_distribution.items()
+        if count > 0
+    ]
+    generation_results = await _run_generation_jobs(
+        [
+            {
+                "content": "",
+                "question_types": [qtype],
+                "count": count,
+                "difficulty": difficulty,
+                "bloom_level": bloom_level,
+                "custom_prompt": custom_prompt,
+                "model_config": model_config,
+                "prompt_seed": prompt_seed,
+                "system_prompt": system_prompt,
+                "user_prompt_template": user_prompt_template,
+            }
+            for qtype, count in generation_batches
+        ]
+    )
+
+    for (qtype, count), llm_result in zip(generation_batches, generation_results):
         raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
         usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
         if isinstance(llm_result, dict) and llm_result.get("fallback_used"):
@@ -1973,7 +2274,6 @@ def preview_questions_free(
     duration = round(time.time() - start_time, 2)
     generated_total = len(all_preview)
     near_duplicate_warnings = _collect_near_duplicate_pairs(all_preview)
-    quality_review_summary = _review_preview_questions(all_preview)
     calibration_summary = _review_preview_calibration(all_preview)
     warnings: list[str] = []
     if generated_total < requested_total:
@@ -1981,14 +2281,11 @@ def preview_questions_free(
     if fallback_count > 0:
         warnings.append("本次生成触发了降级模板，请关注结果中的风险提示")
     warnings.extend(near_duplicate_warnings)
-    warnings.extend(quality_review_summary["warnings"])
-    warnings.extend(quality_review_summary["blocked_items"])
     warnings.extend(calibration_summary["warnings"])
     quality_gate_failed = (
         fallback_count > 0
         or generated_total < requested_total
         or bool(near_duplicate_warnings)
-        or bool(quality_review_summary["blocked_items"])
     )
     save_blocked = False
     stats = {
@@ -2001,8 +2298,8 @@ def preview_questions_free(
         "generated_total": generated_total,
         "quality_gate_failed": quality_gate_failed,
         "save_blocked": save_blocked,
-        "quality_review_count": quality_review_summary["reviewed_count"],
-        "quality_review_blocked": len(quality_review_summary["blocked_items"]),
+        "quality_review_count": 0,
+        "quality_review_blocked": 0,
         "near_duplicate_count": len(near_duplicate_warnings),
         "calibration_review_count": calibration_summary["reviewed_count"],
         "calibration_warning_count": calibration_summary["warning_count"],
@@ -2010,9 +2307,19 @@ def preview_questions_free(
         "difficulty_severe_mismatch_count": calibration_summary["difficulty_severe_mismatch_count"],
         "bloom_mismatch_count": calibration_summary["bloom_mismatch_count"],
         "bloom_severe_mismatch_count": calibration_summary["bloom_severe_mismatch_count"],
+        "configured_max_units": 0,
+        "effective_max_units": 0,
+        "selected_unit_count": 0,
+        "ai_review_pending": generated_total > 0,
+        "ai_review_completed": False,
         "warnings": list(dict.fromkeys(warnings)),
     }
-    return {"questions": all_preview, "stats": stats}
+    preview_batch_id = create_preview_review_batch(all_preview, stats)
+    return {
+        "preview_batch_id": preview_batch_id,
+        "questions": all_preview,
+        "stats": stats,
+    }
 
 
 async def batch_create_from_raw(

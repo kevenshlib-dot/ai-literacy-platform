@@ -1,5 +1,7 @@
 """Tests for question generation engine (T009)."""
 import io
+import threading
+import time
 import uuid
 import pytest
 from httpx import AsyncClient, ASGITransport
@@ -315,6 +317,57 @@ def test_review_preview_calibration_detects_severe_mismatch():
     assert raw_questions[0]["calibration_review"]["estimated_bloom_level"] == "remember"
 
 
+@pytest.mark.asyncio
+async def test_suggest_question_distribution_expands_effective_max_units():
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    async with session_factory() as session:
+        uploader = await create_user(
+            session,
+            username=f"suggest_expand_{uuid.uuid4().hex[:8]}",
+            email=f"{uuid.uuid4().hex[:8]}@test.com",
+            password="password123",
+            role_name="organizer",
+        )
+        material = Material(
+            id=uuid.uuid4(),
+            title="建议扩容素材",
+            format=MaterialFormat.MARKDOWN,
+            file_path="materials/suggest-expand.md",
+            file_size=256,
+            status=MaterialStatus.PARSED,
+            uploaded_by=uploader.id,
+        )
+        session.add(material)
+        session.add_all(
+            [
+                KnowledgeUnit(
+                    material_id=material.id,
+                    title=f"知识点{i}",
+                    summary=f"摘要{i}",
+                    content=f"知识点{i}详细说明数据治理、权限控制和审计流程，适合独立出题。",
+                    chunk_index=i,
+                )
+                for i in range(6)
+            ]
+        )
+        await session.commit()
+
+        result = await question_service.suggest_question_distribution(
+            db=session,
+            material_id=material.id,
+            max_units=2,
+        )
+
+    await engine.dispose()
+
+    assert result["configured_max_units"] == 2
+    assert result["effective_max_units"] == 6
+    assert result["total_units"] == 6
+    assert result["suggested_total"] == 6
+
+
 # ---- Integration Tests: Question API ----
 
 async def override_get_db():
@@ -590,6 +643,7 @@ async def test_prompt_preview_uses_actual_material_split_for_preview():
     assert "人工智能是计算机科学的一个分支" in data["rendered_user_prompts"][0]["rendered_user_prompt"]
     assert "先生成知识点规划" in data["preview_note"]
     assert "按实际调用顺序向模型发送 1 条用户提示词" in data["preview_note"]
+    assert "若目标题量超过该值，系统会自动扩展候选片段" in data["preview_note"]
 
 
 @pytest.mark.asyncio
@@ -1395,6 +1449,52 @@ async def test_preview_free_request_prompt_overrides_saved_defaults(monkeypatch)
     assert captured["user_prompt_template"] == VALID_TEST_USER_PROMPT_TEMPLATE
 
 
+@pytest.mark.asyncio
+async def test_preview_questions_free_runs_type_batches_concurrently(monkeypatch):
+    state = {
+        "active": 0,
+        "max_active": 0,
+    }
+    lock = threading.Lock()
+
+    def fake_generate(**kwargs):
+        with lock:
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+        try:
+            time.sleep(0.12)
+            qtype = kwargs["question_types"][0]
+            return {
+                "questions": [
+                    {
+                        "question_type": qtype,
+                        "stem": f"{qtype} 并发测试题",
+                        "options": {"A": "选项A", "B": "选项B", "C": "选项C", "D": "选项D"} if qtype != "true_false" else {"A": "正确", "B": "错误"},
+                        "correct_answer": "A",
+                        "explanation": "并发测试",
+                        "knowledge_tags": [qtype],
+                        "dimension": "AI基础知识",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "fallback_used": False,
+                "error": None,
+            }
+        finally:
+            with lock:
+                state["active"] -= 1
+
+    monkeypatch.setattr(question_service, "generate_questions_via_llm", fake_generate)
+
+    result = await question_service.preview_questions_free(
+        type_distribution={"single_choice": 1, "true_false": 1},
+        difficulty=3,
+    )
+
+    assert len(result["questions"]) == 2
+    assert state["max_active"] >= 2
+
+
 # ---- CRUD Tests ----
 
 @pytest.mark.asyncio
@@ -1699,6 +1799,303 @@ async def test_preview_question_bank_includes_source_titles(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_preview_question_bank_uses_batch_planner_once_per_attempt(monkeypatch):
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    material_id = uuid.uuid4()
+    planner_calls = {"count": 0}
+    injected_plans: list[list[dict] | None] = []
+    generator_calls: list[dict] = []
+
+    def fake_batch_planner(**kwargs):
+        planner_calls["count"] += 1
+        slot_requests = kwargs.get("slot_requests", [])
+        return {
+            "question_plan": [
+                {
+                    "knowledge_point": f"规划知识点{slot['slot_index']}",
+                    "evidence": f"证据{slot['slot_index']}",
+                    "question_type": slot["question_type"],
+                    "stem_style": "直接知识型",
+                    "scenario": "课堂学习场景",
+                    "answer_focus": f"答案聚焦{slot['slot_index']}",
+                    "distractor_focus": f"干扰项{slot['slot_index']}",
+                    "knowledge_tags": [f"标签{slot['slot_index']}"],
+                    "dimension": "AI基础知识",
+                }
+                for slot in slot_requests
+            ],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+            "fallback_used": False,
+            "error": None,
+        }
+
+    def fake_generate_questions_via_llm(**kwargs):
+        question_plan = kwargs.get("question_plan")
+        injected_plans.append(question_plan)
+        question_type = kwargs["question_types"][0]
+        count = kwargs["count"]
+        generator_calls.append({
+            "question_type": question_type,
+            "count": count,
+            "question_plan": question_plan,
+        })
+
+        questions = []
+        for index in range(count):
+            plan_item = (question_plan or [{}])[index] if question_plan and index < len(question_plan) else {}
+            if question_type == "true_false":
+                questions.append(
+                    {
+                        "question_type": "true_false",
+                        "stem": f"{plan_item.get('knowledge_point', '默认知识点')} 是正确的表述。",
+                        "options": {"A": "正确", "B": "错误"},
+                        "correct_answer": "A",
+                        "explanation": "测试整批 planner 注入。",
+                        "knowledge_tags": plan_item.get("knowledge_tags", [f"默认标签{index + 1}"]),
+                        "dimension": plan_item.get("dimension", "AI基础知识"),
+                    }
+                )
+                continue
+            questions.append(
+                {
+                    "question_type": question_type,
+                    "stem": f"{plan_item.get('knowledge_point', '默认知识点')} 对应的测试题目是什么？",
+                    "options": {"A": "方案A", "B": "方案B", "C": "方案C", "D": "方案D"},
+                    "correct_answer": "A",
+                    "explanation": "测试整批 planner 注入。",
+                    "knowledge_tags": plan_item.get("knowledge_tags", [f"默认标签{index + 1}"]),
+                    "dimension": plan_item.get("dimension", "AI基础知识"),
+                }
+            )
+        return {
+            "questions": questions,
+            "usage": {"prompt_tokens": 11, "completion_tokens": 6, "total_tokens": 17},
+            "fallback_used": False,
+            "error": None,
+        }
+
+    monkeypatch.setattr(question_service, "generate_question_plan_batch_via_llm", fake_batch_planner)
+    monkeypatch.setattr(question_service, "generate_questions_via_llm", fake_generate_questions_via_llm)
+    monkeypatch.setattr(question_service, "_validate_generated_question_set", lambda *args, **kwargs: {
+        "passed": True,
+        "reasons": [],
+    })
+    monkeypatch.setattr(question_service, "_collect_near_duplicate_pairs", lambda *args, **kwargs: [])
+
+    async def empty_existing_duplicates(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(question_service, "_collect_existing_duplicate_stems", empty_existing_duplicates)
+    monkeypatch.setattr(question_service, "_collect_existing_near_duplicate_pairs", empty_existing_duplicates)
+
+    async with session_factory() as session:
+        uploader = await create_user(
+            session,
+            username=f"batch_plan_{uuid.uuid4().hex[:8]}",
+            email=f"{uuid.uuid4().hex[:8]}@test.com",
+            password="password123",
+            role_name="organizer",
+        )
+        session.add(
+            Material(
+                id=material_id,
+                title="整批规划素材",
+                format=MaterialFormat.MARKDOWN,
+                file_path="materials/test.md",
+                file_size=128,
+                status=MaterialStatus.PARSED,
+                uploaded_by=uploader.id,
+            )
+        )
+        session.add_all([
+            KnowledgeUnit(
+                material_id=material_id,
+                title="片段1",
+                content="片段1内容，说明数据脱敏。",
+                chunk_index=0,
+            ),
+            KnowledgeUnit(
+                material_id=material_id,
+                title="片段2",
+                content="片段2内容，说明访问审计。",
+                chunk_index=1,
+            ),
+            KnowledgeUnit(
+                material_id=material_id,
+                title="片段3",
+                content="片段3内容，说明风险评估。",
+                chunk_index=2,
+            ),
+        ])
+        await session.commit()
+
+        result = await question_service.preview_question_bank_from_material(
+            db=session,
+            material_id=material_id,
+            type_distribution={"single_choice": 2, "true_false": 1},
+            difficulty=3,
+            max_units=3,
+        )
+
+    await engine.dispose()
+
+    assert planner_calls["count"] == 1
+    assert len(result["questions"]) == 3
+    assert len(injected_plans) == 2
+    assert len(generator_calls) == 2
+    assert generator_calls[0]["question_type"] == "single_choice"
+    assert generator_calls[0]["count"] == 2
+    assert len(generator_calls[0]["question_plan"]) == 2
+    assert generator_calls[1]["question_type"] == "true_false"
+    assert generator_calls[1]["count"] == 1
+    assert len(generator_calls[1]["question_plan"]) == 1
+    assert injected_plans[0][0]["knowledge_point"] == "规划知识点1"
+    assert injected_plans[0][1]["knowledge_point"] == "规划知识点2"
+    assert injected_plans[1][0]["knowledge_point"] == "规划知识点3"
+
+
+@pytest.mark.asyncio
+async def test_preview_question_bank_defers_ai_review_until_batch_poll(monkeypatch):
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    material_id = uuid.uuid4()
+
+    monkeypatch.setattr(question_service, "generate_questions_via_llm", lambda *args, **kwargs: {
+        "questions": [
+            {
+                "question_type": "single_choice",
+                "stem": "预览异步质检测试题",
+                "options": {"A": "选项A", "B": "选项B", "C": "选项C", "D": "选项D"},
+                "correct_answer": "A",
+                "explanation": "测试异步质检回填。",
+                "knowledge_tags": ["异步质检"],
+                "dimension": "AI基础知识",
+            }
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        "fallback_used": False,
+        "error": None,
+    })
+    monkeypatch.setattr(question_service, "_validate_generated_question_set", lambda *args, **kwargs: {
+        "passed": True,
+        "reasons": [],
+    })
+    monkeypatch.setattr(question_service, "ai_review_question", lambda *args, **kwargs: {
+        "scores": {"stem_clarity": 4},
+        "overall_score": 4.5,
+        "recommendation": "approve",
+        "comments": "AI质检通过",
+    })
+
+    async with session_factory() as session:
+        uploader = await create_user(
+            session,
+            username=f"preview_async_{uuid.uuid4().hex[:8]}",
+            email=f"{uuid.uuid4().hex[:8]}@test.com",
+            password="password123",
+            role_name="organizer",
+        )
+        session.add(
+            Material(
+                id=material_id,
+                title="异步质检素材",
+                format=MaterialFormat.MARKDOWN,
+                file_path="materials/test.md",
+                file_size=128,
+                status=MaterialStatus.PARSED,
+                uploaded_by=uploader.id,
+            )
+        )
+        session.add(
+            KnowledgeUnit(
+                material_id=material_id,
+                title="片段1",
+                content="素材正文内容",
+                chunk_index=0,
+            )
+        )
+        await session.commit()
+
+        preview = await question_service.preview_question_bank_from_material(
+            db=session,
+            material_id=material_id,
+            type_distribution={"single_choice": 1},
+            difficulty=3,
+        )
+        batch_before = question_service.get_preview_review_batch(preview["preview_batch_id"])
+        await question_service.populate_preview_ai_review(preview["preview_batch_id"])
+        batch_after = question_service.get_preview_review_batch(preview["preview_batch_id"])
+
+    await engine.dispose()
+
+    assert preview["preview_batch_id"] is not None
+    assert preview["stats"]["quality_review_count"] == 0
+    assert preview["stats"]["ai_review_pending"] is True
+    assert preview["questions"][0]["preview_item_id"]
+    assert batch_before is not None
+    assert batch_before["pending"] is True
+    assert batch_before["questions"][0]["quality_review"] is None
+    assert batch_after is not None
+    assert batch_after["pending"] is False
+    assert batch_after["completed"] is True
+    assert batch_after["stats"]["quality_review_count"] == 1
+    assert batch_after["stats"]["ai_review_completed"] is True
+    assert batch_after["questions"][0]["quality_review"]["recommendation"] == "approve"
+
+
+@pytest.mark.asyncio
+async def test_preview_batch_review_endpoint_returns_completed_results(monkeypatch):
+    monkeypatch.setattr(question_service, "ai_review_question", lambda *args, **kwargs: {
+        "scores": {"stem_clarity": 4},
+        "overall_score": 4.1,
+        "recommendation": "revise",
+        "comments": "建议微调",
+    })
+
+    batch_id = question_service.create_preview_review_batch(
+        raw_questions=[
+            {
+                "preview_item_id": str(uuid.uuid4()),
+                "question_type": "single_choice",
+                "stem": "批次查询测试题",
+                "options": {"A": "正确", "B": "错误", "C": "干扰项1", "D": "干扰项2"},
+                "correct_answer": "A",
+                "explanation": "测试批次查询接口。",
+                "difficulty": 3,
+                "dimension": "AI基础知识",
+                "knowledge_tags": ["批次查询"],
+                "bloom_level": "understand",
+            }
+        ],
+        stats={
+            "quality_review_count": 0,
+            "quality_review_blocked": 0,
+            "quality_gate_failed": False,
+            "ai_review_pending": True,
+            "ai_review_completed": False,
+            "warnings": [],
+        },
+    )
+    assert batch_id is not None
+    await question_service.populate_preview_ai_review(batch_id)
+
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = await client.get(f"/api/v1/questions/preview/batch/{batch_id}", headers=headers)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["preview_batch_id"] == str(batch_id)
+    assert data["pending"] is False
+    assert data["completed"] is True
+    assert data["questions"][0]["quality_review"]["recommendation"] == "revise"
+    assert data["stats"]["quality_review_count"] == 1
+    assert data["stats"]["ai_review_completed"] is True
+
+
+@pytest.mark.asyncio
 async def test_preview_question_bank_reports_quality_gate_warning(monkeypatch):
     engine = create_async_engine(settings.DATABASE_URL, echo=False)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -1751,6 +2148,14 @@ async def test_preview_question_bank_reports_quality_gate_warning(monkeypatch):
                 chunk_index=0,
             )
         )
+        session.add(
+            KnowledgeUnit(
+                material_id=material_id,
+                title="片段2",
+                content="另一段素材正文内容",
+                chunk_index=1,
+            )
+        )
         await session.commit()
 
         result = await question_service.preview_question_bank_from_material(
@@ -1758,12 +2163,16 @@ async def test_preview_question_bank_reports_quality_gate_warning(monkeypatch):
             material_id=material_id,
             type_distribution={"single_choice": 1},
             difficulty=3,
+            max_units=1,
         )
 
     await engine.dispose()
 
     assert result["stats"]["save_blocked"] is False
     assert result["stats"]["quality_gate_failed"] is True
+    assert result["stats"]["configured_max_units"] == 1
+    assert result["stats"]["effective_max_units"] == 1
+    assert result["stats"]["selected_unit_count"] == 1
     assert any("素材元信息" in item for item in result["stats"]["validation_reasons"])
 
 
@@ -2006,13 +2415,18 @@ async def test_preview_question_bank_blocks_ai_reject(monkeypatch):
             type_distribution={"single_choice": 1},
             difficulty=3,
         )
+        await question_service.populate_preview_ai_review(result["preview_batch_id"])
+        reviewed = question_service.get_preview_review_batch(result["preview_batch_id"])
 
     await engine.dispose()
 
     assert result["stats"]["save_blocked"] is False
-    assert result["stats"]["quality_gate_failed"] is True
-    assert result["stats"]["quality_review_blocked"] == 1
-    assert result["questions"][0]["quality_review"]["recommendation"] == "reject"
+    assert result["stats"]["quality_gate_failed"] is False
+    assert result["stats"]["quality_review_blocked"] == 0
+    assert reviewed is not None
+    assert reviewed["stats"]["quality_gate_failed"] is True
+    assert reviewed["stats"]["quality_review_blocked"] == 1
+    assert reviewed["questions"][0]["quality_review"]["recommendation"] == "reject"
 
 
 @pytest.mark.asyncio
@@ -2567,6 +2981,96 @@ async def test_batch_generate_from_material_prefers_high_value_units(monkeypatch
 
     assert set(called_ids) == {rich_unit_a.id, rich_unit_b.id}
     assert weak_unit.id not in called_ids
+
+
+@pytest.mark.asyncio
+async def test_generate_from_knowledge_unit_accepts_injected_question_plan(monkeypatch):
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    material_id = uuid.uuid4()
+    knowledge_unit_id = uuid.uuid4()
+    captured: dict[str, object] = {}
+
+    def fake_generate_questions_via_llm(**kwargs):
+        captured["question_plan"] = kwargs.get("question_plan")
+        return {
+            "questions": [
+                {
+                    "question_type": "single_choice",
+                    "stem": "基于注入规划生成的题目",
+                    "options": {"A": "答案A", "B": "答案B", "C": "答案C", "D": "答案D"},
+                    "correct_answer": "A",
+                    "explanation": "测试注入 question_plan。",
+                    "knowledge_tags": ["注入规划"],
+                    "dimension": "AI基础知识",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            "fallback_used": False,
+            "error": None,
+        }
+
+    monkeypatch.setattr(question_service, "generate_questions_via_llm", fake_generate_questions_via_llm)
+
+    injected_plan = [
+        {
+            "knowledge_point": "注入规划知识点",
+            "evidence": "知识片段中包含注入规划的证据。",
+            "question_type": "single_choice",
+            "stem_style": "直接知识型",
+            "scenario": "课堂学习场景",
+            "answer_focus": "理解注入规划的作用",
+            "distractor_focus": "混入跳过规划的错误做法",
+            "knowledge_tags": ["注入规划"],
+            "dimension": "AI基础知识",
+        }
+    ]
+
+    async with session_factory() as session:
+        uploader = await create_user(
+            session,
+            username=f"plan_inject_{uuid.uuid4().hex[:8]}",
+            email=f"{uuid.uuid4().hex[:8]}@test.com",
+            password="password123",
+            role_name="organizer",
+        )
+        session.add(
+            Material(
+                id=material_id,
+                title="注入规划素材",
+                format=MaterialFormat.MARKDOWN,
+                file_path="materials/test.md",
+                file_size=128,
+                status=MaterialStatus.PARSED,
+                uploaded_by=uploader.id,
+            )
+        )
+        session.add(
+            KnowledgeUnit(
+                id=knowledge_unit_id,
+                material_id=material_id,
+                title="片段1",
+                content="知识片段中包含注入规划的证据。",
+                chunk_index=0,
+            )
+        )
+        await session.commit()
+
+        result = await question_service.generate_from_knowledge_unit(
+            db=session,
+            knowledge_unit_id=knowledge_unit_id,
+            question_types=["single_choice"],
+            count=1,
+            difficulty=3,
+            created_by=uploader.id,
+            question_plan=injected_plan,
+        )
+
+    await engine.dispose()
+
+    assert len(result["questions"]) == 1
+    assert captured["question_plan"] == injected_plan
+    assert result["questions"][0].stem == "基于注入规划生成的题目"
 
 
 @pytest.mark.asyncio

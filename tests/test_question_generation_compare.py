@@ -239,9 +239,33 @@ def test_request_question_generation_routes_gemini_to_openai_compatible(monkeypa
     assert result["content"] == "[]"
 
 
-def test_supports_structured_output_skips_local_qwen():
-    assert question_agent._supports_structured_output(get_compare_models(["local_qwen"])[0]) is False
+def test_supports_structured_output_allows_local_qwen():
+    assert question_agent._supports_structured_output(get_compare_models(["local_qwen"])[0]) is True
     assert question_agent._supports_structured_output(get_compare_models(["gemini"])[0]) is True
+
+
+def test_supports_structured_output_allows_default_local_qwen():
+    model = ModelConfig(
+        slug="default",
+        display_name="Local Qwen",
+        provider="openai_compatible",
+        model_name="Qwen/Qwen3.5-35B-A3B-FP8",
+        default_base_url="http://127.0.0.1:8100/v1",
+        default_api_key="token-not-needed",
+    )
+    assert question_agent._supports_structured_output(model) is True
+
+
+def test_supports_structured_output_keeps_local_non_qwen_disabled():
+    model = ModelConfig(
+        slug="local_other",
+        display_name="Local Other",
+        provider="openai_compatible",
+        model_name="SomeOtherModel",
+        default_base_url="http://127.0.0.1:8100/v1",
+        default_api_key="token-not-needed",
+    )
+    assert question_agent._supports_structured_output(model) is False
 
 
 def test_openai_compatible_request_retries_without_response_format(monkeypatch):
@@ -405,6 +429,61 @@ def test_generate_question_plan_via_llm_falls_back_to_local_plan(monkeypatch):
     assert len(result["question_plan"]) == 1
 
 
+def test_generate_question_plan_batch_via_llm_aligns_slot_indexed_results(monkeypatch):
+    monkeypatch.setattr(question_agent, "resolve_api_key", lambda model: "test-key")
+    monkeypatch.setattr(
+        question_agent,
+        "_request_question_generation",
+        lambda *args, **kwargs: {
+            "content": json.dumps([
+                {
+                    "slot_index": 2,
+                    "knowledge_point": "访问审计",
+                    "evidence": "高风险访问前需要审批控制。",
+                    "question_type": "true_false",
+                    "stem_style": "直接知识型",
+                    "scenario": "职场工作场景",
+                    "answer_focus": "高风险访问前需要审批控制",
+                    "distractor_focus": "混入跳过审批的错误做法",
+                    "knowledge_tags": ["访问审计"],
+                    "dimension": "AI伦理安全",
+                },
+                {
+                    "slot_index": 1,
+                    "knowledge_point": "隐私最小化",
+                    "evidence": "上线前需要完成数据脱敏。",
+                    "question_type": "single_choice",
+                    "stem_style": "情景应用型",
+                    "scenario": "课堂学习场景",
+                    "answer_focus": "先做数据脱敏",
+                    "distractor_focus": "混入扩大采集等常见误解",
+                    "knowledge_tags": ["隐私最小化"],
+                    "dimension": "AI伦理安全",
+                },
+            ]),
+            "usage": {"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18},
+        },
+    )
+
+    result = question_agent.generate_question_plan_batch_via_llm(
+        slot_requests=[
+            {"slot_index": 1, "question_type": "single_choice", "content": "【知识单元正文】\n上线前需要完成数据脱敏。"},
+            {"slot_index": 2, "question_type": "true_false", "content": "【知识单元正文】\n高风险访问前需要审批控制。"},
+        ],
+        difficulty=3,
+        model_config=get_compare_models(["gemini"])[0],
+        prompt_seed=42,
+    )
+
+    assert result["fallback_used"] is False
+    assert result["usage"]["total_tokens"] == 18
+    assert len(result["question_plan"]) == 2
+    assert result["question_plan"][0]["knowledge_point"] == "隐私最小化"
+    assert result["question_plan"][0]["question_type"] == "single_choice"
+    assert result["question_plan"][1]["knowledge_point"] == "访问审计"
+    assert result["question_plan"][1]["question_type"] == "true_false"
+
+
 def test_generate_questions_via_llm_uses_llm_planner_and_accumulates_usage(monkeypatch):
     monkeypatch.setattr(question_agent, "resolve_api_key", lambda model: "test-key")
     responses = [
@@ -463,6 +542,66 @@ def test_generate_questions_via_llm_uses_llm_planner_and_accumulates_usage(monke
     assert calls[1]["response_format"]["type"] == "json_schema"
     assert result["usage"]["total_tokens"] == 43
     assert result["fallback_used"] is False
+    assert result["planner_fallback_used"] is False
+    assert result["question_plan"][0]["knowledge_point"] == "隐私最小化"
+
+
+def test_generate_questions_via_llm_uses_injected_question_plan_without_calling_planner(monkeypatch):
+    monkeypatch.setattr(question_agent, "resolve_api_key", lambda model: "test-key")
+
+    def fail_planner(**kwargs):
+        raise AssertionError("planner should not be called when question_plan is injected")
+
+    monkeypatch.setattr(question_agent, "generate_question_plan_via_llm", fail_planner)
+
+    captured_calls = []
+
+    def fake_request(*args, **kwargs):
+        captured_calls.append(kwargs)
+        return {
+            "content": json.dumps([
+                {
+                    "question_type": "single_choice",
+                    "dimension": "AI伦理安全",
+                    "stem": "推荐系统上线前，哪项做法最符合隐私最小化原则？",
+                    "options": {"A": "只保留必要字段", "B": "扩大原始日志采集", "C": "长期保存未脱敏数据", "D": "关闭访问审计"},
+                    "correct_answer": "A",
+                    "explanation": "隐私最小化要求只保留完成任务所必需的数据字段。",
+                    "knowledge_tags": ["隐私最小化", "推荐系统"],
+                }
+            ]),
+            "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28},
+        }
+
+    monkeypatch.setattr(question_agent, "_request_question_generation", fake_request)
+
+    injected_plan = [
+        {
+            "knowledge_point": "隐私最小化",
+            "evidence": "推荐系统上线前，需要完成数据脱敏。",
+            "question_type": "single_choice",
+            "stem_style": "情景应用型",
+            "scenario": "职场工作场景",
+            "answer_focus": "先做数据脱敏与用途评估",
+            "distractor_focus": "混入扩大采集或跳过审计等常见误解",
+            "knowledge_tags": ["隐私最小化", "推荐系统"],
+            "dimension": "AI伦理安全",
+        }
+    ]
+
+    result = question_agent.generate_questions_via_llm(
+        content="【知识单元正文】\n推荐系统上线前，需要完成数据脱敏、用途评估和访问审计配置。",
+        question_types=["single_choice"],
+        count=1,
+        difficulty=3,
+        model_config=get_compare_models(["gemini"])[0],
+        prompt_seed=42,
+        question_plan=injected_plan,
+    )
+
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["temperature"] == 0.4
+    assert result["usage"]["total_tokens"] == 28
     assert result["planner_fallback_used"] is False
     assert result["question_plan"][0]["knowledge_point"] == "隐私最小化"
 

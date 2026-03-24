@@ -119,8 +119,13 @@ class GenerateStats(BaseModel):
     bloom_mismatch_count: int = 0
     bloom_severe_mismatch_count: int = 0
     selection_mode: Literal["stable", "coverage"] = "stable"
+    configured_max_units: int = 0
+    effective_max_units: int = 0
+    selected_unit_count: int = 0
     history_window_size: int = 0
     cooled_unit_count: int = 0
+    ai_review_pending: bool = False
+    ai_review_completed: bool = False
     warnings: List[str] = Field(default_factory=list)
 
 
@@ -200,6 +205,8 @@ class QuestionBankSuggestResponse(BaseModel):
     material_id: UUID
     material_title: str
     total_units: int
+    configured_max_units: int = 0
+    effective_max_units: int = 0
     suggested_distribution: dict
     suggested_total: int
     difficulty: int
@@ -207,6 +214,7 @@ class QuestionBankSuggestResponse(BaseModel):
 
 class PreviewQuestionItem(BaseModel):
     """预览题目（未保存），匹配 generate_questions_via_llm() 的原始dict结构。"""
+    preview_item_id: Optional[str] = None
     question_type: str
     stem: str
     options: Optional[dict] = None
@@ -226,10 +234,26 @@ class PreviewQuestionItem(BaseModel):
 
 class PreviewResponse(BaseModel):
     """预览生成结果（不存DB）。"""
+    preview_batch_id: Optional[UUID] = None
     questions: List[PreviewQuestionItem]
     total: int
     stats: Optional[GenerateStats] = None
     model_name: Optional[str] = None
+
+
+class PreviewBatchReviewItem(BaseModel):
+    preview_item_id: str
+    quality_review: Optional[dict] = None
+
+
+class PreviewBatchReviewResponse(BaseModel):
+    preview_batch_id: UUID
+    pending: bool = False
+    completed: bool = False
+    failed: bool = False
+    error: Optional[str] = None
+    questions: List[PreviewBatchReviewItem] = Field(default_factory=list)
+    stats: Optional[GenerateStats] = None
 
 
 class BatchCreateFromRawRequest(BaseModel):

@@ -839,6 +839,7 @@ def _build_question_plan_section(question_plan: Optional[list[dict]]) -> str:
         "",
         "【知识点出题规划】",
         "请严格按照以下规划逐题生成，每条规划最多对应1道题，不要遗漏、合并或改题型：",
+        "返回 JSON 数组时，题目顺序必须与以下规划顺序完全一致。",
     ]
     for index, item in enumerate(question_plan, start=1):
         tags = "、".join(item.get("knowledge_tags") or [])
@@ -924,7 +925,16 @@ def _build_question_plan_response_format(count: int) -> dict:
 
 def _supports_structured_output(model_config: ModelConfig) -> bool:
     base_url = (resolve_base_url(model_config) or "").lower()
+    model_name = (model_config.model_name or "").lower()
     if model_config.slug == "local_qwen":
+        return True
+    if "qwen" in model_name and any(
+        token in base_url for token in STRUCTURED_OUTPUT_UNSUPPORTED_HOSTS
+    ):
+        # Local/OpenAI-compatible Qwen endpoints can support response_format
+        # when thinking is explicitly disabled via chat_template_kwargs.
+        return True
+    if model_config.slug.startswith("local_"):
         return False
     return not any(token in base_url for token in STRUCTURED_OUTPUT_UNSUPPORTED_HOSTS)
 
@@ -1017,6 +1027,65 @@ def _normalize_question_plan_item(
     return normalized
 
 
+def _normalize_question_plan_items(
+    raw_items: object,
+    question_types: list[str],
+    fallback_plan: list[dict],
+    count: int,
+) -> list[dict]:
+    if isinstance(raw_items, list):
+        plan_items = raw_items
+    elif raw_items is None:
+        plan_items = []
+    else:
+        plan_items = [raw_items]
+
+    normalized: list[dict] = []
+    for index, fallback_item in enumerate(fallback_plan[:count]):
+        raw_item = plan_items[index] if index < len(plan_items) else None
+        normalized.append(
+            _normalize_question_plan_item(
+                raw_item,
+                question_types,
+                fallback_item,
+            )
+        )
+    return normalized[:count]
+
+
+def _normalize_question_plan_batch_items(
+    raw_items: object,
+    slot_requests: list[dict],
+    fallback_plan: list[dict],
+) -> list[dict]:
+    sequential_items = raw_items if isinstance(raw_items, list) else ([raw_items] if raw_items is not None else [])
+    indexed_items: dict[int, dict] = {}
+    for item in sequential_items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            slot_index = int(item.get("slot_index"))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= slot_index <= len(slot_requests) and slot_index not in indexed_items:
+            indexed_items[slot_index] = item
+
+    normalized: list[dict] = []
+    for position, slot_request in enumerate(slot_requests, start=1):
+        fallback_item = fallback_plan[position - 1]
+        raw_item = indexed_items.get(position)
+        if raw_item is None and position - 1 < len(sequential_items):
+            raw_item = sequential_items[position - 1]
+        item = _normalize_question_plan_item(
+            raw_item,
+            [slot_request["question_type"]],
+            fallback_item,
+        )
+        item["question_type"] = slot_request["question_type"]
+        normalized.append(item)
+    return normalized
+
+
 def _build_question_plan_user_prompt(
     content: str,
     question_types: list[str],
@@ -1046,6 +1115,42 @@ def _build_question_plan_user_prompt(
         f"{_build_plan_type_requirements(question_types)}\n"
         f"{extra}\n\n"
         f"{content or '【出题范围】AI素养通识知识'}"
+    )
+
+
+def _build_question_plan_batch_user_prompt(
+    slot_requests: list[dict],
+    difficulty: int,
+    bloom_level: Optional[str] = None,
+    custom_prompt: Optional[str] = None,
+) -> str:
+    bloom_text = BLOOM_LABELS.get(bloom_level, bloom_level or "不限")
+    extra = f"\n【额外要求】\n{custom_prompt}" if custom_prompt else ""
+    slot_lines = []
+    for slot in slot_requests:
+        slot_lines.append(
+            f"【槽位 {slot['slot_index']}】\n"
+            f"- 指定题型：{TYPE_LABELS.get(slot['question_type'], slot['question_type'])}（{slot['question_type']}）\n"
+            "- 只能围绕该槽位内容规划，不得跨槽位借用知识点\n"
+            f"{slot['content']}"
+        )
+
+    return (
+        "请先完成整批出题规划，不要直接生成题目。\n"
+        f"目标题量：{len(slot_requests)} 道\n"
+        f"难度：{difficulty}/5\n"
+        f"布鲁姆层级：{bloom_text}\n"
+        "请为下列每个槽位各输出 1 条规划，最终输出必须是 JSON 数组，且数组长度必须与槽位数完全一致。\n"
+        "每个元素必须包含：slot_index、knowledge_point、evidence、question_type、stem_style、scenario、answer_focus、distractor_focus、knowledge_tags、dimension。\n"
+        "要求：\n"
+        "1. 每个元素必须通过 slot_index 与对应槽位一一匹配，不得遗漏、重复或合并；\n"
+        "2. question_type 必须与槽位指定题型一致；\n"
+        "3. 只能基于对应槽位的知识片段规划，不得跨槽位引用其他片段；\n"
+        "4. 不同槽位应尽量覆盖各自片段中最适合考查的不同知识点；\n"
+        "5. evidence 必须是该槽位片段中的证据句或高保真摘要；\n"
+        "6. 不要输出题干、选项和答案，只输出规划。\n"
+        f"{extra}\n\n"
+        f"{chr(10).join(slot_lines)}"
     )
 
 
@@ -1101,19 +1206,12 @@ def generate_question_plan_via_llm(
         )
         raw = extract_json_text(response_data["content"])
         plan_items = json.loads(raw)
-        if not isinstance(plan_items, list):
-            plan_items = [plan_items]
-
-        normalized: list[dict] = []
-        for index, fallback_item in enumerate(fallback_plan):
-            raw_item = plan_items[index] if index < len(plan_items) else None
-            normalized.append(
-                _normalize_question_plan_item(
-                    raw_item,
-                    question_types,
-                    fallback_item,
-                )
-            )
+        normalized = _normalize_question_plan_items(
+            plan_items,
+            question_types,
+            fallback_plan,
+            count,
+        )
 
         return {
             "question_plan": normalized[:count],
@@ -1123,6 +1221,144 @@ def generate_question_plan_via_llm(
         }
     except Exception as exc:
         logger.warning("Question planning via LLM failed, falling back to deterministic plan: %s", exc)
+        return {
+            "question_plan": fallback_plan,
+            "usage": empty_usage,
+            "fallback_used": True,
+            "error": str(exc),
+        }
+
+
+def _build_question_plan_batch_response_format(count: int) -> dict:
+    plan_item_schema = {
+        "type": "object",
+        "required": [
+            "slot_index",
+            "knowledge_point",
+            "evidence",
+            "question_type",
+            "stem_style",
+            "scenario",
+            "answer_focus",
+            "distractor_focus",
+            "knowledge_tags",
+            "dimension",
+        ],
+        "additionalProperties": True,
+        "properties": {
+            "slot_index": {"type": "integer", "minimum": 1, "maximum": max(count, 1)},
+            "knowledge_point": {"type": "string"},
+            "evidence": {"type": "string"},
+            "question_type": {"type": "string", "enum": sorted(VALID_TYPES)},
+            "stem_style": {"type": "string"},
+            "scenario": {"type": "string"},
+            "answer_focus": {"type": "string"},
+            "distractor_focus": {"type": "string"},
+            "knowledge_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "dimension": {"type": "string", "enum": FIVE_DIMENSIONS},
+        },
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "question_plan_batch",
+            "strict": False,
+            "schema": {
+                "type": "array",
+                "items": plan_item_schema,
+                "minItems": 1,
+                "maxItems": max(count, 1),
+            },
+        },
+    }
+
+
+def generate_question_plan_batch_via_llm(
+    slot_requests: list[dict],
+    difficulty: int,
+    bloom_level: Optional[str] = None,
+    custom_prompt: Optional[str] = None,
+    model_config: Optional[ModelConfig] = None,
+    prompt_seed: Optional[int] = None,
+) -> dict:
+    empty_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    if not slot_requests:
+        return {
+            "question_plan": [],
+            "usage": empty_usage,
+            "fallback_used": False,
+            "error": None,
+        }
+
+    normalized_slot_requests = []
+    fallback_plan = []
+    for index, raw_slot in enumerate(slot_requests, start=1):
+        content = str(raw_slot.get("content", "") or "").strip()
+        question_type = str(raw_slot.get("question_type", "single_choice") or "single_choice")
+        if question_type not in VALID_TYPES:
+            question_type = "single_choice"
+        normalized_slot_requests.append({
+            "slot_index": index,
+            "question_type": question_type,
+            "content": content,
+        })
+        fallback_plan.append(
+            build_question_plan(
+                content=content,
+                question_types=[question_type],
+                count=1,
+                difficulty=difficulty,
+                bloom_level=bloom_level,
+                custom_prompt=custom_prompt,
+                prompt_seed=prompt_seed,
+            )[0]
+        )
+
+    runtime_model = model_config or get_default_model_config()
+    api_key = resolve_api_key(runtime_model)
+    if not api_key or api_key == "your-api-key":
+        return {
+            "question_plan": fallback_plan,
+            "usage": empty_usage,
+            "fallback_used": True,
+            "error": "LLM API key not configured",
+        }
+
+    try:
+        response_data = _request_question_generation(
+            runtime_model,
+            api_key,
+            "你是一名资深命题规划专家，负责先为整批题目槽位抽取可考知识点，再输出严格的一一对应规划。",
+            _build_question_plan_batch_user_prompt(
+                slot_requests=normalized_slot_requests,
+                difficulty=difficulty,
+                bloom_level=bloom_level,
+                custom_prompt=custom_prompt,
+            ),
+            max(4096, len(normalized_slot_requests) * 320),
+            len(normalized_slot_requests),
+            empty_usage,
+            response_format=_build_question_plan_batch_response_format(len(normalized_slot_requests)),
+            temperature=0.2,
+        )
+        raw = extract_json_text(response_data["content"])
+        plan_items = json.loads(raw)
+        normalized = _normalize_question_plan_batch_items(
+            plan_items,
+            normalized_slot_requests,
+            fallback_plan,
+        )
+        return {
+            "question_plan": normalized,
+            "usage": response_data["usage"],
+            "fallback_used": False,
+            "error": None,
+        }
+    except Exception as exc:
+        logger.warning("Batch question planning via LLM failed, falling back to deterministic plan: %s", exc)
         return {
             "question_plan": fallback_plan,
             "usage": empty_usage,
@@ -1733,6 +1969,7 @@ def generate_questions_via_llm(
     prompt_seed: Optional[int] = None,
     system_prompt: Optional[str] = None,
     user_prompt_template: Optional[str] = None,
+    question_plan: Optional[list[dict]] = None,
 ) -> dict:
     """Generate questions using LLM API.
 
@@ -1743,17 +1980,41 @@ def generate_questions_via_llm(
     _empty_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     runtime_model = model_config or get_default_model_config()
     api_key = resolve_api_key(runtime_model)
-    planner_result = generate_question_plan_via_llm(
-        content=content,
-        question_types=question_types,
-        count=count,
-        difficulty=difficulty,
-        bloom_level=bloom_level,
-        custom_prompt=custom_prompt,
-        model_config=runtime_model,
-        prompt_seed=prompt_seed,
-    )
-    question_plan = planner_result["question_plan"]
+    planner_result = {
+        "question_plan": [],
+        "usage": dict(_empty_usage),
+        "fallback_used": False,
+        "error": None,
+    }
+    if question_plan is None:
+        planner_result = generate_question_plan_via_llm(
+            content=content,
+            question_types=question_types,
+            count=count,
+            difficulty=difficulty,
+            bloom_level=bloom_level,
+            custom_prompt=custom_prompt,
+            model_config=runtime_model,
+            prompt_seed=prompt_seed,
+        )
+        question_plan = planner_result["question_plan"]
+    else:
+        fallback_plan = build_question_plan(
+            content=content,
+            question_types=question_types,
+            count=count,
+            difficulty=difficulty,
+            bloom_level=bloom_level,
+            custom_prompt=custom_prompt,
+            prompt_seed=prompt_seed,
+        )
+        question_plan = _normalize_question_plan_items(
+            question_plan,
+            question_types,
+            fallback_plan,
+            count,
+        )
+        planner_result["question_plan"] = question_plan
 
     if not api_key or api_key == "your-api-key":
         logger.warning("LLM API key not configured, using template fallback")
