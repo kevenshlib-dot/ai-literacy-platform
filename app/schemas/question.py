@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional, List
+from typing import Literal, Optional, List
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -91,6 +91,7 @@ class BatchGenerateRequest(PromptOverrideMixin):
     difficulty: int = Field(default=3, ge=1, le=5)
     bloom_level: Optional[str] = None
     max_units: int = Field(default=10, ge=1, le=50)
+    selection_mode: Literal["stable", "coverage"] = "stable"
 
 
 class GenerateStats(BaseModel):
@@ -98,7 +99,29 @@ class GenerateStats(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     duration_seconds: float = 0.0
-    type_counts: dict = {}
+    type_counts: dict = Field(default_factory=dict)
+    fallback_count: int = 0
+    errors: List[str] = Field(default_factory=list)
+    generation_attempts: int = 0
+    validation_reasons: List[str] = Field(default_factory=list)
+    requested_total: int = 0
+    generated_total: int = 0
+    quality_gate_failed: bool = False
+    save_blocked: bool = False
+    quality_review_count: int = 0
+    quality_review_blocked: int = 0
+    near_duplicate_count: int = 0
+    existing_near_duplicate_count: int = 0
+    calibration_review_count: int = 0
+    calibration_warning_count: int = 0
+    difficulty_mismatch_count: int = 0
+    difficulty_severe_mismatch_count: int = 0
+    bloom_mismatch_count: int = 0
+    bloom_severe_mismatch_count: int = 0
+    selection_mode: Literal["stable", "coverage"] = "stable"
+    history_window_size: int = 0
+    cooled_unit_count: int = 0
+    warnings: List[str] = Field(default_factory=list)
 
 
 class GenerateResponse(BaseModel):
@@ -158,6 +181,7 @@ class QuestionBankBuildRequest(PromptOverrideMixin):
     difficulty: int = Field(default=3, ge=1, le=5)
     bloom_level: Optional[str] = None
     max_units: int = Field(default=10, ge=1, le=50)
+    selection_mode: Literal["stable", "coverage"] = "stable"
     custom_prompt: Optional[str] = Field(default=None, max_length=500)
 
 
@@ -196,6 +220,8 @@ class PreviewQuestionItem(BaseModel):
     source_knowledge_unit_id: Optional[UUID] = None
     source_material_title: Optional[str] = None
     source_knowledge_unit_title: Optional[str] = None
+    quality_review: Optional[dict] = None
+    calibration_review: Optional[dict] = None
 
 
 class PreviewResponse(BaseModel):
@@ -236,6 +262,7 @@ class QuestionPromptPreviewRequest(PromptOverrideMixin):
     bloom_level: Optional[str] = None
     custom_prompt: Optional[str] = Field(default=None, max_length=500)
     max_units: int = Field(default=10, ge=1, le=50)
+    selection_mode: Literal["stable", "coverage"] = "stable"
     material_ids: List[UUID] = Field(default_factory=list)
 
 

@@ -11,6 +11,7 @@ from app.schemas.material import (
     MaterialResponse,
     MaterialListResponse,
     MaterialDownloadResponse,
+    MaterialReparseResponse,
 )
 from app.services.material_service import (
     create_material,
@@ -19,7 +20,7 @@ from app.services.material_service import (
     delete_material,
     get_material_download_url,
 )
-from app.services.parse_worker import trigger_parse, parse_and_store
+from app.services.parse_worker import trigger_parse, parse_and_store, safe_reparse_material
 
 router = APIRouter(prefix="/materials", tags=["素材管理"])
 
@@ -214,6 +215,30 @@ async def manual_parse_material(
     success = await parse_and_store(db, material_id)
     await db.commit()
     return {"parsed": success, "material_id": str(material_id)}
+
+
+@router.post("/{material_id}/reparse", response_model=MaterialReparseResponse)
+async def reparse_material(
+    material_id: UUID,
+    revectorize: Optional[bool] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    """Safely replace an existing material's knowledge units."""
+    material = await get_material_by_id(db, material_id)
+    if not material:
+        raise HTTPException(status_code=404, detail="素材不存在")
+
+    try:
+        result = await safe_reparse_material(db, material_id, revectorize=revectorize)
+        await db.commit()
+        return result
+    except ValueError as e:
+        await db.commit()
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        await db.commit()
+        raise HTTPException(status_code=500, detail=f"重解析失败: {str(e)}")
 
 
 @router.get("/{material_id}/knowledge-units")

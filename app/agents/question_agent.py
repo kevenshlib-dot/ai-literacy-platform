@@ -4,13 +4,17 @@ import json
 import logging
 import random
 import re
+from itertools import combinations
 from typing import Optional
 
 from openai import OpenAI
 from httpx import Timeout
 
 from app.core.config import settings
-from app.agents.llm_utils import strip_thinking_tags, build_disable_thinking_extra_body
+from app.agents.llm_utils import (
+    build_disable_thinking_extra_body,
+    extract_json_text,
+)
 from app.agents.model_registry import (
     ModelConfig,
     get_default_model_config,
@@ -36,6 +40,18 @@ OPTION_TYPES = {"single_choice", "multiple_choice", "true_false"}
 
 # 合法的 question_type 集合
 VALID_TYPES = set(TYPE_LABELS.keys()) | {"essay", "sjt"}
+STRICT_FORMAT_TYPES = {"true_false", "fill_blank"}
+BLANK_MARKERS = ("____", "___", "（ ）", "( )", "（）", "【 】", "[]", "＿", "填空")
+BLANK_MARKER_PATTERN = r"(?:____|___|（\s*）|\(\s*\)|（）|【\s*】|\[\s*\]|＿|填空)"
+TRUE_FALSE_INTERROGATIVE_PREFIXES = (
+    "以下",
+    "下列",
+    "请判断",
+    "判断以下",
+    "判断下列",
+    "是否",
+)
+QUESTION_GENERATION_RETRY_LIMIT = 2
 
 BLOOM_LABELS = {
     "remember": "记忆",
@@ -218,7 +234,7 @@ FORBIDDEN_MATERIAL_REFERENCES = [
     "结合素材", "根据本文", "根据材料", "根据上文", "根据下文",
     "本文作者", "作者认为", "本书", "该书", "书中", "出版社",
     "出版信息", "ISBN", "第1章", "第2章", "第3章", "第4章", "第5章",
-    "第1节", "第2节", "第3节", "章节", "章", "节",
+    "第1节", "第2节", "第3节", "章节",
 ]
 
 FORBIDDEN_MATERIAL_REGEXES = [
@@ -230,6 +246,7 @@ FORBIDDEN_MATERIAL_REGEXES = [
 GARBLED_TEXT_MARKERS = ["�", "\x00", "□", "�", "锟斤拷"]
 MAX_ROLE_LEAD_STEMS = 2
 MATERIAL_GENERATION_MAX_ATTEMPTS = 2
+STRUCTURED_OUTPUT_UNSUPPORTED_HOSTS = ("localhost", "127.0.0.1", "100.64.", "192.168.", "10.", "172.")
 
 # 难度校准详细描述
 DIFFICULTY_CALIBRATION = {
@@ -313,9 +330,9 @@ DEFAULT_QUESTION_SYSTEM_PROMPT = """\
 ## 题干设计标准
 1. **语言多样化**：每道题的题干必须使用不同的表达方式和句式开头，严禁使用固定模板。具体要求：
    - 不要每道题都以"以下关于...的描述"或"以下哪项..."开头
-   - 交替使用陈述句、设问句、情境描述、案例引用、数据引用等不同开头
+   - 在不违反题型硬约束的前提下，交替使用陈述句、设问句、情境描述、案例引用、数据引用等不同开头
    - 每道题的语言风格应有所变化（学术风、口语风、新闻风、叙事风等）
-2. **情境丰富性**：优先使用具体情境（工作场景、学习场景、生活场景）包裹知识点，避免纯粹的"以下哪项正确"式提问
+2. **情境丰富性**：优先使用具体情境（工作场景、学习场景、生活场景）包裹知识点，但若题型硬约束要求固定格式，必须优先满足题型格式
 3. **认知层次精准**：题目应精准对应布鲁姆认知层次——记忆/理解层次问"是什么"，应用层次问"怎么做"，分析层次问"为什么"，评价层次问"哪个更好"，创造层次问"如何设计"
 4. **表述清晰完整**：题干必须自足，不依赖外部信息即可作答；避免否定句式（"以下哪项不正确"）除非明确标注
 5. **答案简明扼要**：正确答案和解析要准确精练，避免冗长啰嗦
@@ -376,14 +393,16 @@ DEFAULT_QUESTION_SYSTEM_PROMPT = """\
 2. **单选题 correct_answer** 只能是单个大写字母：A、B、C 或 D
 3. **多选题 correct_answer** 是多个大写字母的拼接（按字母排序）：AB、AC、ABC、ABD、ACD、ABCD 等
 4. **判断题 correct_answer** 只能是 A（正确）或 B（错误）
-5. **填空题和简答题** 的 options 必须为 null
-6. **explanation 必须提供**，不能为空，且应解释为什么正确答案对、其他选项错
-7. **stem 必须完整**，语句通顺，不能截断
-8. **干扰项**必须具有合理性和迷惑性，不能一眼看出错误
-9. 每道题的 knowledge_tags 必须是字符串数组
-10. **dimension 必须是以下五个值之一**：AI基础知识、AI技术应用、AI伦理安全、AI批判思维、AI创新实践
-11. 直接输出 JSON 数组，不要加 ```json 标记，不要加任何其他文字
-12. **正确答案位置分散**：多道题时，正确答案应分布在不同选项位置（A/B/C/D），不能全部相同
+5. **判断题 stem 必须是完整陈述句**，不得出现问号、"以下哪项"、"是否正确"等疑问表达
+6. **填空题 stem 必须包含明确空位标记**（如 ____ / （ ）），且不得写成问答题或简答题
+7. **填空题和简答题** 的 options 必须为 null
+8. **explanation 必须提供**，不能为空，且应解释为什么正确答案对、其他选项错
+9. **stem 必须完整**，语句通顺，不能截断
+10. **干扰项**必须具有合理性和迷惑性，不能一眼看出错误
+11. 每道题的 knowledge_tags 必须是字符串数组
+12. **dimension 必须是以下五个值之一**：AI基础知识、AI技术应用、AI伦理安全、AI批判思维、AI创新实践
+13. 直接输出 JSON 数组，不要加 ```json 标记，不要加任何其他文字
+14. **正确答案位置分散**：多道题时，正确答案应分布在不同选项位置（A/B/C/D），不能全部相同
 """
 
 DEFAULT_QUESTION_USER_PROMPT_TEMPLATE = """请生成 {{count}} 道题目，严格遵守系统提示中的输出格式和质量标准。
@@ -393,7 +412,7 @@ DEFAULT_QUESTION_USER_PROMPT_TEMPLATE = """请生成 {{count}} 道题目，严�
 {{difficulty_section}}{{bloom_section}}
 - 每道题必须包含 stem、correct_answer、explanation、knowledge_tags、dimension
 - 选择题和判断题必须包含 options（键为 A/B/C/D）
-- 直接输出 JSON 数组，不要包含任何其他文字{{diversity_rules}}{{content_section}}{{custom_requirements}}"""
+- 直接输出 JSON 数组，不要包含任何其他文字{{diversity_rules}}{{question_plan_section}}{{content_section}}{{custom_requirements}}"""
 
 QUESTION_PROMPT_TEMPLATE_PLACEHOLDERS = [
     {
@@ -422,6 +441,11 @@ QUESTION_PROMPT_TEMPLATE_PLACEHOLDERS = [
         "source": "系统自动生成的质量与多样性规则",
     },
     {
+        "key": "{{question_plan_section}}",
+        "description": "系统自动生成的知识点出题规划",
+        "source": "规划阶段抽取的知识点、证据和出题建议",
+    },
+    {
         "key": "{{content_section}}",
         "description": "素材内容或自由出题范围",
         "source": "所选素材；未选素材时自动切换为自由出题范围",
@@ -436,6 +460,14 @@ QUESTION_PROMPT_TEMPLATE_PLACEHOLDERS = [
 ALLOWED_USER_PROMPT_TEMPLATE_KEYS = {
     item["key"][2:-2] for item in QUESTION_PROMPT_TEMPLATE_PLACEHOLDERS
 }
+REQUIRED_USER_PROMPT_TEMPLATE_KEYS = {
+    "count",
+    "question_types",
+    "difficulty_section",
+    "diversity_rules",
+    "question_plan_section",
+    "content_section",
+}
 USER_PROMPT_TEMPLATE_PATTERN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 
 # Backwards-compatible alias for existing imports.
@@ -448,6 +480,10 @@ def validate_user_prompt_template(template: str) -> str:
     if unknown:
         rendered = ", ".join(f"{{{{{name}}}}}" for name in unknown)
         raise ValueError(f"用户提示词模板包含未知占位符: {rendered}")
+    missing = sorted(REQUIRED_USER_PROMPT_TEMPLATE_KEYS - set(placeholders))
+    if missing:
+        rendered = ", ".join(f"{{{{{name}}}}}" for name in missing)
+        raise ValueError(f"用户提示词模板缺少必填占位符: {rendered}")
     return template
 
 
@@ -461,6 +497,640 @@ def render_user_prompt(template: str, context: dict[str, str]) -> str:
     return USER_PROMPT_TEMPLATE_PATTERN.sub(replace, template)
 
 
+def _build_prompt_rng(seed_payload: dict, prompt_seed: Optional[int]):
+    if prompt_seed is None:
+        return random
+
+    material = {
+        "prompt_seed": prompt_seed,
+        **seed_payload,
+    }
+    derived_seed = int(
+        hashlib.sha256(
+            json.dumps(material, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16],
+        16,
+    )
+    return random.Random(derived_seed)
+
+
+def _extract_content_sections(content: str) -> dict[str, str]:
+    sections: dict[str, str] = {}
+    if not content:
+        return sections
+
+    pattern = re.compile(r"【([^】]+)】\n(.*?)(?=(?:\n\n【)|\Z)", re.S)
+    for match in pattern.finditer(content):
+        title = match.group(1).strip()
+        body = match.group(2).strip()
+        if title and body:
+            sections[title] = body
+    return sections
+
+
+def _split_keywords_text(text: str) -> list[str]:
+    if not text:
+        return []
+    parts = re.split(r"[、,，;；\n]+", text)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _dedupe_text_items(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in items:
+        normalized = _normalize_text_for_compare(item)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(item.strip())
+    return deduped
+
+
+def _summarize_knowledge_point(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    cleaned = re.sub(r"^[：:;；，,。.\-]+", "", cleaned)
+    if not cleaned:
+        return "AI素养关键知识"
+    return cleaned[:32]
+
+
+def _has_blank_marker(text: str) -> bool:
+    return any(marker in (text or "") for marker in BLANK_MARKERS)
+
+
+def _looks_like_true_false_statement(stem: str) -> bool:
+    normalized = str(stem or "").strip()
+    if not normalized:
+        return False
+    if "?" in normalized or "？" in normalized:
+        return False
+    if normalized.endswith("吗"):
+        return False
+    return not any(normalized.startswith(prefix) for prefix in TRUE_FALSE_INTERROGATIVE_PREFIXES)
+
+
+def _build_type_rule_section(question_types: list[str]) -> str:
+    normalized_types = [qt for qt in question_types if qt in VALID_TYPES]
+    if not normalized_types:
+        return ""
+
+    lines = [
+        "",
+        "",
+        "【题型硬约束——优先级高于多样性要求】",
+        "所有风格变化、情境包装和语言多样性都必须服从题型格式；若冲突，必须优先满足题型硬约束。",
+    ]
+    if any(qt in ("single_choice", "multiple_choice") for qt in normalized_types):
+        lines.extend([
+            "- 单选题/多选题：必须使用 A/B/C/D 四个标准选项；干扰项应基于真实误解，但不得改变题型结构。",
+        ])
+    if "true_false" in normalized_types:
+        lines.extend([
+            "- 判断题：题干必须写成可直接判断真假的完整陈述句，严禁使用问号、'以下哪项'、'是否正确'、'请判断'等疑问表达。",
+            "- 判断题：options 必须严格且仅为 {\"A\": \"正确\", \"B\": \"错误\"}，correct_answer 只能是 A 或 B。",
+            "- 判断题：如果某个知识点更适合提问式表达，请放弃该知识点，改选能自然写成陈述句的知识点。",
+        ])
+    if "fill_blank" in normalized_types:
+        lines.extend([
+            "- 填空题：题干必须包含明确空位标记（如 ____ 或 （ ）），不得改写成问答题、简答题或判断题。",
+            "- 填空题：options 必须为 null，correct_answer 应是简洁术语、短语或关键词，不应是一整句解释。",
+            "- 填空题：优先选择概念名称、关键术语、核心步骤中的缺失项，不要选择需要长篇作答的知识点。",
+        ])
+    if "short_answer" in normalized_types:
+        lines.extend([
+            "- 简答题：题干必须明确说明作答任务，options 必须为 null，参考答案应为文本型答案而非字母选项。",
+        ])
+    return "\n".join(lines)
+
+
+def _build_plan_type_requirements(question_types: list[str]) -> str:
+    lines: list[str] = []
+    if "true_false" in question_types:
+        lines.append("7. 若题型为判断题，只规划能自然写成陈述句的知识点，不要规划成疑问句或选择题式表达；")
+    if "fill_blank" in question_types:
+        lines.append("8. 若题型为填空题，只规划能抽取出术语、关键词、短语或固定步骤缺失项的知识点；")
+    if "short_answer" in question_types:
+        lines.append("9. 若题型为简答题，只规划需要简要解释、说明原因或概括方法的知识点；")
+    return "\n".join(lines)
+
+
+def _build_choice_answer_enums(min_answers: int = 1) -> list[str]:
+    letters = ("A", "B", "C", "D")
+    answers: list[str] = []
+    for size in range(min_answers, len(letters) + 1):
+        for combo in combinations(letters, size):
+            answers.append("".join(combo))
+    return answers
+
+
+def _build_choice_options_schema() -> dict:
+    return {
+        "type": "object",
+        "required": ["A", "B", "C", "D"],
+        "additionalProperties": False,
+        "properties": {
+            "A": {"type": "string", "minLength": 1},
+            "B": {"type": "string", "minLength": 1},
+            "C": {"type": "string", "minLength": 1},
+            "D": {"type": "string", "minLength": 1},
+        },
+    }
+
+
+def _build_question_item_schema(question_type: str) -> dict:
+    base_properties = {
+        "question_type": {"type": "string", "const": question_type},
+        "dimension": {
+            "type": "string",
+            "enum": FIVE_DIMENSIONS,
+        },
+        "stem": {"type": "string", "minLength": 5},
+        "correct_answer": {"type": "string"},
+        "explanation": {"type": "string", "minLength": 2},
+        "knowledge_tags": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+        },
+    }
+
+    if question_type == "single_choice":
+        return {
+            "type": "object",
+            "required": list(base_properties.keys()) + ["options"],
+            "additionalProperties": False,
+            "properties": {
+                **base_properties,
+                "options": _build_choice_options_schema(),
+                "correct_answer": {"type": "string", "enum": ["A", "B", "C", "D"]},
+            },
+        }
+
+    if question_type == "multiple_choice":
+        return {
+            "type": "object",
+            "required": list(base_properties.keys()) + ["options"],
+            "additionalProperties": False,
+            "properties": {
+                **base_properties,
+                "options": _build_choice_options_schema(),
+                "correct_answer": {"type": "string", "enum": _build_choice_answer_enums(min_answers=2)},
+            },
+        }
+
+    if question_type == "true_false":
+        return {
+            "type": "object",
+            "required": list(base_properties.keys()) + ["options"],
+            "additionalProperties": False,
+            "properties": {
+                **base_properties,
+                "stem": {
+                    "type": "string",
+                    "minLength": 5,
+                    "not": {"pattern": r"[？?]"},
+                },
+                "options": {
+                    "type": "object",
+                    "required": ["A", "B"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "A": {"const": "正确"},
+                        "B": {"const": "错误"},
+                    },
+                },
+                "correct_answer": {"type": "string", "enum": ["A", "B"]},
+            },
+        }
+
+    if question_type == "fill_blank":
+        return {
+            "type": "object",
+            "required": list(base_properties.keys()) + ["options"],
+            "additionalProperties": False,
+            "properties": {
+                **base_properties,
+                "stem": {
+                    "type": "string",
+                    "minLength": 5,
+                    "pattern": BLANK_MARKER_PATTERN,
+                },
+                "options": {"type": "null"},
+                "correct_answer": {"type": "string", "minLength": 1, "maxLength": 48},
+            },
+        }
+
+    return {
+        "type": "object",
+        "required": list(base_properties.keys()) + ["options"],
+        "additionalProperties": False,
+        "properties": {
+            **base_properties,
+            "options": {"type": "null"},
+            "correct_answer": {"type": "string", "minLength": 1},
+        },
+    }
+
+
+def build_question_plan(
+    content: str,
+    question_types: list[str],
+    count: int,
+    difficulty: int,
+    bloom_level: Optional[str] = None,
+    custom_prompt: Optional[str] = None,
+    prompt_seed: Optional[int] = None,
+) -> list[dict]:
+    """Build a deterministic question plan before final prompt generation."""
+    rng = _build_prompt_rng(
+        {
+            "content": content,
+            "question_types": question_types,
+            "count": count,
+            "difficulty": difficulty,
+            "bloom_level": bloom_level,
+            "custom_prompt": custom_prompt,
+            "stage": "question_plan",
+        },
+        prompt_seed,
+    )
+
+    sections = _extract_content_sections(content)
+    title = sections.get("知识单元标题", "")
+    summary = sections.get("知识单元摘要", "")
+    keywords = _split_keywords_text(sections.get("知识关键词", ""))
+    body = sections.get("知识单元正文", content)
+    sentences = _extract_key_sentences(body, max_count=max(count * 2, 6))
+
+    topic_candidates = _dedupe_text_items(
+        keywords
+        + ([title] if title else [])
+        + ([summary] if summary else [])
+        + sentences
+    )
+    if not topic_candidates:
+        sampled_topics = rng.sample(
+            DIRECT_GENERATION_TOPICS,
+            min(3, len(DIRECT_GENERATION_TOPICS)),
+        )
+        topic_candidates = [f"{topic['theme']}：{topic['keywords']}" for topic in sampled_topics]
+
+    evidence_candidates = _dedupe_text_items(
+        ([summary] if summary else [])
+        + sentences
+        + ([body[:120]] if body else [])
+    )
+    if not evidence_candidates:
+        evidence_candidates = topic_candidates[:]
+
+    selected_styles = rng.sample(
+        QUESTION_STEM_STYLES,
+        min(max(count, 1), len(QUESTION_STEM_STYLES)),
+    )
+    selected_contexts = rng.sample(
+        SCENARIO_CONTEXTS,
+        min(max(count, 1), len(SCENARIO_CONTEXTS)),
+    )
+
+    plan: list[dict] = []
+    for index in range(max(count, 1)):
+        question_type = question_types[index % len(question_types)] if question_types else "single_choice"
+        if question_type == "fill_blank" and keywords:
+            topic = keywords[index % len(keywords)]
+        elif question_type == "true_false":
+            topic = evidence_candidates[index % len(evidence_candidates)]
+        else:
+            topic = topic_candidates[index % len(topic_candidates)]
+        evidence = evidence_candidates[index % len(evidence_candidates)]
+        style = selected_styles[index % len(selected_styles)]
+        scenario = selected_contexts[index % len(selected_contexts)]
+        base_tags = _dedupe_text_items(
+            [topic]
+            + keywords[:3]
+            + ([title] if title else [])
+        )
+        knowledge_tags = base_tags[:3] or [_summarize_knowledge_point(topic)]
+        dimension = classify_dimension(" ".join([topic, evidence]), knowledge_tags)
+
+        plan.append(
+            {
+                "knowledge_point": _summarize_knowledge_point(topic),
+                "evidence": evidence[:120],
+                "question_type": question_type,
+                "stem_style": style["name"],
+                "scenario": scenario,
+                "answer_focus": evidence[:80],
+                "distractor_focus": f"围绕“{_summarize_knowledge_point(topic)}”设计常见误解或边界条件",
+                "knowledge_tags": knowledge_tags,
+                "dimension": dimension,
+            }
+        )
+
+    return plan[:count]
+
+
+def _build_question_plan_section(question_plan: Optional[list[dict]]) -> str:
+    if not question_plan:
+        return ""
+
+    lines = [
+        "",
+        "",
+        "【知识点出题规划】",
+        "请严格按照以下规划逐题生成，每条规划最多对应1道题，不要遗漏、合并或改题型：",
+    ]
+    for index, item in enumerate(question_plan, start=1):
+        tags = "、".join(item.get("knowledge_tags") or [])
+        lines.append(f"{index}. 知识点：{item.get('knowledge_point', '')}")
+        lines.append(f"   - 证据锚点：{item.get('evidence', '')}")
+        lines.append(f"   - 题型：{TYPE_LABELS.get(item.get('question_type', ''), item.get('question_type', ''))}")
+        lines.append(f"   - 推荐风格：{item.get('stem_style', '')}")
+        lines.append(f"   - 推荐场景：{item.get('scenario', '')}")
+        lines.append(f"   - 正确答案聚焦：{item.get('answer_focus', '')}")
+        lines.append(f"   - 干扰项设计：{item.get('distractor_focus', '')}")
+        lines.append(f"   - 建议标签：{tags}")
+        lines.append(f"   - 建议维度：{item.get('dimension', '')}")
+    return "\n".join(lines)
+
+
+def _build_question_response_format(count: int, question_types: list[str]) -> dict:
+    normalized_types = [
+        question_type
+        for question_type in dict.fromkeys(question_types)
+        if question_type in VALID_TYPES
+    ] or ["single_choice"]
+    item_schemas = [_build_question_item_schema(question_type) for question_type in normalized_types]
+    question_item_schema = item_schemas[0] if len(item_schemas) == 1 else {"oneOf": item_schemas}
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": f"generated_questions_{'_'.join(normalized_types)}",
+            "strict": False,
+            "schema": {
+                "type": "array",
+                "items": question_item_schema,
+                "minItems": 1,
+                "maxItems": max(count, 1),
+            },
+        },
+    }
+
+
+def _build_question_plan_response_format(count: int) -> dict:
+    plan_item_schema = {
+        "type": "object",
+        "required": [
+            "knowledge_point",
+            "evidence",
+            "question_type",
+            "stem_style",
+            "scenario",
+            "answer_focus",
+            "distractor_focus",
+            "knowledge_tags",
+            "dimension",
+        ],
+        "additionalProperties": True,
+        "properties": {
+            "knowledge_point": {"type": "string"},
+            "evidence": {"type": "string"},
+            "question_type": {"type": "string", "enum": sorted(VALID_TYPES)},
+            "stem_style": {"type": "string"},
+            "scenario": {"type": "string"},
+            "answer_focus": {"type": "string"},
+            "distractor_focus": {"type": "string"},
+            "knowledge_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "dimension": {"type": "string", "enum": FIVE_DIMENSIONS},
+        },
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "question_plan",
+            "strict": False,
+            "schema": {
+                "type": "array",
+                "items": plan_item_schema,
+                "minItems": 1,
+                "maxItems": max(count, 1),
+            },
+        },
+    }
+
+
+def _supports_structured_output(model_config: ModelConfig) -> bool:
+    base_url = (resolve_base_url(model_config) or "").lower()
+    if model_config.slug == "local_qwen":
+        return False
+    return not any(token in base_url for token in STRUCTURED_OUTPUT_UNSUPPORTED_HOSTS)
+
+
+def _should_retry_without_structured_output(exc: Exception) -> bool:
+    message = str(exc).lower()
+    retry_markers = (
+        "response_format",
+        "json_schema",
+        "structured output",
+        "schema",
+        "invalid parameter",
+        "unsupported",
+        "not support",
+        "not supported",
+        "json mode",
+    )
+    return any(marker in message for marker in retry_markers)
+
+
+def _extract_question_payload(payload: object) -> list[dict]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        if isinstance(payload.get("questions"), list):
+            return payload["questions"]
+        return [payload]
+    return [payload] if payload is not None else []
+
+
+def _sum_usage(*usages: Optional[dict]) -> dict:
+    total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for usage in usages:
+        if not usage:
+            continue
+        for key in total:
+            total[key] += int(usage.get(key, 0) or 0)
+    return total
+
+
+def _normalize_question_plan_item(
+    raw: object,
+    question_types: list[str],
+    fallback_item: dict,
+) -> dict:
+    if not isinstance(raw, dict):
+        return dict(fallback_item)
+
+    normalized = dict(fallback_item)
+    question_type = raw.get("question_type")
+    if question_type in LABEL_TO_TYPE:
+        question_type = LABEL_TO_TYPE[question_type]
+    if question_type in VALID_TYPES and question_type in set(question_types):
+        normalized["question_type"] = question_type
+
+    for field in (
+        "knowledge_point",
+        "evidence",
+        "stem_style",
+        "scenario",
+        "answer_focus",
+        "distractor_focus",
+    ):
+        value = str(raw.get(field, "") or "").strip()
+        if value:
+            normalized[field] = value
+
+    tags = raw.get("knowledge_tags")
+    if isinstance(tags, str):
+        tags = [tag.strip() for tag in re.split(r"[,，、;；]", tags) if tag.strip()]
+    if isinstance(tags, list):
+        normalized["knowledge_tags"] = [
+            str(tag).strip() for tag in tags if str(tag).strip()
+        ][:3] or normalized["knowledge_tags"]
+
+    dimension = raw.get("dimension")
+    if dimension in FIVE_DIMENSIONS:
+        normalized["dimension"] = dimension
+    else:
+        normalized["dimension"] = classify_dimension(
+            " ".join(
+                [
+                    normalized.get("knowledge_point", ""),
+                    normalized.get("evidence", ""),
+                ]
+            ),
+            normalized.get("knowledge_tags"),
+        )
+
+    return normalized
+
+
+def _build_question_plan_user_prompt(
+    content: str,
+    question_types: list[str],
+    count: int,
+    difficulty: int,
+    bloom_level: Optional[str] = None,
+    custom_prompt: Optional[str] = None,
+) -> str:
+    type_labels = "、".join(TYPE_LABELS.get(item, item) for item in question_types)
+    bloom_text = BLOOM_LABELS.get(bloom_level, bloom_level or "不限")
+    extra = f"\n【额外要求】\n{custom_prompt}" if custom_prompt else ""
+    return (
+        f"请先完成出题规划，不要直接生成题目。\n"
+        f"目标题量：{count} 道\n"
+        f"允许题型：{type_labels}\n"
+        f"难度：{difficulty}/5\n"
+        f"布鲁姆层级：{bloom_text}\n"
+        "请围绕素材中最有价值、最适合考查的知识点，输出一个 JSON 数组，每个元素表示 1 道题的规划。\n"
+        "每条规划必须包含：knowledge_point、evidence、question_type、stem_style、scenario、answer_focus、distractor_focus、knowledge_tags、dimension。\n"
+        "要求：\n"
+        "1. 不得重复知识点；\n"
+        "2. evidence 必须是素材中的证据句或高保真摘要；\n"
+        "3. question_type 只能从允许题型中选择；\n"
+        "4. dimension 必须是五个 AI 素养维度之一；\n"
+        "5. knowledge_tags 必须是简洁的字符串数组；\n"
+        "6. 不要输出题干、选项和答案，只输出规划。\n"
+        f"{_build_plan_type_requirements(question_types)}\n"
+        f"{extra}\n\n"
+        f"{content or '【出题范围】AI素养通识知识'}"
+    )
+
+
+def generate_question_plan_via_llm(
+    content: str,
+    question_types: list[str],
+    count: int,
+    difficulty: int,
+    bloom_level: Optional[str] = None,
+    custom_prompt: Optional[str] = None,
+    model_config: Optional[ModelConfig] = None,
+    prompt_seed: Optional[int] = None,
+) -> dict:
+    fallback_plan = build_question_plan(
+        content=content,
+        question_types=question_types,
+        count=count,
+        difficulty=difficulty,
+        bloom_level=bloom_level,
+        custom_prompt=custom_prompt,
+        prompt_seed=prompt_seed,
+    )
+    runtime_model = model_config or get_default_model_config()
+    api_key = resolve_api_key(runtime_model)
+    empty_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    if not api_key or api_key == "your-api-key":
+        return {
+            "question_plan": fallback_plan,
+            "usage": empty_usage,
+            "fallback_used": True,
+            "error": "LLM API key not configured",
+        }
+
+    try:
+        response_data = _request_question_generation(
+            runtime_model,
+            api_key,
+            "你是一名资深命题规划专家，负责先抽取可考知识点，再为后续出题生成严格的结构化规划。",
+            _build_question_plan_user_prompt(
+                content=content,
+                question_types=question_types,
+                count=count,
+                difficulty=difficulty,
+                bloom_level=bloom_level,
+                custom_prompt=custom_prompt,
+            ),
+            max(2048, count * 300),
+            count,
+            empty_usage,
+            response_format=_build_question_plan_response_format(count),
+            temperature=0.2,
+        )
+        raw = extract_json_text(response_data["content"])
+        plan_items = json.loads(raw)
+        if not isinstance(plan_items, list):
+            plan_items = [plan_items]
+
+        normalized: list[dict] = []
+        for index, fallback_item in enumerate(fallback_plan):
+            raw_item = plan_items[index] if index < len(plan_items) else None
+            normalized.append(
+                _normalize_question_plan_item(
+                    raw_item,
+                    question_types,
+                    fallback_item,
+                )
+            )
+
+        return {
+            "question_plan": normalized[:count],
+            "usage": response_data["usage"],
+            "fallback_used": False,
+            "error": None,
+        }
+    except Exception as exc:
+        logger.warning("Question planning via LLM failed, falling back to deterministic plan: %s", exc)
+        return {
+            "question_plan": fallback_plan,
+            "usage": empty_usage,
+            "fallback_used": True,
+            "error": str(exc),
+        }
+
+
 def build_question_prompt_context(
     content: str,
     question_types: list[str],
@@ -469,29 +1139,22 @@ def build_question_prompt_context(
     bloom_level: Optional[str] = None,
     custom_prompt: Optional[str] = None,
     prompt_seed: Optional[int] = None,
+    question_plan: Optional[list[dict]] = None,
+    retry_feedback: Optional[str] = None,
 ) -> dict[str, str]:
     """Build prompt context for question generation with diversity and quality instructions."""
-    if prompt_seed is None:
-        rng = random
-    else:
-        seed_material = json.dumps(
-            {
-                "prompt_seed": prompt_seed,
-                "content": content,
-                "question_types": question_types,
-                "count": count,
-                "difficulty": difficulty,
-                "bloom_level": bloom_level,
-                "custom_prompt": custom_prompt,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        derived_seed = int(
-            hashlib.sha256(seed_material.encode("utf-8")).hexdigest()[:16],
-            16,
-        )
-        rng = random.Random(derived_seed)
+    rng = _build_prompt_rng(
+        {
+            "content": content,
+            "question_types": question_types,
+            "count": count,
+            "difficulty": difficulty,
+            "bloom_level": bloom_level,
+            "custom_prompt": custom_prompt,
+            "stage": "question_prompt",
+        },
+        prompt_seed,
+    )
 
     # ── 题型说明 ──
     type_parts = []
@@ -537,9 +1200,14 @@ def build_question_prompt_context(
     context_section = "、".join(selected_contexts)
 
     # ── 额外要求 ──
-    custom_requirements = ""
+    custom_requirement_parts: list[str] = []
     if custom_prompt:
-        custom_requirements = f"\n\n【额外要求】\n{custom_prompt}"
+        custom_requirement_parts.append(f"【额外要求】\n{custom_prompt}")
+    if retry_feedback:
+        custom_requirement_parts.append(f"【上次输出问题——本次必须修正】\n{retry_feedback}")
+    custom_requirements = ""
+    if custom_requirement_parts:
+        custom_requirements = "\n\n" + "\n\n".join(custom_requirement_parts)
 
     # ── 内容区 ──
     if content:
@@ -593,20 +1261,22 @@ def build_question_prompt_context(
     voice_style = rng.choice(QUESTION_VOICE_STYLES)
 
     # ── 组合多样性要求 ──
+    type_rule_section = _build_type_rule_section(question_types)
     diversity_rules = f"""
 
 【多样性与质量要求——核心规则】
-1. **语言多样化**——每道题的题干必须使用不同的句式和表达方式：
+1. **题型约束优先**——所有语言多样化、情境包装和风格变化都必须服从题型硬约束；若冲突，以题型硬约束为准。
+2. **语言多样化**——在不违反题型硬约束的前提下，每道题的题干应尽量使用不同的句式和表达方式：
    - 本次推荐视角：{voice_style}
    - 严禁多道题使用相同的句式开头（如全都用"以下关于..."或"以下哪项..."）
    - 每道题的语言风格和切入角度要有变化
-2. **题目风格混合**——请在以下推荐风格中选择并混合使用：
+3. **题目风格混合**——请在以下推荐风格中选择并混合使用：
 {style_section}
-3. **情境多样**——题目场景应涉及：{context_section}
-4. **正确答案随机分布**——{count}道题中，正确答案必须随机分布在不同选项位置（ABCD），绝对不能全都是A或全都是AB
-5. **知识点覆盖**——每道题应考查不同的知识点或从不同角度考查，避免重复
-6. **干扰项质量**——每个干扰项都应对应一种常见误解，具有足够迷惑性
-7. **答案简明**——correct_answer（主观题除外）和explanation应简洁明了"""
+4. **情境多样**——题目场景应涉及：{context_section}；但若题型更适合直接陈述或术语填空，应优先保证格式正确
+5. **正确答案随机分布**——{count}道题中，选择题正确答案应尽量分布在不同选项位置（ABCD），不能全部相同
+6. **知识点覆盖**——每道题应考查不同的知识点或从不同角度考查，避免重复
+7. **干扰项质量**——每个干扰项都应对应一种常见误解，具有足够迷惑性
+8. **答案简明**——correct_answer（主观题除外）和explanation应简洁明了{type_rule_section}"""
 
     return {
         "count": str(count),
@@ -614,6 +1284,7 @@ def build_question_prompt_context(
         "difficulty_section": difficulty_section,
         "bloom_section": bloom_section,
         "diversity_rules": diversity_rules,
+        "question_plan_section": _build_question_plan_section(question_plan),
         "content_section": content_section,
         "custom_requirements": custom_requirements,
     }
@@ -628,6 +1299,8 @@ def _build_user_prompt(
     custom_prompt: Optional[str] = None,
     prompt_seed: Optional[int] = None,
     user_prompt_template: Optional[str] = None,
+    question_plan: Optional[list[dict]] = None,
+    retry_feedback: Optional[str] = None,
 ) -> str:
     context = build_question_prompt_context(
         content=content,
@@ -637,6 +1310,8 @@ def _build_user_prompt(
         bloom_level=bloom_level,
         custom_prompt=custom_prompt,
         prompt_seed=prompt_seed,
+        question_plan=question_plan,
+        retry_feedback=retry_feedback,
     )
     return render_user_prompt(
         user_prompt_template or DEFAULT_QUESTION_USER_PROMPT_TEMPLATE,
@@ -724,8 +1399,16 @@ def _normalize_correct_answer(answer: str, question_type: str, options: Optional
     return answer
 
 
-def _validate_and_fix_question(raw: dict, requested_types: list[str]) -> Optional[dict]:
+def _validate_and_fix_question(
+    raw: dict,
+    requested_types: list[str],
+    rejection_reasons: Optional[list[str]] = None,
+) -> Optional[dict]:
     """校验并修复单道题目，返回 None 表示该题无法修复应丢弃。"""
+    def reject(reason: str) -> None:
+        if rejection_reasons is not None:
+            rejection_reasons.append(reason)
+
     # ── 1. 题型规范化 ──
     qt = raw.get("question_type", "")
     if qt in LABEL_TO_TYPE:
@@ -748,12 +1431,14 @@ def _validate_and_fix_question(raw: dict, requested_types: list[str]) -> Optiona
     stem = raw.get("stem", "")
     if not stem or not isinstance(stem, str) or len(stem.strip()) < 5:
         logger.warning(f"题目 stem 无效，已丢弃: {stem!r}")
+        reject("题干缺失或过短")
         return None
     raw["stem"] = stem.strip()
 
     correct_answer = raw.get("correct_answer", "")
     if not correct_answer:
         logger.warning(f"题目缺少 correct_answer，已丢弃: {stem[:30]}")
+        reject("缺少正确答案")
         return None
 
     # ── 3. 选项规范化 ──
@@ -765,11 +1450,13 @@ def _validate_and_fix_question(raw: dict, requested_types: list[str]) -> Optiona
                 options = {"A": "正确", "B": "错误"}
             else:
                 logger.warning(f"选择题缺少有效 options，已丢弃: {stem[:30]}")
+                reject("缺少有效选项")
                 return None
         options = _normalize_options_keys(options)
         # 确保至少有2个选项
         if len(options) < 2:
             logger.warning(f"选项数量不足，已丢弃: {stem[:30]}")
+            reject("选项数量不足")
             return None
         raw["options"] = options
     else:
@@ -790,11 +1477,11 @@ def _validate_and_fix_question(raw: dict, requested_types: list[str]) -> Optiona
                     raw["correct_answer"] = k
                     break
             else:
-                # 默认设为 A，并记录警告
                 logger.warning(
-                    f"单选题答案 '{correct_answer}' 不在选项中，默认设为A: {stem[:30]}"
+                    f"单选题答案 '{correct_answer}' 不在选项中，已丢弃: {stem[:30]}"
                 )
-                raw["correct_answer"] = "A"
+                reject("单选题答案未落在选项内")
+                return None
 
     if qt == "multiple_choice" and raw.get("options"):
         valid_keys = set(raw["options"].keys())
@@ -804,7 +1491,39 @@ def _validate_and_fix_question(raw: dict, requested_types: list[str]) -> Optiona
                 f"多选题答案 '{raw['correct_answer']}' 包含无效选项: {stem[:30]}"
             )
             fixed = "".join(sorted(answer_keys & valid_keys))
-            raw["correct_answer"] = fixed or "AB"
+            if len(fixed) < 2:
+                reject("多选题答案无效")
+                return None
+            raw["correct_answer"] = fixed
+
+    if qt == "true_false" and raw["correct_answer"] not in ("A", "B"):
+        logger.warning(f"判断题答案 '{correct_answer}' 非法，已丢弃: {stem[:30]}")
+        reject("判断题答案必须为 A 或 B")
+        return None
+
+    if qt == "true_false":
+        if not _looks_like_true_false_statement(raw["stem"]):
+            logger.warning(f"判断题题干不是陈述句，已丢弃: {stem[:30]}")
+            reject("判断题题干必须是陈述句且不得包含问号或疑问表达")
+            return None
+        if raw.get("options") != {"A": "正确", "B": "错误"}:
+            logger.warning(f"判断题选项非标准格式，已丢弃: {stem[:30]}")
+            reject("判断题选项必须严格为 A.正确 / B.错误")
+            return None
+
+    if qt == "fill_blank":
+        if not _has_blank_marker(raw["stem"]):
+            logger.warning(f"填空题缺少空位标记，已丢弃: {stem[:30]}")
+            reject("填空题题干必须包含明确空位标记")
+            return None
+        if raw.get("options") is not None:
+            logger.warning(f"填空题包含非法 options，已丢弃: {stem[:30]}")
+            reject("填空题不应包含选项")
+            return None
+        if len(raw["correct_answer"]) > 48:
+            logger.warning(f"填空题答案过长，已丢弃: {stem[:30]}")
+            reject("填空题答案过长，更适合改为简答题")
+            return None
 
     # ── 5. 解析字段 ──
     explanation = raw.get("explanation")
@@ -830,6 +1549,25 @@ def _validate_and_fix_question(raw: dict, requested_types: list[str]) -> Optiona
         raw["dimension"] = dim
 
     return raw
+
+
+def _build_generation_retry_feedback(
+    question_types: list[str],
+    rejection_reasons: list[str],
+    generated_count: int,
+    target_count: int,
+) -> str:
+    unique_reasons = list(dict.fromkeys(reason.strip() for reason in rejection_reasons if reason.strip()))
+    lines = [
+        f"本次只生成了 {generated_count} / {target_count} 道有效题目，必须补齐。",
+    ]
+    if unique_reasons:
+        lines.append("上次输出中最常见的问题如下，请逐条修正：")
+        for index, reason in enumerate(unique_reasons[:5], start=1):
+            lines.append(f"{index}. {reason}")
+    if set(question_types) & STRICT_FORMAT_TYPES:
+        lines.append("本次不得为了语言变化破坏题型格式；若知识点不适合当前题型，请改换更合适的知识点。")
+    return "\n".join(lines)
 
 
 def _question_field(question: object, field: str, default=None):
@@ -885,6 +1623,12 @@ def _knowledge_signature(question: object) -> str:
     return _normalize_text_for_compare(_question_field(question, "stem", ""))
 
 
+def _stem_opening_signature(stem: str) -> str:
+    if not stem:
+        return ""
+    return _normalize_text_for_compare(stem)[:12]
+
+
 def _validate_generated_question_set(
     questions: list[object],
     strict_material_rules: bool = False,
@@ -898,7 +1642,10 @@ def _validate_generated_question_set(
     reasons: list[str] = []
     seen_signatures: dict[str, int] = {}
     seen_roles: dict[str, int] = {}
+    seen_openings: dict[str, int] = {}
     role_lead_count = 0
+    single_choice_answers: list[str] = []
+    true_false_answers: list[str] = []
 
     for index, question in enumerate(questions, start=1):
         stem = str(_question_field(question, "stem", "") or "")
@@ -913,40 +1660,61 @@ def _validate_generated_question_set(
             ]
         )
 
-        # if _contains_material_reference(combined_text):
-        #     reasons.append(f"第{index}题包含素材元信息或禁用表述")
+        if _contains_material_reference(combined_text):
+            reasons.append(f"第{index}题包含素材元信息或禁用表述")
 
-        # if _contains_garbled_text(combined_text):
-        #     reasons.append(f"第{index}题存在乱码残留")
+        if _contains_garbled_text(combined_text):
+            reasons.append(f"第{index}题存在乱码残留")
 
-        # signature = _knowledge_signature(question)
-        # if signature:
-        #     if signature in seen_signatures:
-        #         reasons.append(
-        #             f"第{index}题与第{seen_signatures[signature]}题知识点重复"
-        #         )
-        #     else:
-        #         seen_signatures[signature] = index
+        signature = _knowledge_signature(question)
+        if signature:
+            if signature in seen_signatures:
+                reasons.append(
+                    f"第{index}题与第{seen_signatures[signature]}题知识点重复"
+                )
+            else:
+                seen_signatures[signature] = index
 
-        # if stem.startswith("一位"):
-        #     role_lead_count += 1
-        #     if role_lead_count > MAX_ROLE_LEAD_STEMS:
-        #         reasons.append("同套题以“一位……”开头的题干超过2题")
+        opening = _stem_opening_signature(stem)
+        if opening:
+            if opening in seen_openings:
+                reasons.append(
+                    f"第{index}题与第{seen_openings[opening]}题题干开头过于相似"
+                )
+            else:
+                seen_openings[opening] = index
 
-        #     role = _extract_role_from_stem(stem)
-        #     if role:
-        #         if role in seen_roles:
-        #             reasons.append(
-        #                 f"第{index}题与第{seen_roles[role]}题职业角色重复"
-        #             )
-        #         else:
-        #             seen_roles[role] = index
+        if stem.startswith("一位"):
+            role_lead_count += 1
+            if role_lead_count > MAX_ROLE_LEAD_STEMS:
+                reasons.append("同套题以“一位……”开头的题干超过2题")
 
-        if _question_field(question, "question_type") == "true_false":
+            role = _extract_role_from_stem(stem)
+            if role:
+                if role in seen_roles:
+                    reasons.append(
+                        f"第{index}题与第{seen_roles[role]}题职业角色重复"
+                    )
+                else:
+                    seen_roles[role] = index
+
+        question_type = _question_field(question, "question_type")
+        answer = str(_question_field(question, "correct_answer", "") or "")
+        if question_type == "single_choice":
+            single_choice_answers.append(answer)
+        if question_type == "true_false":
+            true_false_answers.append(answer)
+
+        if question_type == "true_false":
             if "?" in stem or "？" in stem:
                 reasons.append(f"第{index}题判断题题干必须是陈述句")
             if options != {"A": "正确", "B": "错误"}:
                 reasons.append(f"第{index}题判断题选项必须严格为A.正确/B.错误")
+
+    if len(single_choice_answers) >= 3 and len(set(single_choice_answers)) == 1:
+        reasons.append("同套单选题正确答案位置全部相同")
+    if len(true_false_answers) >= 3 and len(set(true_false_answers)) == 1:
+        reasons.append("同套判断题答案全部相同")
 
     deduped_reasons = list(dict.fromkeys(reasons))
     return {"passed": not deduped_reasons, "reasons": deduped_reasons}
@@ -975,6 +1743,17 @@ def generate_questions_via_llm(
     _empty_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     runtime_model = model_config or get_default_model_config()
     api_key = resolve_api_key(runtime_model)
+    planner_result = generate_question_plan_via_llm(
+        content=content,
+        question_types=question_types,
+        count=count,
+        difficulty=difficulty,
+        bloom_level=bloom_level,
+        custom_prompt=custom_prompt,
+        model_config=runtime_model,
+        prompt_seed=prompt_seed,
+    )
+    question_plan = planner_result["question_plan"]
 
     if not api_key or api_key == "your-api-key":
         logger.warning("LLM API key not configured, using template fallback")
@@ -984,103 +1763,154 @@ def generate_questions_via_llm(
             count,
             difficulty,
             bloom_level,
-            _empty_usage,
+            _sum_usage(_empty_usage, planner_result.get("usage")),
             runtime_model,
             "LLM API key not configured",
+            question_plan=question_plan,
+            planner_fallback_used=planner_result.get("fallback_used", False),
+            planner_error=planner_result.get("error"),
         )
 
-    try:
-        user_prompt = _build_user_prompt(
-            content,
-            question_types,
-            count,
-            difficulty,
-            bloom_level,
-            custom_prompt,
-            prompt_seed=prompt_seed,
-            user_prompt_template=user_prompt_template,
-        )
-        runtime_system_prompt = system_prompt or DEFAULT_QUESTION_SYSTEM_PROMPT
+    runtime_system_prompt = system_prompt or DEFAULT_QUESTION_SYSTEM_PROMPT
+    max_tokens = max(4096, count * 600)
+    generation_usage = dict(_empty_usage)
+    retry_feedback: Optional[str] = None
+    last_error: Optional[str] = None
+    best_validated: list[dict] = []
+    max_attempts = QUESTION_GENERATION_RETRY_LIMIT if set(question_types) & STRICT_FORMAT_TYPES else 1
 
-        # 根据题目数量动态调整 max_tokens，每题预留约 600 tokens
-        max_tokens = max(4096, count * 600)
-        response_data = _request_question_generation(
-            runtime_model,
-            api_key,
-            runtime_system_prompt,
-            user_prompt,
-            max_tokens,
-            _empty_usage,
-        )
-        usage = response_data["usage"]
-        raw = response_data["content"]
-
-        # Strip Qwen3.5 thinking chain (<think>...</think>) if present
-        raw = strip_thinking_tags(raw)
-
-        # Extract JSON from response (LLM may wrap in ```json ... ```)
-        if "```json" in raw:
-            raw = raw.split("```json", 1)[1].split("```", 1)[0].strip()
-        elif "```" in raw:
-            raw = raw.split("```", 1)[1].split("```", 1)[0].strip()
-
-        questions = json.loads(raw)
-        if not isinstance(questions, list):
-            questions = [questions]
-
-        # ── 逐题校验并修复 ──
-        validated = []
-        for q in questions:
-            fixed = _validate_and_fix_question(q, question_types)
-            if fixed is not None:
-                validated.append(fixed)
-
-        if not validated:
-            logger.warning("LLM output passed 0 validation, falling back to template")
-            return _build_fallback_generation_result(
+    for attempt in range(1, max_attempts + 1):
+        raw = ""
+        try:
+            user_prompt = _build_user_prompt(
                 content,
                 question_types,
                 count,
                 difficulty,
                 bloom_level,
-                usage,
-                runtime_model,
-                "LLM output passed 0 validation",
+                custom_prompt,
+                prompt_seed=prompt_seed,
+                user_prompt_template=user_prompt_template,
+                question_plan=question_plan,
+                retry_feedback=retry_feedback,
             )
+            response_data = _request_question_generation(
+                runtime_model,
+                api_key,
+                runtime_system_prompt,
+                user_prompt,
+                max_tokens,
+                count,
+                _empty_usage,
+                response_format=_build_question_response_format(count, question_types),
+                temperature=0.4,
+            )
+            generation_usage = _sum_usage(generation_usage, response_data["usage"])
+            raw = extract_json_text(response_data["content"])
+            questions = _extract_question_payload(json.loads(raw))
 
+            validated: list[dict] = []
+            rejection_reasons: list[str] = []
+            for q in questions:
+                fixed = _validate_and_fix_question(q, question_types, rejection_reasons)
+                if fixed is not None:
+                    validated.append(fixed)
+
+            if validated:
+                best_validated = validated[:count]
+            if len(validated) >= count:
+                return {
+                    "questions": validated[:count],
+                    "usage": _sum_usage(planner_result.get("usage"), generation_usage),
+                    "model_name": runtime_model.model_name,
+                    "provider": runtime_model.provider,
+                    "fallback_used": False,
+                    "error": None,
+                    "question_plan": question_plan,
+                    "planner_fallback_used": planner_result.get("fallback_used", False),
+                    "planner_error": planner_result.get("error"),
+                }
+
+            last_error = (
+                f"Only {len(validated)}/{count} questions passed validation"
+            )
+            if rejection_reasons:
+                last_error = f"{last_error}: {'; '.join(dict.fromkeys(rejection_reasons))}"
+
+            if attempt < max_attempts:
+                retry_feedback = _build_generation_retry_feedback(
+                    question_types,
+                    rejection_reasons,
+                    len(validated),
+                    count,
+                )
+                logger.warning(
+                    "Question generation attempt %s/%s produced only %s/%s valid questions, retrying: %s",
+                    attempt,
+                    max_attempts,
+                    len(validated),
+                    count,
+                    "; ".join(dict.fromkeys(rejection_reasons[:3])) or "insufficient valid items",
+                )
+                continue
+
+        except json.JSONDecodeError as exc:
+            last_error = f"Invalid JSON: {exc}"
+            logger.error(
+                "LLM output is not valid JSON on attempt %s/%s: %s\nRaw output (first 500 chars): %s",
+                attempt,
+                max_attempts,
+                exc,
+                raw[:500] if raw else "EMPTY",
+            )
+            if attempt < max_attempts:
+                retry_feedback = _build_generation_retry_feedback(
+                    question_types,
+                    ["输出必须是纯 JSON 数组，不能包含多余文本或多个 JSON 片段"],
+                    0,
+                    count,
+                )
+                continue
+        except Exception as exc:
+            last_error = str(exc)
+            logger.error("LLM question generation failed on attempt %s/%s: %s", attempt, max_attempts, exc)
+            if attempt < max_attempts:
+                retry_feedback = _build_generation_retry_feedback(
+                    question_types,
+                    [str(exc)],
+                    len(best_validated),
+                    count,
+                )
+                continue
+
+    total_usage = _sum_usage(planner_result.get("usage"), generation_usage)
+    if best_validated:
         return {
-            "questions": validated[:count],
-            "usage": usage,
+            "questions": best_validated[:count],
+            "usage": total_usage,
             "model_name": runtime_model.model_name,
             "provider": runtime_model.provider,
             "fallback_used": False,
-            "error": None,
+            "error": last_error,
+            "question_plan": question_plan,
+            "planner_fallback_used": planner_result.get("fallback_used", False),
+            "planner_error": planner_result.get("error"),
         }
 
-    except json.JSONDecodeError as e:
-        logger.error(f"LLM output is not valid JSON: {e}\nRaw output (first 500 chars): {raw[:500] if raw else 'EMPTY'}")
-        return _build_fallback_generation_result(
-            content,
-            question_types,
-            count,
-            difficulty,
-            bloom_level,
-            _empty_usage,
-            runtime_model,
-            f"Invalid JSON: {e}",
-        )
-    except Exception as e:
-        logger.error(f"LLM question generation failed: {e}")
-        return _build_fallback_generation_result(
-            content,
-            question_types,
-            count,
-            difficulty,
-            bloom_level,
-            _empty_usage,
-            runtime_model,
-            str(e),
-        )
+    logger.warning("LLM output passed 0 validation, falling back to template")
+    return _build_fallback_generation_result(
+        content,
+        question_types,
+        count,
+        difficulty,
+        bloom_level,
+        total_usage,
+        runtime_model,
+        last_error or "LLM output passed 0 validation",
+        question_plan=question_plan,
+        planner_fallback_used=planner_result.get("fallback_used", False),
+        planner_error=planner_result.get("error"),
+    )
 
 
 def _build_fallback_generation_result(
@@ -1092,6 +1922,9 @@ def _build_fallback_generation_result(
     usage: dict,
     runtime_model: ModelConfig,
     error_message: str,
+    question_plan: Optional[list[dict]] = None,
+    planner_fallback_used: bool = False,
+    planner_error: Optional[str] = None,
 ) -> dict:
     return {
         "questions": _template_fallback(content, question_types, count, difficulty, bloom_level),
@@ -1100,6 +1933,9 @@ def _build_fallback_generation_result(
         "provider": runtime_model.provider,
         "fallback_used": True,
         "error": error_message,
+        "question_plan": question_plan or [],
+        "planner_fallback_used": planner_fallback_used,
+        "planner_error": planner_error,
     }
 
 
@@ -1109,7 +1945,10 @@ def _request_question_generation(
     system_prompt: str,
     user_prompt: str,
     max_tokens: int,
+    count: int,
     empty_usage: dict,
+    response_format: Optional[dict] = None,
+    temperature: float = 0.4,
 ) -> dict:
     """Dispatch question generation to the right provider."""
     return _request_question_generation_openai_compatible(
@@ -1118,7 +1957,10 @@ def _request_question_generation(
         system_prompt,
         user_prompt,
         max_tokens,
+        count,
         empty_usage,
+        response_format=response_format,
+        temperature=temperature,
     )
 
 
@@ -1128,7 +1970,10 @@ def _request_question_generation_openai_compatible(
     system_prompt: str,
     user_prompt: str,
     max_tokens: int,
+    count: int,
     empty_usage: dict,
+    response_format: Optional[dict] = None,
+    temperature: float = 0.4,
 ) -> dict:
     client = OpenAI(
         api_key=api_key,
@@ -1142,7 +1987,7 @@ def _request_question_generation_openai_compatible(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.85,
+        "temperature": temperature,
         "max_tokens": max_tokens,
     }
     extra_body = build_disable_thinking_extra_body(
@@ -1152,10 +1997,26 @@ def _request_question_generation_openai_compatible(
     )
     if extra_body:
         request_kwargs["extra_body"] = extra_body
+    if response_format and _supports_structured_output(model_config):
+        request_kwargs["response_format"] = response_format
 
-    response = client.chat.completions.create(
-        **request_kwargs,
-    )
+    try:
+        response = client.chat.completions.create(
+            **request_kwargs,
+        )
+    except Exception as exc:
+        if request_kwargs.get("response_format") and _should_retry_without_structured_output(exc):
+            logger.warning(
+                "Structured output unsupported for model %s, retrying without response_format: %s",
+                model_config.model_name,
+                exc,
+            )
+            request_kwargs.pop("response_format", None)
+            response = client.chat.completions.create(
+                **request_kwargs,
+            )
+        else:
+            raise
 
     usage = empty_usage
     if response.usage:

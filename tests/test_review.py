@@ -57,6 +57,52 @@ def test_rule_based_review_true_false():
     assert result["recommendation"] == "approve"
 
 
+def test_rule_based_review_fill_blank_requires_blank_marker():
+    result = _rule_based_review(
+        stem="人工智能的英文缩写是____。",
+        options=None,
+        correct_answer="AI",
+        explanation="AI 是 Artificial Intelligence 的缩写。",
+        question_type="fill_blank",
+        difficulty=2,
+        dimension="AI基础认知",
+    )
+    assert result["scores"]["stem_clarity"] >= 4
+    assert result["scores"]["option_quality"] >= 4
+    assert result["scores"]["answer_correctness"] >= 4
+    assert result["recommendation"] == "approve"
+
+
+def test_rule_based_review_true_false_rejects_non_standard_options():
+    result = _rule_based_review(
+        stem="人工智能是计算机科学的一个分支。",
+        options={"A": "正确", "B": "错误", "C": "无法判断"},
+        correct_answer="C",
+        explanation="题型配置错误。",
+        question_type="true_false",
+        difficulty=2,
+        dimension="AI基础认知",
+    )
+    assert result["scores"]["option_quality"] <= 2
+    assert result["scores"]["answer_correctness"] <= 2
+    assert result["recommendation"] in ("revise", "reject")
+
+
+def test_rule_based_review_short_answer_requires_textual_answer():
+    result = _rule_based_review(
+        stem="请结合推荐系统场景，说明为什么需要最小化采集用户数据。",
+        options=None,
+        correct_answer="因为过度采集会扩大隐私泄露风险，也会增加越权使用的概率。",
+        explanation="可从合规、风险和用户信任三个角度评分。",
+        question_type="short_answer",
+        difficulty=4,
+        dimension="AI伦理安全",
+    )
+    assert result["scores"]["option_quality"] >= 4
+    assert result["scores"]["answer_correctness"] >= 4
+    assert result["recommendation"] in ("approve", "revise")
+
+
 def test_ai_review_uses_fallback():
     """When LLM not configured, uses rule-based review."""
     result = ai_review_question(

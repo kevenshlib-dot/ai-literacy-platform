@@ -146,6 +146,7 @@ async def preview_generation_prompt(
             prompt_seed=body.prompt_seed,
             material_ids=body.material_ids,
             max_units=body.max_units,
+            selection_mode=body.selection_mode,
         )
     except ValueError as e:
         status_code = 422 if "占位符" in str(e) or "prompt" in str(e) else 400
@@ -211,11 +212,24 @@ async def list_questions(
 @router.get("/stats")
 async def question_stats(
     dimension: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
+    question_type: Optional[str] = None,
+    difficulty: Optional[int] = Query(None, ge=1, le=5),
+    keyword: Optional[str] = None,
+    only_mine: bool = Query(False),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
     """Get question bank statistics."""
-    stats = await question_service.get_question_stats(db, dimension)
+    stats = await question_service.get_question_stats(
+        db=db,
+        dimension=dimension,
+        status=status_filter,
+        question_type=question_type,
+        difficulty=difficulty,
+        keyword=keyword,
+        created_by=current_user.id if only_mine else None,
+    )
     return stats
 
 
@@ -356,6 +370,7 @@ async def batch_generate_from_material(
             difficulty=body.difficulty,
             bloom_level=body.bloom_level,
             max_units=body.max_units,
+            selection_mode=body.selection_mode,
             created_by=current_user.id,
             prompt_seed=body.prompt_seed,
             system_prompt=prompt_config["system_prompt"],
@@ -445,6 +460,7 @@ async def build_question_bank(
             difficulty=body.difficulty,
             bloom_level=body.bloom_level,
             max_units=body.max_units,
+            selection_mode=body.selection_mode,
             created_by=current_user.id,
             custom_prompt=body.custom_prompt,
             prompt_seed=body.prompt_seed,
@@ -468,12 +484,19 @@ async def build_question_bank(
 @router.get("/generate/suggest/{material_id}", response_model=QuestionBankSuggestResponse)
 async def suggest_distribution(
     material_id: UUID,
+    max_units: Optional[int] = Query(None, ge=1, le=50),
+    selection_mode: str = Query("stable", pattern="^(stable|coverage)$"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "organizer"])),
 ):
     """Analyze a material and suggest optimal question type distribution."""
     try:
-        result = await question_service.suggest_question_distribution(db, material_id)
+        result = await question_service.suggest_question_distribution(
+            db,
+            material_id,
+            max_units=max_units,
+            selection_mode=selection_mode,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return QuestionBankSuggestResponse(**result)
@@ -541,7 +564,9 @@ async def preview_question_bank(
             difficulty=body.difficulty,
             bloom_level=body.bloom_level,
             max_units=body.max_units,
+            selection_mode=body.selection_mode,
             custom_prompt=body.custom_prompt,
+            created_by=current_user.id,
             prompt_seed=body.prompt_seed,
             system_prompt=prompt_config["system_prompt"],
             user_prompt_template=prompt_config["user_prompt_template"],
@@ -604,11 +629,14 @@ async def batch_create_from_raw(
     current_user: User = Depends(require_role(["admin", "organizer"])),
 ):
     """Batch save previewed questions to DB. Called after user review/edit."""
-    questions = await question_service.batch_create_from_raw(
-        db=db,
-        raw_questions=[q.model_dump() for q in body.questions],
-        created_by=current_user.id,
-    )
+    try:
+        questions = await question_service.batch_create_from_raw(
+            db=db,
+            raw_questions=[q.model_dump() for q in body.questions],
+            created_by=current_user.id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     await db.commit()
     return GenerateResponse(
         generated=len(questions),

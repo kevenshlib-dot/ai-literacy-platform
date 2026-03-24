@@ -50,3 +50,14 @@ class MaterialListResponse(BaseModel):
 class MaterialDownloadResponse(BaseModel):
     download_url: str
     filename: str
+
+
+class MaterialReparseResponse(BaseModel):
+    material_id: UUID
+    old_unit_count: int
+    new_unit_count: int
+    detached_question_count: int
+    deleted_vector_count: int
+    revectorized: bool
+    vectorized_count: int = 0
+    status: str

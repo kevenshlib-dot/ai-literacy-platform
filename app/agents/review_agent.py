@@ -9,6 +9,7 @@ Performs red-team validation checks:
 """
 import json
 import logging
+import re
 from typing import Optional
 
 from openai import OpenAI
@@ -46,6 +47,44 @@ REVIEW_SYSTEM_PROMPT = """你是一个专业的题目质量审核专家。你需
 
 recommendation 取值：approve（建议通过，overall_score >= 3.5）、revise（建议修改，2.5-3.5）、reject（建议拒绝，< 2.5）
 """
+
+BOOLEAN_TRUE_LABELS = {"正确", "对", "true", "是", "yes"}
+BOOLEAN_FALSE_LABELS = {"错误", "错", "false", "否", "no"}
+BLANK_MARKERS = ("____", "___", "（ ）", "( )", "（）", "【 】", "[]", "＿", "填空")
+SHORT_ANSWER_HINTS = ("请", "说明", "分析", "简述", "解释", "论述", "阐述", "为什么", "如何", "结合")
+
+
+def _normalize_option_map(options: Optional[dict]) -> dict[str, str]:
+    if not isinstance(options, dict):
+        return {}
+    return {
+        str(key).strip().upper(): str(value).strip()
+        for key, value in options.items()
+        if str(key).strip() and str(value).strip()
+    }
+
+
+def _normalize_boolean_label(value: str) -> Optional[str]:
+    normalized = str(value or "").strip().lower()
+    if normalized in BOOLEAN_TRUE_LABELS:
+        return "true"
+    if normalized in BOOLEAN_FALSE_LABELS:
+        return "false"
+    return None
+
+
+def _has_blank_marker(stem: str) -> bool:
+    collapsed = str(stem or "").replace(" ", "")
+    return any(marker in collapsed for marker in BLANK_MARKERS)
+
+
+def _looks_like_option_answer(answer: str) -> bool:
+    return bool(re.fullmatch(r"[A-F]+", str(answer or "").strip().upper()))
+
+
+def _has_short_answer_prompt(stem: str) -> bool:
+    stem = str(stem or "")
+    return any(hint in stem for hint in SHORT_ANSWER_HINTS) or "？" in stem or "?" in stem
 
 
 def ai_review_question(
@@ -125,53 +164,132 @@ def _rule_based_review(
     dimension: Optional[str] = None,
 ) -> dict:
     """Rule-based quality check fallback when LLM is not available."""
+    stem = str(stem or "").strip()
+    correct_answer = str(correct_answer or "").strip()
+    normalized_options = _normalize_option_map(options)
+    option_values = list(normalized_options.values())
     scores = {}
+    comments_parts: list[str] = []
 
-    # Stem clarity: check length and punctuation
+    # Stem clarity
     stem_score = 5
     if len(stem) < 10:
         stem_score = 2
     elif len(stem) < 20:
         stem_score = 3
-    if "？" not in stem and "。" not in stem and "?" not in stem and ":" not in stem:
-        stem_score = max(stem_score - 1, 1)
+
+    if question_type in ("single_choice", "multiple_choice"):
+        if not any(token in stem for token in ("？", "?", "：", ":", "哪项", "下列", "以下")):
+            stem_score = max(stem_score - 1, 1)
+    elif question_type == "fill_blank":
+        if _has_blank_marker(stem):
+            stem_score = max(stem_score, 4)
+        else:
+            stem_score = max(stem_score - 2, 1)
+            comments_parts.append("填空题题干应包含明确空位")
+    elif question_type in ("short_answer", "essay"):
+        if not _has_short_answer_prompt(stem):
+            stem_score = max(stem_score - 1, 1)
+            comments_parts.append("主观题题干应明确说明回答任务")
+    elif question_type == "true_false" and len(stem) < 8:
+        stem_score = min(stem_score, 2)
+
     scores["stem_clarity"] = stem_score
 
-    # Option quality
-    if question_type in ("single_choice", "multiple_choice"):
-        if options and len(options) >= 3:
-            opt_score = 4
-            values = list(options.values())
-            if all(len(v) < 5 for v in values):
-                opt_score = 3
-            scores["option_quality"] = opt_score
-        else:
-            scores["option_quality"] = 2
+    # Option quality + answer correctness
+    if question_type == "single_choice":
+        option_quality = 4 if len(normalized_options) >= 4 else 2
+        if len(normalized_options) == 3:
+            option_quality = 3
+        if option_values and all(len(value) < 4 for value in option_values):
+            option_quality = min(option_quality, 3)
+        if len({value.lower() for value in option_values}) < len(option_values):
+            option_quality = min(option_quality, 2)
+            comments_parts.append("单选题选项存在重复或区分度不足")
+        answer_score = 4 if correct_answer in normalized_options else 2
+        if answer_score < 4:
+            comments_parts.append("单选题正确答案未落在选项内")
+    elif question_type == "multiple_choice":
+        option_quality = 4 if len(normalized_options) >= 4 else 2
+        answers = sorted({char for char in correct_answer.upper() if char.isalpha()})
+        answer_score = 4 if len(answers) >= 2 and all(char in normalized_options for char in answers) else 2
+        if len(answers) < 2:
+            comments_parts.append("多选题正确答案至少应包含两个选项")
+        if answer_score < 4:
+            comments_parts.append("多选题正确答案与选项不匹配")
     elif question_type == "true_false":
-        scores["option_quality"] = 4
-    else:
-        scores["option_quality"] = 4
-
-    # Answer correctness
-    if correct_answer and len(correct_answer.strip()) > 0:
-        if question_type == "single_choice" and correct_answer in ("A", "B", "C", "D"):
-            scores["answer_correctness"] = 4
-        elif question_type == "multiple_choice" and all(c in "ABCD" for c in correct_answer):
-            scores["answer_correctness"] = 4
-        elif question_type == "true_false" and correct_answer in ("A", "B"):
-            scores["answer_correctness"] = 4
+        normalized_labels = {
+            _normalize_boolean_label(value)
+            for value in option_values
+        }
+        normalized_labels.discard(None)
+        has_standard_options = (
+            len(normalized_options) == 2
+            and {"A", "B"}.issubset(normalized_options.keys())
+        )
+        if has_standard_options and normalized_labels == {"true", "false"}:
+            option_quality = 5
+        elif has_standard_options:
+            option_quality = 4
+            comments_parts.append("判断题建议使用“正确/错误”标准选项")
         else:
-            scores["answer_correctness"] = 3
+            option_quality = 2
+            comments_parts.append("判断题应仅提供 A/B 两个标准选项")
+        answer_score = 4 if correct_answer in ("A", "B") and has_standard_options else 2
+        if answer_score < 4:
+            comments_parts.append("判断题正确答案应为 A 或 B")
+    elif question_type == "fill_blank":
+        option_quality = 5 if not normalized_options else 1
+        answer_score = 4
+        if normalized_options:
+            comments_parts.append("填空题不应提供选择项")
+        if not correct_answer:
+            answer_score = 1
+        elif _looks_like_option_answer(correct_answer):
+            answer_score = 2
+            comments_parts.append("填空题正确答案不应是选项字母")
+        elif len(correct_answer) > 48:
+            answer_score = 3
+            comments_parts.append("填空题答案过长，更适合改为简答题")
+    elif question_type in ("short_answer", "essay"):
+        option_quality = 5 if not normalized_options else 1
+        answer_score = 4
+        if normalized_options:
+            comments_parts.append("主观题不应提供选择项")
+        if not correct_answer:
+            answer_score = 1
+        elif _looks_like_option_answer(correct_answer) or len(correct_answer) < 8:
+            answer_score = 2
+            comments_parts.append("主观题参考答案过短或格式错误")
+        elif not explanation or len(str(explanation).strip()) < 8:
+            answer_score = 3
+            comments_parts.append("主观题建议补充更完整的解析或评分依据")
     else:
-        scores["answer_correctness"] = 1
+        option_quality = 4 if not normalized_options else 3
+        answer_score = 4 if correct_answer else 2
+
+    scores["option_quality"] = option_quality
+    scores["answer_correctness"] = answer_score
 
     # Knowledge alignment
     scores["knowledge_alignment"] = 4 if dimension else 3
+    if not dimension:
+        comments_parts.append("建议添加知识维度标签")
 
     # Difficulty calibration
-    scores["difficulty_calibration"] = 4 if 1 <= difficulty <= 5 else 2
+    if 1 <= difficulty <= 5:
+        difficulty_score = 4
+        if question_type in ("short_answer", "essay") and difficulty <= 2:
+            difficulty_score = 3
+            comments_parts.append("主观题当前难度标注偏低")
+        elif question_type == "true_false" and difficulty >= 4 and len(stem) < 18:
+            difficulty_score = 3
+            comments_parts.append("判断题当前难度标注偏高")
+    else:
+        difficulty_score = 2
+        comments_parts.append("难度标注超出 1-5 范围")
+    scores["difficulty_calibration"] = difficulty_score
 
-    # Calculate overall
     overall = sum(scores.values()) / len(scores)
 
     if overall >= 3.5:
@@ -181,19 +299,16 @@ def _rule_based_review(
     else:
         recommendation = "reject"
 
-    comments_parts = []
-    if scores["stem_clarity"] < 3:
-        comments_parts.append("题干过短或缺少标点")
-    if scores.get("option_quality", 4) < 3:
-        comments_parts.append("选项数量不足或过于简短")
-    if scores["answer_correctness"] < 3:
-        comments_parts.append("答案格式可能有误")
-    if not dimension:
-        comments_parts.append("建议添加知识维度标签")
+    if scores["stem_clarity"] < 3 and "题干过短或缺少标点" not in comments_parts:
+        comments_parts.append("题干过短或表达不完整")
+    if scores["option_quality"] < 3 and question_type in ("single_choice", "multiple_choice"):
+        comments_parts.append("选择题选项数量不足或区分度不够")
+    if scores["answer_correctness"] < 3 and "答案格式可能有误" not in comments_parts:
+        comments_parts.append("答案格式或内容可能有误")
 
     return {
         "scores": scores,
         "overall_score": round(overall, 1),
         "recommendation": recommendation,
-        "comments": "；".join(comments_parts) if comments_parts else "题目质量整体良好",
+        "comments": "；".join(dict.fromkeys(comments_parts)) if comments_parts else "题目质量整体良好",
     }

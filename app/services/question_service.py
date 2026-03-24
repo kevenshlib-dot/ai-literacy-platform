@@ -1,14 +1,18 @@
 """Question service - handles question CRUD, generation, and review."""
+from difflib import SequenceMatcher
 import logging
+import re
 import time
 import uuid
+from collections.abc import Hashable
 from typing import Optional
 
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.question import Question, QuestionType, QuestionStatus, BloomLevel, ReviewRecord
-from app.models.material import Material, KnowledgeUnit
+from app.models.material import Material, KnowledgeUnit, MaterialFormat
+from app.models.material_generation import MaterialGenerationRun, MaterialGenerationRunUnit
 from app.agents.question_agent import (
     MATERIAL_GENERATION_MAX_ATTEMPTS,
     _validate_generated_question_set,
@@ -19,6 +23,33 @@ from app.agents.model_registry import ModelConfig
 from app.agents.review_agent import ai_review_question
 
 logger = logging.getLogger(__name__)
+MATERIAL_PLACEHOLDER_MARKERS = ("待OCR处理", "待转录处理", "待ASR处理")
+SELECTION_MODE_STABLE = "stable"
+SELECTION_MODE_COVERAGE = "coverage"
+SUPPORTED_SELECTION_MODES = {SELECTION_MODE_STABLE, SELECTION_MODE_COVERAGE}
+COVERAGE_HISTORY_WINDOW_SIZE = 3
+COVERAGE_RECENCY_PENALTIES = {
+    1: 3.0,
+    2: 1.5,
+    3: 1.0,
+}
+COVERAGE_PENALTY_CAP = 4.0
+BLOOM_LEVEL_ORDER = {
+    "remember": 0,
+    "understand": 1,
+    "apply": 2,
+    "analyze": 3,
+    "evaluate": 4,
+    "create": 5,
+}
+BLOOM_LEVEL_LABELS = {
+    "remember": "记忆",
+    "understand": "理解",
+    "apply": "应用",
+    "analyze": "分析",
+    "evaluate": "评价",
+    "create": "创造",
+}
 
 
 def _coerce_uuid(value: Optional[uuid.UUID | str]) -> Optional[uuid.UUID]:
@@ -28,6 +59,868 @@ def _coerce_uuid(value: Optional[uuid.UUID | str]) -> Optional[uuid.UUID]:
     if isinstance(value, uuid.UUID):
         return value
     return uuid.UUID(value)
+
+
+def _material_format_value(material: Material) -> str:
+    value = getattr(material, "format", None)
+    return value.value if hasattr(value, "value") else str(value or "")
+
+
+def _contains_generation_placeholder(text: Optional[str]) -> bool:
+    return any(marker in (text or "") for marker in MATERIAL_PLACEHOLDER_MARKERS)
+
+
+def _normalize_selection_mode(selection_mode: Optional[str]) -> str:
+    normalized = (selection_mode or SELECTION_MODE_STABLE).strip().lower()
+    if normalized not in SUPPORTED_SELECTION_MODES:
+        raise ValueError("selection_mode 必须是 stable 或 coverage")
+    return normalized
+
+
+def _ensure_knowledge_unit_generation_ready(ku: KnowledgeUnit) -> None:
+    if _contains_generation_placeholder(ku.content):
+        raise ValueError("知识单元仍是占位解析结果，请先完成OCR/ASR后再生成试题")
+
+
+def _ensure_material_generation_ready(material: Material, units: list[KnowledgeUnit]) -> None:
+    material_format = _material_format_value(material)
+    if material_format in (
+        MaterialFormat.IMAGE.value,
+        MaterialFormat.VIDEO.value,
+        MaterialFormat.AUDIO.value,
+    ):
+        raise ValueError("当前素材仅有占位解析结果，请先完成OCR/ASR后再生成试题")
+    if any(_contains_generation_placeholder(unit.content) for unit in units):
+        raise ValueError("素材知识片段仍包含占位解析文本，请先完成OCR/ASR后再生成试题")
+
+
+def _format_keywords(keywords: object) -> str:
+    if not keywords:
+        return ""
+    if isinstance(keywords, dict):
+        values = []
+        for value in keywords.values():
+            if isinstance(value, list):
+                values.extend(str(item) for item in value if str(item).strip())
+            elif str(value).strip():
+                values.append(str(value))
+        return "、".join(values)
+    if isinstance(keywords, list):
+        return "、".join(str(item) for item in keywords if str(item).strip())
+    return str(keywords).strip()
+
+
+def _build_knowledge_unit_prompt_content(ku: KnowledgeUnit) -> str:
+    parts: list[str] = []
+    if ku.title:
+        parts.append(f"【知识单元标题】\n{ku.title}")
+    if ku.summary:
+        parts.append(f"【知识单元摘要】\n{ku.summary}")
+    keyword_text = _format_keywords(ku.keywords)
+    if keyword_text:
+        parts.append(f"【知识关键词】\n{keyword_text}")
+    parts.append(f"【知识单元正文】\n{ku.content}")
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def _knowledge_unit_signature(ku: KnowledgeUnit) -> str:
+    base = " ".join(
+        part.strip()
+        for part in [
+            ku.title or "",
+            ku.summary or "",
+            (ku.content or "")[:160],
+        ]
+        if part and part.strip()
+    )
+    normalized = re.sub(r"\s+", "", base.lower())
+    normalized = re.sub(r"[，。！？；：、“”‘’\"'（）()、,.!?;:\-_/]", "", normalized)
+    return normalized[:160]
+
+
+def _knowledge_unit_keyword_count(keywords: object) -> int:
+    if not keywords:
+        return 0
+    if isinstance(keywords, dict):
+        total = 0
+        for value in keywords.values():
+            if isinstance(value, list):
+                total += sum(1 for item in value if str(item).strip())
+            elif str(value).strip():
+                total += 1
+        return total
+    if isinstance(keywords, list):
+        return sum(1 for item in keywords if str(item).strip())
+    return 1 if str(keywords).strip() else 0
+
+
+def _knowledge_unit_information_score(ku: KnowledgeUnit) -> float:
+    content = (ku.content or "").strip()
+    content_length = len(content)
+    sentence_count = len(re.findall(r"[。！？.!?]", content))
+    keyword_count = _knowledge_unit_keyword_count(ku.keywords)
+
+    score = 1.0
+    score += min(content_length, 1600) / 240
+    score += min(sentence_count, 8) * 0.15
+    if ku.title:
+        score += 1.0
+    if ku.summary:
+        score += 1.25
+    score += min(keyword_count, 6) * 0.35
+    if ku.difficulty:
+        score += max(0, ku.difficulty - 2) * 0.2
+    if content_length < 120:
+        score *= 0.65
+    return max(score, 0.1)
+
+
+def _select_generation_units(
+    units: list[KnowledgeUnit],
+    max_units: Optional[int] = None,
+    selection_mode: str = SELECTION_MODE_STABLE,
+    coverage_penalties: Optional[dict[uuid.UUID, float]] = None,
+) -> list[KnowledgeUnit]:
+    if not units:
+        return []
+
+    normalized_selection_mode = _normalize_selection_mode(selection_mode)
+    penalty_map = coverage_penalties or {}
+    deduped: dict[str, tuple[float, float, KnowledgeUnit]] = {}
+    for ku in units:
+        base_score = _knowledge_unit_information_score(ku)
+        penalty = 0.0
+        if normalized_selection_mode == SELECTION_MODE_COVERAGE:
+            penalty = max(float(penalty_map.get(ku.id, 0.0)), 0.0)
+        score = base_score - penalty
+        signature = _knowledge_unit_signature(ku) or f"ku:{ku.id}"
+        existing = deduped.get(signature)
+        if existing is None or (score, base_score) > (existing[0], existing[1]):
+            deduped[signature] = (score, base_score, ku)
+
+    ranked = sorted(
+        deduped.values(),
+        key=lambda item: (
+            -item[0],
+            -item[1],
+            item[2].chunk_index if item[2].chunk_index is not None else 10**9,
+            str(item[2].id),
+        ),
+    )
+    limited = ranked[:max_units] if max_units else ranked
+    selected = [ku for _, _, ku in limited]
+    return sorted(
+        selected,
+        key=lambda ku: (
+            ku.chunk_index if ku.chunk_index is not None else 10**9,
+            str(ku.id),
+        ),
+    )
+
+
+async def _load_material_generation_penalties(
+    db: AsyncSession,
+    material_id: uuid.UUID,
+    history_window_size: int = COVERAGE_HISTORY_WINDOW_SIZE,
+) -> tuple[dict[uuid.UUID, float], int]:
+    run_result = await db.execute(
+        select(MaterialGenerationRun.id)
+        .where(MaterialGenerationRun.material_id == material_id)
+        .order_by(MaterialGenerationRun.created_at.desc(), MaterialGenerationRun.id.desc())
+        .limit(history_window_size)
+    )
+    recent_run_ids = list(run_result.scalars().all())
+    if not recent_run_ids:
+        return {}, 0
+
+    run_recency_rank = {
+        run_id: index + 1
+        for index, run_id in enumerate(recent_run_ids)
+    }
+    unit_result = await db.execute(
+        select(
+            MaterialGenerationRunUnit.run_id,
+            MaterialGenerationRunUnit.knowledge_unit_id,
+        ).where(MaterialGenerationRunUnit.run_id.in_(recent_run_ids))
+    )
+
+    penalties: dict[uuid.UUID, float] = {}
+    for run_id, knowledge_unit_id in unit_result.all():
+        recency_rank = run_recency_rank.get(run_id)
+        if recency_rank is None:
+            continue
+        penalties[knowledge_unit_id] = penalties.get(knowledge_unit_id, 0.0) + (
+            COVERAGE_RECENCY_PENALTIES.get(recency_rank, 0.0)
+        )
+
+    return (
+        {
+            knowledge_unit_id: min(penalty, COVERAGE_PENALTY_CAP)
+            for knowledge_unit_id, penalty in penalties.items()
+            if penalty > 0
+        },
+        len(recent_run_ids),
+    )
+
+
+async def _select_material_generation_units(
+    db: AsyncSession,
+    material_id: uuid.UUID,
+    units: list[KnowledgeUnit],
+    max_units: Optional[int] = None,
+    selection_mode: str = SELECTION_MODE_STABLE,
+) -> tuple[list[KnowledgeUnit], dict[str, int | str]]:
+    normalized_selection_mode = _normalize_selection_mode(selection_mode)
+    penalties: dict[uuid.UUID, float] = {}
+    history_run_count = 0
+    if normalized_selection_mode == SELECTION_MODE_COVERAGE:
+        penalties, history_run_count = await _load_material_generation_penalties(
+            db=db,
+            material_id=material_id,
+        )
+
+    selected = _select_generation_units(
+        units,
+        max_units=max_units,
+        selection_mode=normalized_selection_mode,
+        coverage_penalties=penalties,
+    )
+    return selected, {
+        "selection_mode": normalized_selection_mode,
+        "history_window_size": COVERAGE_HISTORY_WINDOW_SIZE if normalized_selection_mode == SELECTION_MODE_COVERAGE else 0,
+        "cooled_unit_count": len(penalties),
+        "history_run_count": history_run_count,
+    }
+
+
+def _count_requested_questions(
+    type_distribution: dict[str, int] | list[tuple[str, int]],
+) -> int:
+    items = type_distribution.items() if isinstance(type_distribution, dict) else type_distribution
+    return sum(count for _, count in items if count > 0)
+
+
+def _effective_material_generation_max_units(
+    max_units: Optional[int],
+    requested_total: int,
+) -> Optional[int]:
+    if requested_total <= 0:
+        return max_units
+    if max_units is None:
+        return requested_total
+    return max(max_units, requested_total)
+
+
+def _ensure_material_unique_generation_capacity(
+    units: list[KnowledgeUnit],
+    requested_total: int,
+) -> None:
+    if requested_total <= 0:
+        return
+    unique_unit_count = len(units)
+    if unique_unit_count < requested_total:
+        raise ValueError(
+            f"当前素材去重后仅有 {unique_unit_count} 个可用知识点，不足以生成 {requested_total} 道互不重复知识点的题目"
+        )
+
+
+async def _prepare_material_generation_units(
+    *,
+    db: AsyncSession,
+    material: Material,
+    units: list[KnowledgeUnit],
+    requested_total: int,
+    max_units: Optional[int],
+    selection_mode: str,
+) -> tuple[list[KnowledgeUnit], dict[str, int | str]]:
+    selected_units, selection_stats = await _select_material_generation_units(
+        db=db,
+        material_id=material.id,
+        units=units,
+        max_units=_effective_material_generation_max_units(max_units, requested_total),
+        selection_mode=selection_mode,
+    )
+    if not selected_units:
+        raise ValueError("该素材没有知识单元，请先解析素材")
+    _ensure_material_generation_ready(material, selected_units)
+    _ensure_material_unique_generation_capacity(selected_units, requested_total)
+    return selected_units, selection_stats
+
+
+async def _record_material_generation_run(
+    db: AsyncSession,
+    *,
+    material_id: uuid.UUID,
+    knowledge_unit_ids: list[uuid.UUID | str],
+    selection_mode: str = SELECTION_MODE_STABLE,
+    created_by: Optional[uuid.UUID] = None,
+) -> Optional[MaterialGenerationRun]:
+    normalized_selection_mode = _normalize_selection_mode(selection_mode)
+    ordered_unit_ids: list[uuid.UUID] = []
+    seen_unit_ids: set[uuid.UUID] = set()
+    for raw_unit_id in knowledge_unit_ids:
+        unit_id = _coerce_uuid(raw_unit_id)
+        if unit_id is None or unit_id in seen_unit_ids:
+            continue
+        ordered_unit_ids.append(unit_id)
+        seen_unit_ids.add(unit_id)
+
+    if not ordered_unit_ids:
+        return None
+
+    run = MaterialGenerationRun(
+        material_id=material_id,
+        selection_mode=normalized_selection_mode,
+        created_by=created_by,
+    )
+    db.add(run)
+    await db.flush()
+
+    for selected_order, knowledge_unit_id in enumerate(ordered_unit_ids):
+        db.add(
+            MaterialGenerationRunUnit(
+                run_id=run.id,
+                knowledge_unit_id=knowledge_unit_id,
+                selected_order=selected_order,
+            )
+        )
+    await db.flush()
+    return run
+
+
+def _material_generation_weight(units: list[KnowledgeUnit]) -> float:
+    return sum(_knowledge_unit_information_score(ku) for ku in units) or float(len(units) or 1)
+
+
+def _allocate_counts_by_weights(
+    weighted_items: list[tuple[Hashable, float, tuple]],
+    total_count: int,
+) -> dict[Hashable, int]:
+    if total_count <= 0 or not weighted_items:
+        return {key: 0 for key, _, _ in weighted_items}
+
+    normalized_items = [
+        (key, max(float(weight), 0.1), tie_breaker)
+        for key, weight, tie_breaker in weighted_items
+    ]
+    total_weight = sum(weight for _, weight, _ in normalized_items)
+    raw_allocations = [
+        (key, (total_count * weight / total_weight), tie_breaker)
+        for key, weight, tie_breaker in normalized_items
+    ]
+    allocations = {key: int(raw) for key, raw, _ in raw_allocations}
+    remainder = total_count - sum(allocations.values())
+    ranked_remainders = sorted(
+        raw_allocations,
+        key=lambda item: (-(item[1] - int(item[1])), item[2]),
+    )
+    for key, _, _ in ranked_remainders[:remainder]:
+        allocations[key] += 1
+    return allocations
+
+
+def _plan_unit_type_distribution(
+    units: list[KnowledgeUnit],
+    type_distribution: dict[str, int],
+) -> dict[uuid.UUID, dict[str, int]]:
+    plan = {ku.id: {} for ku in units}
+    positive_distribution = [
+        (question_type, total_count)
+        for question_type, total_count in type_distribution.items()
+        if total_count > 0
+    ]
+    if not units or not positive_distribution:
+        return plan
+
+    unit_scores = {
+        ku.id: _knowledge_unit_information_score(ku)
+        for ku in units
+    }
+    weighted_items = [
+        (
+            ku.id,
+            unit_scores[ku.id],
+            (
+                -unit_scores[ku.id],
+                ku.chunk_index if ku.chunk_index is not None else 10**9,
+                str(ku.id),
+            ),
+        )
+        for ku in units
+    ]
+
+    remaining_by_type = {
+        question_type: total_count
+        for question_type, total_count in positive_distribution
+    }
+    type_order = [question_type for question_type, _ in positive_distribution]
+    available_unit_ids: set[uuid.UUID] = {ku.id for ku in units}
+
+    while any(count > 0 for count in remaining_by_type.values()) and available_unit_ids:
+        progressed = False
+        for question_type in type_order:
+            if remaining_by_type[question_type] <= 0:
+                continue
+
+            chosen_unit_id = next(
+                (
+                    ku_id
+                    for ku_id, _, _ in weighted_items
+                    if ku_id in available_unit_ids
+                ),
+                None,
+            )
+            if chosen_unit_id is None:
+                continue
+
+            plan[chosen_unit_id][question_type] = 1
+            available_unit_ids.remove(chosen_unit_id)
+            remaining_by_type[question_type] -= 1
+            progressed = True
+
+        if not progressed:
+            break
+
+    return plan
+
+
+def _normalize_stem_for_dedupe(stem: str) -> str:
+    normalized = (stem or "").strip().lower()
+    normalized = re.sub(r"\s+", "", normalized)
+    normalized = re.sub(r"[，。！？；：、“”‘’\"'（）()、,.!?;:\-_/]", "", normalized)
+    return normalized
+
+
+def _collect_duplicate_stems(raw_questions: list[dict]) -> list[str]:
+    seen: dict[str, str] = {}
+    duplicates: list[str] = []
+    for raw in raw_questions:
+        stem = str(raw.get("stem", "") or "").strip()
+        signature = _normalize_stem_for_dedupe(stem)
+        if not signature:
+            continue
+        if signature in seen:
+            duplicates.append(stem or seen[signature])
+        else:
+            seen[signature] = stem
+    return list(dict.fromkeys(duplicates))
+
+
+def _question_tag_set(question: dict) -> set[str]:
+    tags = question.get("knowledge_tags") or []
+    if isinstance(tags, str):
+        tags = [tags]
+    return {
+        _normalize_stem_for_dedupe(str(tag))
+        for tag in tags
+        if str(tag).strip()
+    }
+
+
+def _question_tag_overlap(left: dict, right: dict) -> float:
+    left_tags = _question_tag_set(left)
+    right_tags = _question_tag_set(right)
+    if not left_tags or not right_tags:
+        return 0.0
+    return len(left_tags & right_tags) / len(left_tags | right_tags)
+
+
+def _question_similarity(left: dict, right: dict) -> float:
+    left_stem = _normalize_stem_for_dedupe(str(left.get("stem", "") or ""))
+    right_stem = _normalize_stem_for_dedupe(str(right.get("stem", "") or ""))
+    if not left_stem or not right_stem:
+        return 0.0
+
+    stem_ratio = SequenceMatcher(None, left_stem, right_stem).ratio()
+    tag_overlap = _question_tag_overlap(left, right)
+
+    same_type_bonus = 0.05 if left.get("question_type") == right.get("question_type") else 0.0
+    same_source_bonus = 0.08 if (
+        left.get("source_knowledge_unit_id")
+        and left.get("source_knowledge_unit_id") == right.get("source_knowledge_unit_id")
+    ) else 0.0
+    same_material_bonus = 0.04 if (
+        left.get("source_material_id")
+        and left.get("source_material_id") == right.get("source_material_id")
+    ) else 0.0
+
+    return max(
+        stem_ratio,
+        (
+            (stem_ratio * 0.75)
+            + (tag_overlap * 0.25)
+            + same_type_bonus
+            + same_source_bonus
+            + same_material_bonus
+        ),
+    )
+
+
+def _is_near_duplicate_pair(left: dict, right: dict, similarity: Optional[float] = None) -> bool:
+    similarity = similarity if similarity is not None else _question_similarity(left, right)
+    tag_overlap = _question_tag_overlap(left, right)
+    return similarity >= 0.84 or (similarity >= 0.72 and tag_overlap >= 0.5)
+
+
+def _truncate_text(text: str, limit: int = 28) -> str:
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit - 1]}..."
+
+
+def _collect_near_duplicate_pairs(raw_questions: list[dict]) -> list[str]:
+    warnings: list[str] = []
+    for left_index in range(len(raw_questions)):
+        for right_index in range(left_index + 1, len(raw_questions)):
+            left = raw_questions[left_index]
+            right = raw_questions[right_index]
+            similarity = _question_similarity(left, right)
+            if _is_near_duplicate_pair(left, right, similarity):
+                warnings.append(
+                    f"第{left_index + 1}题与第{right_index + 1}题疑似近重复（相似度 {similarity:.2f}）"
+                )
+    return list(dict.fromkeys(warnings))
+
+
+async def _collect_existing_duplicate_stems(
+    db: AsyncSession,
+    raw_questions: list[dict],
+) -> list[str]:
+    stems = sorted(
+        {
+            str(raw.get("stem", "") or "").strip()
+            for raw in raw_questions
+            if str(raw.get("stem", "") or "").strip()
+        }
+    )
+    if not stems:
+        return []
+    result = await db.execute(select(Question.stem).where(Question.stem.in_(stems)))
+    return sorted({stem for stem, in result.all() if stem})
+
+
+async def _load_existing_question_candidates(
+    db: AsyncSession,
+    raw_questions: list[dict],
+) -> dict[str, list[dict]]:
+    requested_types: set[QuestionType] = set()
+    for raw in raw_questions:
+        raw_type = str(raw.get("question_type", "") or "").strip()
+        if not raw_type:
+            continue
+        try:
+            requested_types.add(QuestionType(raw_type))
+        except ValueError:
+            continue
+
+    if not requested_types:
+        return {}
+
+    result = await db.execute(
+        select(
+            Question.id,
+            Question.stem,
+            Question.question_type,
+            Question.dimension,
+            Question.knowledge_tags,
+            Question.source_material_id,
+            Question.source_knowledge_unit_id,
+        ).where(Question.question_type.in_(sorted(requested_types, key=lambda item: item.value)))
+    )
+
+    candidates_by_type: dict[str, list[dict]] = {}
+    for row in result.all():
+        question_type = row.question_type.value if hasattr(row.question_type, "value") else str(row.question_type)
+        candidates_by_type.setdefault(question_type, []).append({
+            "id": row.id,
+            "stem": row.stem,
+            "question_type": question_type,
+            "dimension": row.dimension,
+            "knowledge_tags": row.knowledge_tags,
+            "source_material_id": str(row.source_material_id) if row.source_material_id else None,
+            "source_knowledge_unit_id": str(row.source_knowledge_unit_id) if row.source_knowledge_unit_id else None,
+        })
+    return candidates_by_type
+
+
+async def _collect_existing_near_duplicate_pairs(
+    db: AsyncSession,
+    raw_questions: list[dict],
+) -> list[str]:
+    candidates_by_type = await _load_existing_question_candidates(db, raw_questions)
+    if not candidates_by_type:
+        return []
+
+    warnings: list[str] = []
+    exact_signatures = {
+        _normalize_stem_for_dedupe(str(raw.get("stem", "") or ""))
+        for raw in raw_questions
+        if str(raw.get("stem", "") or "").strip()
+    }
+
+    for index, raw in enumerate(raw_questions, start=1):
+        question_type = str(raw.get("question_type", "") or "").strip()
+        if not question_type:
+            continue
+
+        for candidate in candidates_by_type.get(question_type, []):
+            candidate_signature = _normalize_stem_for_dedupe(candidate.get("stem", ""))
+            if candidate_signature in exact_signatures:
+                continue
+
+            similarity = _question_similarity(raw, candidate)
+            if not _is_near_duplicate_pair(raw, candidate, similarity):
+                continue
+
+            warnings.append(
+                "第"
+                f"{index}题与题库已有题目“{_truncate_text(candidate['stem'])}”"
+                f"疑似近重复（相似度 {similarity:.2f}）"
+            )
+            break
+
+    return list(dict.fromkeys(warnings))
+
+
+def _normalize_review_overall_score(review: dict) -> float:
+    try:
+        return float(review.get("overall_score", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _normalize_bloom_level(value: object) -> Optional[str]:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in BLOOM_LEVEL_ORDER else None
+
+
+def _label_bloom_level(value: Optional[str]) -> str:
+    if not value:
+        return "未标注"
+    return BLOOM_LEVEL_LABELS.get(value, value)
+
+
+def _estimate_bloom_level(question: dict) -> tuple[str, list[str]]:
+    stem = str(question.get("stem", "") or "").strip()
+    question_type = str(question.get("question_type", "") or "").strip()
+    correct_answer = str(question.get("correct_answer", "") or "").strip()
+    reasons: list[str] = []
+
+    keyword_rules = [
+        ("create", ("设计", "制定", "提出", "构建", "撰写", "生成", "规划")),
+        ("evaluate", ("评价", "评估", "最合适", "最合理", "最佳", "优先", "是否合理", "是否恰当", "利弊")),
+        ("analyze", ("分析", "比较", "原因", "影响", "区别", "推断", "拆解", "关联")),
+        ("apply", ("场景", "案例", "做法", "措施", "处理", "操作", "应用", "结合", "如何", "根据")),
+        ("understand", ("解释", "说明", "概括", "意味着", "表明", "理解")),
+        ("remember", ("是什么", "哪项", "下列", "以下", "简称", "定义", "判断")),
+    ]
+    for level, keywords in keyword_rules:
+        if any(keyword in stem for keyword in keywords):
+            reasons.append(f"题干包含“{next(keyword for keyword in keywords if keyword in stem)}”等 { _label_bloom_level(level) } 线索")
+            return level, reasons
+
+    if question_type == "true_false":
+        reasons.append("判断题默认更接近记忆/理解层次")
+        return "remember", reasons
+    if question_type == "fill_blank":
+        reasons.append("填空题默认更接近记忆层次")
+        return "remember", reasons
+    if question_type == "multiple_choice":
+        reasons.append("多选题默认更接近应用层次")
+        return "apply", reasons
+    if question_type == "short_answer":
+        reasons.append("简答题默认更接近分析层次")
+        return "analyze", reasons
+    if question_type == "essay":
+        reasons.append("论述题默认更接近评价层次")
+        return "evaluate", reasons
+    if question_type == "sjt":
+        reasons.append("情境判断题默认更接近应用层次")
+        return "apply", reasons
+    if correct_answer and len(correct_answer) > 12:
+        reasons.append("答案较长，默认上调到理解层次")
+        return "understand", reasons
+
+    reasons.append("题型与题干未出现高阶认知线索，按理解层次估计")
+    return "understand", reasons
+
+
+def _estimate_question_difficulty(
+    question: dict,
+    estimated_bloom_level: Optional[str] = None,
+) -> tuple[int, list[str]]:
+    stem = str(question.get("stem", "") or "").strip()
+    question_type = str(question.get("question_type", "") or "").strip()
+    options = question.get("options") if isinstance(question.get("options"), dict) else {}
+    option_values = [str(value).strip() for value in options.values() if str(value).strip()]
+    correct_answer = str(question.get("correct_answer", "") or "").strip()
+    reasons: list[str] = []
+
+    base_map = {
+        "true_false": 1.0,
+        "single_choice": 2.0,
+        "fill_blank": 2.0,
+        "multiple_choice": 3.0,
+        "short_answer": 4.0,
+        "essay": 5.0,
+        "sjt": 4.0,
+    }
+    score = base_map.get(question_type, 3.0)
+    reasons.append(f"{question_type or 'unknown'} 题型基线难度为 {score:.0f}")
+
+    if len(stem) >= 32:
+        score += 0.4
+        reasons.append("题干较长，理解成本更高")
+    if any(keyword in stem for keyword in ("场景", "案例", "分析", "比较", "原因", "影响", "最合适", "最合理", "为什么", "如何", "综合", "步骤", "策略")):
+        score += 0.8
+        reasons.append("题干包含推理或场景判断要求")
+    if option_values:
+        average_option_length = sum(len(value) for value in option_values) / max(len(option_values), 1)
+        if len(option_values) >= 4 and average_option_length >= 8:
+            score += 0.3
+            reasons.append("选项较长且数量完整")
+    if question_type == "multiple_choice":
+        unique_answers = {char for char in correct_answer if char.isalpha()}
+        if len(unique_answers) >= 3:
+            score += 0.4
+            reasons.append("多选题正确选项较多")
+    if question_type == "true_false" and len(stem) < 18:
+        score -= 0.4
+        reasons.append("判断题题干较短，整体偏易")
+    if question_type in ("short_answer", "essay") and len(correct_answer) >= 30:
+        score += 0.4
+        reasons.append("主观题参考答案较长")
+
+    estimated_bloom_level = _normalize_bloom_level(estimated_bloom_level)
+    if estimated_bloom_level in ("analyze", "evaluate", "create"):
+        score += 0.5
+        reasons.append("认知层次估计偏高，难度上调")
+    elif estimated_bloom_level == "remember":
+        score -= 0.3
+        reasons.append("认知层次估计偏低，难度下调")
+
+    return max(1, min(5, round(score))), reasons
+
+
+def _review_preview_calibration(raw_questions: list[dict]) -> dict:
+    warnings: list[str] = []
+    reviewed_count = 0
+    calibration_warning_count = 0
+    difficulty_mismatch_count = 0
+    difficulty_severe_mismatch_count = 0
+    bloom_mismatch_count = 0
+    bloom_severe_mismatch_count = 0
+
+    for index, question in enumerate(raw_questions, start=1):
+        reviewed_count += 1
+        requested_difficulty = int(question.get("difficulty", 3) or 3)
+        requested_bloom_level = _normalize_bloom_level(question.get("bloom_level"))
+        estimated_bloom_level, bloom_reasons = _estimate_bloom_level(question)
+        estimated_difficulty, difficulty_reasons = _estimate_question_difficulty(
+            question,
+            estimated_bloom_level=estimated_bloom_level,
+        )
+
+        difficulty_gap = abs(estimated_difficulty - requested_difficulty)
+        difficulty_warning = None
+        if difficulty_gap >= 2:
+            difficulty_mismatch_count += 1
+            difficulty_severe_mismatch_count += 1
+            difficulty_warning = (
+                f"声明难度 {requested_difficulty} 与估计难度 {estimated_difficulty} 偏差较大"
+            )
+        elif difficulty_gap == 1:
+            difficulty_mismatch_count += 1
+            difficulty_warning = (
+                f"声明难度 {requested_difficulty} 与估计难度 {estimated_difficulty} 有偏差"
+            )
+
+        bloom_gap = None
+        bloom_warning = None
+        if requested_bloom_level and estimated_bloom_level:
+            bloom_gap = abs(
+                BLOOM_LEVEL_ORDER[requested_bloom_level] - BLOOM_LEVEL_ORDER[estimated_bloom_level]
+            )
+            if bloom_gap >= 2:
+                bloom_mismatch_count += 1
+                bloom_severe_mismatch_count += 1
+                bloom_warning = (
+                    f"声明认知层次“{_label_bloom_level(requested_bloom_level)}”与估计层次“{_label_bloom_level(estimated_bloom_level)}”偏差较大"
+                )
+            elif bloom_gap == 1:
+                bloom_mismatch_count += 1
+                bloom_warning = (
+                    f"声明认知层次“{_label_bloom_level(requested_bloom_level)}”与估计层次“{_label_bloom_level(estimated_bloom_level)}”存在偏差"
+                )
+
+        warning_items = [item for item in (difficulty_warning, bloom_warning) if item]
+        if warning_items:
+            calibration_warning_count += 1
+            warnings.append(f"第{index}题 后验校准提示：{'；'.join(warning_items)}")
+
+        severity = "ok"
+        if difficulty_gap >= 2 or (bloom_gap is not None and bloom_gap >= 2):
+            severity = "severe"
+        elif warning_items:
+            severity = "warn"
+
+        question["calibration_review"] = {
+            "requested_difficulty": requested_difficulty,
+            "estimated_difficulty": estimated_difficulty,
+            "difficulty_gap": difficulty_gap,
+            "requested_bloom_level": requested_bloom_level,
+            "estimated_bloom_level": estimated_bloom_level,
+            "bloom_gap": bloom_gap,
+            "severity": severity,
+            "warnings": warning_items,
+            "difficulty_reasons": difficulty_reasons,
+            "bloom_reasons": bloom_reasons,
+        }
+
+    return {
+        "reviewed_count": reviewed_count,
+        "warning_count": calibration_warning_count,
+        "difficulty_mismatch_count": difficulty_mismatch_count,
+        "difficulty_severe_mismatch_count": difficulty_severe_mismatch_count,
+        "bloom_mismatch_count": bloom_mismatch_count,
+        "bloom_severe_mismatch_count": bloom_severe_mismatch_count,
+        "warnings": warnings,
+    }
+
+
+def _review_preview_questions(raw_questions: list[dict]) -> dict:
+    warnings: list[str] = []
+    blocked_items: list[str] = []
+    reviewed_count = 0
+
+    for index, question in enumerate(raw_questions, start=1):
+        review = ai_review_question(
+            stem=question.get("stem", ""),
+            options=question.get("options"),
+            correct_answer=question.get("correct_answer", ""),
+            explanation=question.get("explanation"),
+            question_type=question.get("question_type", "single_choice"),
+            difficulty=question.get("difficulty", 3),
+            dimension=question.get("dimension"),
+        )
+        question["quality_review"] = review
+        reviewed_count += 1
+
+        recommendation = str(review.get("recommendation", "") or "").lower()
+        overall_score = _normalize_review_overall_score(review)
+        comments = str(review.get("comments", "") or "").strip()
+
+        if recommendation == "reject" or overall_score < 2.5:
+            blocked_items.append(f"第{index}题 AI质检建议拒绝（{overall_score:.1f}分）")
+        elif recommendation == "revise" or overall_score < 3.5:
+            warnings.append(f"第{index}题 AI质检建议修改（{overall_score:.1f}分）：{comments or '题目质量需人工复核'}")
+
+    return {
+        "reviewed_count": reviewed_count,
+        "blocked_items": blocked_items,
+        "warnings": warnings,
+    }
 
 
 async def enrich_question_source_titles(
@@ -404,10 +1297,11 @@ async def generate_from_knowledge_unit(
     ku = result.scalar_one_or_none()
     if not ku:
         raise ValueError(f"Knowledge unit {knowledge_unit_id} not found")
+    _ensure_knowledge_unit_generation_ready(ku)
 
     # Generate via LLM/template
     llm_result = generate_questions_via_llm(
-        content=ku.content,
+        content=_build_knowledge_unit_prompt_content(ku),
         question_types=question_types,
         count=count,
         difficulty=difficulty,
@@ -479,6 +1373,7 @@ async def batch_generate_from_material(
     difficulty: int = 3,
     bloom_level: Optional[str] = None,
     max_units: int = 10,
+    selection_mode: str = SELECTION_MODE_STABLE,
     created_by: Optional[uuid.UUID] = None,
     prompt_seed: Optional[int] = None,
     system_prompt: Optional[str] = None,
@@ -498,12 +1393,18 @@ async def batch_generate_from_material(
         select(KnowledgeUnit)
         .where(KnowledgeUnit.material_id == material_id)
         .order_by(KnowledgeUnit.chunk_index)
-        .limit(max_units)
     )
-    units = list(ku_result.scalars().all())
+    units, _ = await _select_material_generation_units(
+        db=db,
+        material_id=material_id,
+        units=list(ku_result.scalars().all()),
+        max_units=max_units,
+        selection_mode=selection_mode,
+    )
 
     if not units:
         raise ValueError(f"Material {material_id} has no knowledge units. Parse the material first.")
+    _ensure_material_generation_ready(material, units)
 
     all_questions = []
     for ku in units:
@@ -538,6 +1439,7 @@ async def build_question_bank_from_material(
     difficulty: int = 3,
     bloom_level: Optional[str] = None,
     max_units: int = 10,
+    selection_mode: str = SELECTION_MODE_STABLE,
     created_by: Optional[uuid.UUID] = None,
     custom_prompt: Optional[str] = None,
     model_config: Optional[ModelConfig] = None,
@@ -564,15 +1466,20 @@ async def build_question_bank_from_material(
     if mat_status not in ("parsed", "vectorized"):
         raise ValueError(f"素材尚未解析完成，当前状态: {mat_status}")
 
+    requested_total = _count_requested_questions(type_distribution)
     ku_result = await db.execute(
         select(KnowledgeUnit)
         .where(KnowledgeUnit.material_id == material_id)
         .order_by(KnowledgeUnit.chunk_index)
-        .limit(max_units)
     )
-    units = list(ku_result.scalars().all())
-    if not units:
-        raise ValueError("该素材没有知识单元，请先解析素材")
+    await _prepare_material_generation_units(
+        db=db,
+        material=material,
+        units=list(ku_result.scalars().all()),
+        requested_total=requested_total,
+        max_units=max_units,
+        selection_mode=selection_mode,
+    )
 
     preview_result = await preview_question_bank_from_material(
         db=db,
@@ -581,23 +1488,28 @@ async def build_question_bank_from_material(
         difficulty=difficulty,
         bloom_level=bloom_level,
         max_units=max_units,
+        selection_mode=selection_mode,
         custom_prompt=custom_prompt,
         model_config=model_config,
+        created_by=created_by,
         prompt_seed=prompt_seed,
         system_prompt=system_prompt,
         user_prompt_template=user_prompt_template,
     )
+    preview_stats = preview_result.get("stats") or {}
     questions = await batch_create_from_raw(
         db=db,
         raw_questions=preview_result.get("questions", []),
         created_by=created_by,
     )
-    return {"questions": questions, "stats": preview_result.get("stats")}
+    return {"questions": questions, "stats": preview_stats}
 
 
 async def suggest_question_distribution(
     db: AsyncSession,
     material_id: uuid.UUID,
+    max_units: Optional[int] = None,
+    selection_mode: str = SELECTION_MODE_STABLE,
 ) -> dict:
     """Analyze a material and suggest optimal question type distribution."""
     mat_result = await db.execute(
@@ -612,11 +1524,18 @@ async def suggest_question_distribution(
         .where(KnowledgeUnit.material_id == material_id)
         .order_by(KnowledgeUnit.chunk_index)
     )
-    units = list(ku_result.scalars().all())
+    units, selection_stats = await _select_material_generation_units(
+        db=db,
+        material_id=material_id,
+        units=list(ku_result.scalars().all()),
+        max_units=max_units,
+        selection_mode=selection_mode,
+    )
     total_units = len(units)
 
     if total_units == 0:
         raise ValueError("该素材没有知识单元，请先解析素材")
+    _ensure_material_generation_ready(material, units)
 
     total_content_length = sum(len(u.content or "") for u in units)
 
@@ -631,15 +1550,19 @@ async def suggest_question_distribution(
     # Boost for longer content
     if total_content_length > 5000:
         total_questions = min(total_questions + 5, 40)
+    total_questions = min(total_questions, total_units)
 
     # Distribute by type ratios: single 40%, true_false 20%, multiple 15%, short_answer 15%, fill_blank 10%
-    dist = {
-        "single_choice": max(1, round(total_questions * 0.40)),
-        "multiple_choice": max(0, round(total_questions * 0.15)),
-        "true_false": max(1, round(total_questions * 0.20)),
-        "fill_blank": max(0, round(total_questions * 0.10)),
-        "short_answer": max(0, round(total_questions * 0.15)),
-    }
+    dist = _allocate_counts_by_weights(
+        [
+            ("single_choice", 0.40, (0, "single_choice")),
+            ("true_false", 0.20, (1, "true_false")),
+            ("multiple_choice", 0.15, (2, "multiple_choice")),
+            ("short_answer", 0.15, (3, "short_answer")),
+            ("fill_blank", 0.10, (4, "fill_blank")),
+        ],
+        total_questions,
+    )
 
     # Determine average difficulty from knowledge units
     difficulties = [u.difficulty for u in units if u.difficulty]
@@ -654,6 +1577,7 @@ async def suggest_question_distribution(
         "suggested_distribution": dist,
         "suggested_total": actual_total,
         "difficulty": avg_difficulty,
+        "selection_mode": selection_stats["selection_mode"],
     }
 
 
@@ -748,8 +1672,10 @@ async def preview_question_bank_from_material(
     difficulty: int = 3,
     bloom_level: Optional[str] = None,
     max_units: int = 10,
+    selection_mode: str = SELECTION_MODE_STABLE,
     custom_prompt: Optional[str] = None,
     model_config: Optional[ModelConfig] = None,
+    created_by: Optional[uuid.UUID] = None,
     prompt_seed: Optional[int] = None,
     system_prompt: Optional[str] = None,
     user_prompt_template: Optional[str] = None,
@@ -771,17 +1697,35 @@ async def preview_question_bank_from_material(
     if mat_status not in ("parsed", "vectorized"):
         raise ValueError(f"素材尚未解析完成，当前状态: {mat_status}")
 
+    requested_total = _count_requested_questions(type_distribution)
     ku_result = await db.execute(
         select(KnowledgeUnit)
         .where(KnowledgeUnit.material_id == material_id)
         .order_by(KnowledgeUnit.chunk_index)
-        .limit(max_units)
     )
-    units = list(ku_result.scalars().all())
-    if not units:
-        raise ValueError("该素材没有知识单元，请先解析素材")
-
-    num_units = len(units)
+    units, selection_stats = await _prepare_material_generation_units(
+        db=db,
+        material=material,
+        units=list(ku_result.scalars().all()),
+        requested_total=requested_total,
+        max_units=max_units,
+        selection_mode=selection_mode,
+    )
+    unit_type_plan = _plan_unit_type_distribution(units, type_distribution)
+    planned_total = sum(
+        sum(type_counts.values())
+        for type_counts in unit_type_plan.values()
+    )
+    _ensure_material_unique_generation_capacity(units, requested_total)
+    if planned_total < requested_total:
+        raise ValueError(
+            f"当前素材去重后仅有 {planned_total} 个可用知识点，不足以生成 {requested_total} 道互不重复知识点的题目"
+        )
+    planned_unit_ids = [
+        ku.id
+        for ku in units
+        if any(count > 0 for count in unit_type_plan.get(ku.id, {}).values())
+    ]
     last_result: dict | None = None
     last_reasons: list[str] = []
 
@@ -800,17 +1744,15 @@ async def preview_question_bank_from_material(
         for qtype, total_count in type_distribution.items():
             if total_count <= 0:
                 continue
-            base = total_count // num_units
-            remainder = total_count % num_units
             type_generated = 0
 
-            for i, ku in enumerate(units):
-                count_for_unit = base + (1 if i < remainder else 0)
+            for ku in units:
+                count_for_unit = unit_type_plan.get(ku.id, {}).get(qtype, 0)
                 if count_for_unit <= 0:
                     continue
 
                 llm_result = generate_questions_via_llm(
-                    content=ku.content,
+                    content=_build_knowledge_unit_prompt_content(ku),
                     question_types=[qtype],
                     count=count_for_unit,
                     difficulty=difficulty,
@@ -864,6 +1806,39 @@ async def preview_question_bank_from_material(
             all_preview,
             strict_material_rules=True,
         )
+        existing_duplicates = await _collect_existing_duplicate_stems(db, all_preview)
+        existing_duplicate_warnings = [
+            f"题库中已存在同题干题目：{_truncate_text(stem, limit=36)}"
+            for stem in existing_duplicates[:5]
+        ]
+        near_duplicate_warnings = _collect_near_duplicate_pairs(all_preview)
+        existing_near_duplicate_warnings = await _collect_existing_near_duplicate_pairs(db, all_preview)
+        quality_review_summary = _review_preview_questions(all_preview)
+        calibration_summary = _review_preview_calibration(all_preview)
+        generated_total = len(all_preview)
+        quality_gate_failed = (
+            bool(validation["reasons"])
+            or bool(existing_duplicates)
+            or bool(near_duplicate_warnings)
+            or bool(existing_near_duplicate_warnings)
+            or bool(quality_review_summary["blocked_items"])
+            or fallback_count > 0
+            or generated_total < requested_total
+        )
+        save_blocked = False
+        warnings: list[str] = []
+        if generated_total < requested_total:
+            warnings.append(f"实际仅生成 {generated_total} 道题，少于目标 {requested_total} 道")
+        if fallback_count > 0:
+            warnings.append("本次生成触发了降级模板，请关注结果中的风险提示")
+        if validation["reasons"]:
+            warnings.extend(validation["reasons"])
+        warnings.extend(existing_duplicate_warnings)
+        warnings.extend(near_duplicate_warnings)
+        warnings.extend(existing_near_duplicate_warnings)
+        warnings.extend(quality_review_summary["warnings"])
+        warnings.extend(quality_review_summary["blocked_items"])
+        warnings.extend(calibration_summary["warnings"])
         duration = round(time.time() - start_time, 2)
         stats = {
             **total_usage,
@@ -873,9 +1848,35 @@ async def preview_question_bank_from_material(
             "errors": errors,
             "generation_attempts": attempt,
             "validation_reasons": validation["reasons"],
+            "requested_total": requested_total,
+            "generated_total": generated_total,
+            "quality_gate_failed": quality_gate_failed,
+            "save_blocked": save_blocked,
+            "quality_review_count": quality_review_summary["reviewed_count"],
+            "quality_review_blocked": len(quality_review_summary["blocked_items"]),
+            "near_duplicate_count": len(near_duplicate_warnings),
+            "existing_near_duplicate_count": len(existing_near_duplicate_warnings),
+            "calibration_review_count": calibration_summary["reviewed_count"],
+            "calibration_warning_count": calibration_summary["warning_count"],
+            "difficulty_mismatch_count": calibration_summary["difficulty_mismatch_count"],
+            "difficulty_severe_mismatch_count": calibration_summary["difficulty_severe_mismatch_count"],
+            "bloom_mismatch_count": calibration_summary["bloom_mismatch_count"],
+            "bloom_severe_mismatch_count": calibration_summary["bloom_severe_mismatch_count"],
+            "selection_mode": selection_stats["selection_mode"],
+            "history_window_size": selection_stats["history_window_size"],
+            "cooled_unit_count": selection_stats["cooled_unit_count"],
+            "warnings": list(dict.fromkeys(warnings)),
         }
         last_result = {"questions": all_preview, "stats": stats}
-        if validation["passed"]:
+        if validation["passed"] and not quality_gate_failed:
+            if generated_total > 0 and planned_unit_ids:
+                await _record_material_generation_run(
+                    db=db,
+                    material_id=material_id,
+                    knowledge_unit_ids=planned_unit_ids,
+                    selection_mode=selection_stats["selection_mode"],
+                    created_by=created_by,
+                )
             return last_result
 
         last_reasons = validation["reasons"]
@@ -886,6 +1887,14 @@ async def preview_question_bank_from_material(
             "; ".join(last_reasons),
         )
 
+    if last_result and last_result.get("questions") and planned_unit_ids:
+        await _record_material_generation_run(
+            db=db,
+            material_id=material_id,
+            knowledge_unit_ids=planned_unit_ids,
+            selection_mode=selection_stats["selection_mode"],
+            created_by=created_by,
+        )
     return last_result or {"questions": [], "stats": {"validation_reasons": last_reasons}}
 
 
@@ -906,6 +1915,7 @@ def preview_questions_free(
     errors: list[str] = []
     fallback_count = 0
     start_time = time.time()
+    requested_total = sum(count for count in type_distribution.values() if count > 0)
 
     for qtype, count in type_distribution.items():
         if count <= 0:
@@ -961,12 +1971,46 @@ def preview_questions_free(
         type_counts[qtype] = type_generated
 
     duration = round(time.time() - start_time, 2)
+    generated_total = len(all_preview)
+    near_duplicate_warnings = _collect_near_duplicate_pairs(all_preview)
+    quality_review_summary = _review_preview_questions(all_preview)
+    calibration_summary = _review_preview_calibration(all_preview)
+    warnings: list[str] = []
+    if generated_total < requested_total:
+        warnings.append(f"实际仅生成 {generated_total} 道题，少于目标 {requested_total} 道")
+    if fallback_count > 0:
+        warnings.append("本次生成触发了降级模板，请关注结果中的风险提示")
+    warnings.extend(near_duplicate_warnings)
+    warnings.extend(quality_review_summary["warnings"])
+    warnings.extend(quality_review_summary["blocked_items"])
+    warnings.extend(calibration_summary["warnings"])
+    quality_gate_failed = (
+        fallback_count > 0
+        or generated_total < requested_total
+        or bool(near_duplicate_warnings)
+        or bool(quality_review_summary["blocked_items"])
+    )
+    save_blocked = False
     stats = {
         **total_usage,
         "duration_seconds": duration,
         "type_counts": type_counts,
         "fallback_count": fallback_count,
         "errors": errors,
+        "requested_total": requested_total,
+        "generated_total": generated_total,
+        "quality_gate_failed": quality_gate_failed,
+        "save_blocked": save_blocked,
+        "quality_review_count": quality_review_summary["reviewed_count"],
+        "quality_review_blocked": len(quality_review_summary["blocked_items"]),
+        "near_duplicate_count": len(near_duplicate_warnings),
+        "calibration_review_count": calibration_summary["reviewed_count"],
+        "calibration_warning_count": calibration_summary["warning_count"],
+        "difficulty_mismatch_count": calibration_summary["difficulty_mismatch_count"],
+        "difficulty_severe_mismatch_count": calibration_summary["difficulty_severe_mismatch_count"],
+        "bloom_mismatch_count": calibration_summary["bloom_mismatch_count"],
+        "bloom_severe_mismatch_count": calibration_summary["bloom_severe_mismatch_count"],
+        "warnings": list(dict.fromkeys(warnings)),
     }
     return {"questions": all_preview, "stats": stats}
 
@@ -977,6 +2021,39 @@ async def batch_create_from_raw(
     created_by: Optional[uuid.UUID] = None,
 ) -> list:
     """Batch save preview question dicts to DB. Used after user review."""
+    payload_duplicates = _collect_duplicate_stems(raw_questions)
+    near_duplicates = _collect_near_duplicate_pairs(raw_questions)
+    existing_duplicates = await _collect_existing_duplicate_stems(db, raw_questions)
+    existing_near_duplicates = await _collect_existing_near_duplicate_pairs(db, raw_questions)
+
+    material_linked_questions = [
+        raw for raw in raw_questions
+        if raw.get("source_material_id") or raw.get("source_knowledge_unit_id")
+    ]
+    validation = {"passed": True, "reasons": []}
+    if material_linked_questions:
+        validation = _validate_generated_question_set(
+            material_linked_questions,
+            strict_material_rules=True,
+        )
+
+    quality_signals: list[str] = []
+    if payload_duplicates:
+        quality_signals.append(f"重复题干 {len(payload_duplicates)} 个")
+    if near_duplicates:
+        quality_signals.append(f"批内近重复 {len(near_duplicates)} 个")
+    if existing_duplicates:
+        quality_signals.append(f"题库同题干重复 {len(existing_duplicates)} 个")
+    if existing_near_duplicates:
+        quality_signals.append(f"题库近重复 {len(existing_near_duplicates)} 个")
+    if validation["reasons"]:
+        quality_signals.append(f"素材严格校验命中 {len(validation['reasons'])} 条")
+    if quality_signals:
+        logger.warning(
+            "Saving preview questions with quality warnings: %s",
+            "；".join(quality_signals),
+        )
+
     questions = []
     for raw in raw_questions:
         try:
@@ -1012,11 +2089,26 @@ async def batch_create_from_raw(
 async def get_question_stats(
     db: AsyncSession,
     dimension: Optional[str] = None,
+    status: Optional[str] = None,
+    question_type: Optional[str] = None,
+    difficulty: Optional[int] = None,
+    keyword: Optional[str] = None,
+    created_by: Optional[uuid.UUID] = None,
 ) -> dict:
     """Get question bank statistics."""
     conditions = []
     if dimension:
         conditions.append(Question.dimension == dimension)
+    if status:
+        conditions.append(Question.status == QuestionStatus(status))
+    if question_type:
+        conditions.append(Question.question_type == QuestionType(question_type))
+    if difficulty:
+        conditions.append(Question.difficulty == difficulty)
+    if keyword:
+        conditions.append(Question.stem.ilike(f"%{keyword}%"))
+    if created_by:
+        conditions.append(Question.created_by == created_by)
 
     where_clause = and_(*conditions) if conditions else True
 
@@ -1051,9 +2143,69 @@ async def get_question_stats(
     diff_result = await db.execute(diff_q)
     by_difficulty = {str(row[0]): row[1] for row in diff_result.all()}
 
+    bloom_q = (
+        select(Question.bloom_level, func.count(Question.id))
+        .where(and_(where_clause, Question.bloom_level.isnot(None)))
+        .group_by(Question.bloom_level)
+    )
+    bloom_result = await db.execute(bloom_q)
+    by_bloom_level = {
+        row[0].value if hasattr(row[0], "value") else str(row[0]): row[1]
+        for row in bloom_result.all()
+    }
+
+    missing_dimension_count = (
+        await db.execute(
+            select(func.count(Question.id)).where(
+                and_(
+                    where_clause,
+                    or_(Question.dimension.is_(None), Question.dimension == ""),
+                )
+            )
+        )
+    ).scalar() or 0
+    missing_bloom_level_count = (
+        await db.execute(
+            select(func.count(Question.id)).where(
+                and_(where_clause, Question.bloom_level.is_(None))
+            )
+        )
+    ).scalar() or 0
+    missing_explanation_count = (
+        await db.execute(
+            select(func.count(Question.id)).where(
+                and_(
+                    where_clause,
+                    or_(Question.explanation.is_(None), Question.explanation == ""),
+                )
+            )
+        )
+    ).scalar() or 0
+    source_linked_count = (
+        await db.execute(
+            select(func.count(Question.id)).where(
+                and_(
+                    where_clause,
+                    or_(
+                        Question.source_material_id.isnot(None),
+                        Question.source_knowledge_unit_id.isnot(None),
+                    ),
+                )
+            )
+        )
+    ).scalar() or 0
+
     return {
         "total": total,
         "by_status": by_status,
         "by_type": by_type,
         "by_difficulty": by_difficulty,
+        "by_bloom_level": by_bloom_level,
+        "quality_metrics": {
+            "missing_dimension_count": missing_dimension_count,
+            "missing_bloom_level_count": missing_bloom_level_count,
+            "missing_explanation_count": missing_explanation_count,
+            "source_linked_count": source_linked_count,
+            "source_unlinked_count": max(int(total or 0) - int(source_linked_count or 0), 0),
+        },
     }

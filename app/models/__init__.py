@@ -1,5 +1,6 @@
 from app.models.user import User, Role
 from app.models.material import Material, KnowledgeUnit
+from app.models.material_generation import MaterialGenerationRun, MaterialGenerationRunUnit
 from app.models.question import Question, ReviewRecord
 from app.models.exam import Exam, ExamQuestion
 from app.models.answer import AnswerSheet, Answer
@@ -19,6 +20,8 @@ __all__ = [
     "Role",
     "Material",
     "KnowledgeUnit",
+    "MaterialGenerationRun",
+    "MaterialGenerationRunUnit",
     "Question",
     "ReviewRecord",
     "Exam",

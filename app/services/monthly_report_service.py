@@ -1,6 +1,6 @@
 """Monthly report service - auto-generate platform operations reports."""
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import select, func, and_
@@ -13,6 +13,7 @@ from app.models.answer import AnswerSheet, AnswerSheetStatus
 from app.models.score import Score, ScoreDetail
 from app.models.user import User
 from app.models.report import Report
+from app.services.question_service import get_question_stats
 
 
 async def generate_monthly_report(
@@ -30,7 +31,8 @@ async def generate_monthly_report(
     # Gather all metrics
     test_stats = await _test_volume_stats(db, start_date, end_date)
     score_stats = await _scoring_stats(db, start_date, end_date)
-    question_health = await _question_bank_health(db)
+    previous_report = await _get_previous_monthly_report(db, start_date)
+    question_health = await _question_bank_health(db, previous_report=previous_report)
     material_stats = await _material_stats(db, start_date, end_date)
     user_stats = await _user_stats(db, start_date, end_date)
     recommendations = _generate_recommendations(
@@ -200,16 +202,122 @@ async def _scoring_stats(db: AsyncSession, start: datetime, end: datetime) -> di
     }
 
 
-async def _question_bank_health(db: AsyncSession) -> dict:
-    """Current state of the question bank."""
-    # Total questions by status
+async def _get_previous_monthly_report(
+    db: AsyncSession,
+    current_start: datetime,
+) -> Optional[Report]:
+    """Get the previous monthly report for trend comparison."""
     result = await db.execute(
-        select(Question.status, func.count(Question.id))
-        .group_by(Question.status)
+        select(Report)
+        .where(
+            and_(
+                Report.report_type == "monthly",
+                Report.period_end != None,
+                Report.period_end <= current_start,
+            )
+        )
+        .order_by(Report.period_end.desc(), Report.created_at.desc())
+        .limit(1)
     )
-    status_counts = {r[0].value if hasattr(r[0], 'value') else r[0]: r[1] for r in result.all()}
+    return result.scalars().first()
 
-    total = sum(status_counts.values())
+
+def _quality_issue_total(metrics: dict) -> int:
+    """Aggregate outstanding metadata quality issues for trend comparison."""
+    return (
+        metrics.get("missing_dimension_count", 0)
+        + metrics.get("missing_bloom_level_count", 0)
+        + metrics.get("missing_explanation_count", 0)
+    )
+
+
+def _report_period_label(report: Optional[Report]) -> Optional[str]:
+    """Build a stable YYYY-MM period label for a stored report."""
+    if not report:
+        return None
+    content = report.content or {}
+    if isinstance(content, dict) and content.get("period"):
+        return content["period"]
+    if report.period_start:
+        return report.period_start.strftime("%Y-%m")
+    return None
+
+
+def _build_question_bank_trend(current: dict, previous_report: Optional[Report]) -> dict:
+    """Compare the current question bank health snapshot with the previous month."""
+    if not previous_report or not isinstance(previous_report.content, dict):
+        return {
+            "has_previous": False,
+            "previous_period": None,
+            "direction": "insufficient_data",
+            "health_score_delta": 0,
+            "quality_issue_total_delta": 0,
+            "approved_count_delta": 0,
+            "low_discrimination_count_delta": 0,
+            "quality_metric_deltas": {},
+        }
+
+    previous_health = previous_report.content.get("question_bank_health") or {}
+    if not isinstance(previous_health, dict):
+        return {
+            "has_previous": False,
+            "previous_period": None,
+            "direction": "insufficient_data",
+            "health_score_delta": 0,
+            "quality_issue_total_delta": 0,
+            "approved_count_delta": 0,
+            "low_discrimination_count_delta": 0,
+            "quality_metric_deltas": {},
+        }
+
+    current_metrics = current.get("quality_metrics", {})
+    previous_metrics = previous_health.get("quality_metrics") or {}
+    metric_keys = [
+        "missing_dimension_count",
+        "missing_bloom_level_count",
+        "missing_explanation_count",
+        "source_linked_count",
+        "source_unlinked_count",
+    ]
+    quality_metric_deltas = {
+        key: current_metrics.get(key, 0) - previous_metrics.get(key, 0)
+        for key in metric_keys
+    }
+
+    health_score_delta = round(
+        current.get("health_score", 0) - previous_health.get("health_score", 0),
+        1,
+    )
+    quality_issue_total_delta = (
+        _quality_issue_total(current_metrics) - _quality_issue_total(previous_metrics)
+    )
+
+    direction = "stable"
+    if health_score_delta >= 3 or quality_issue_total_delta <= -1:
+        direction = "improving"
+    elif health_score_delta <= -3 or quality_issue_total_delta >= 1:
+        direction = "declining"
+
+    return {
+        "has_previous": True,
+        "previous_period": _report_period_label(previous_report),
+        "direction": direction,
+        "health_score_delta": health_score_delta,
+        "quality_issue_total_delta": quality_issue_total_delta,
+        "approved_count_delta": current.get("approved_count", 0) - previous_health.get("approved_count", 0),
+        "low_discrimination_count_delta": current.get("low_discrimination_count", 0) - previous_health.get("low_discrimination_count", 0),
+        "quality_metric_deltas": quality_metric_deltas,
+    }
+
+
+async def _question_bank_health(
+    db: AsyncSession,
+    previous_report: Optional[Report] = None,
+) -> dict:
+    """Current state of the question bank."""
+    stats = await get_question_stats(db)
+    status_counts = stats["by_status"]
+    total = stats["total"]
     approved = status_counts.get("approved", 0)
 
     # Questions with low discrimination
@@ -230,14 +338,18 @@ async def _question_bank_health(db: AsyncSession) -> dict:
     )
     dimension_dist = {r[0] or "未分类": r[1] for r in result.all()}
 
-    return {
+    health = {
         "total_questions": total,
         "status_distribution": status_counts,
         "approved_count": approved,
         "low_discrimination_count": low_discrimination,
         "dimension_distribution": dimension_dist,
+        "bloom_distribution": stats["by_bloom_level"],
+        "quality_metrics": stats["quality_metrics"],
         "health_score": _calculate_health_score(total, approved, low_discrimination),
     }
+    health["trend"] = _build_question_bank_trend(health, previous_report)
+    return health
 
 
 async def _material_stats(db: AsyncSession, start: datetime, end: datetime) -> dict:
@@ -340,6 +452,61 @@ def _generate_recommendations(
             "category": "题库健康",
             "priority": "高",
             "suggestion": f"题库健康度{question_health['health_score']}分，建议增加审核通过率",
+        })
+
+    quality_metrics = question_health.get("quality_metrics", {})
+    trend = question_health.get("trend", {})
+    quality_metric_deltas = trend.get("quality_metric_deltas", {})
+
+    if trend.get("has_previous") and trend.get("direction") == "declining":
+        previous_period = trend.get("previous_period") or "上期"
+        if trend.get("health_score_delta", 0) < 0:
+            suggestion = (
+                f"相比{previous_period}，题库健康度下降了"
+                f"{abs(trend['health_score_delta']):.1f}分，建议复盘近月新增题目质量"
+            )
+        else:
+            suggestion = (
+                f"相比{previous_period}，题库元数据质量问题增加了"
+                f"{trend.get('quality_issue_total_delta', 0)}项，建议优先补齐标注与解析"
+            )
+        recs.append({
+            "category": "题库趋势",
+            "priority": "中",
+            "suggestion": suggestion,
+        })
+
+    if quality_metrics.get("missing_bloom_level_count", 0) > 0:
+        recs.append({
+            "category": "题目标注",
+            "priority": "中",
+            "suggestion": f"有{quality_metrics['missing_bloom_level_count']}道题缺少 Bloom 标注，建议补齐认知层次",
+        })
+    if quality_metric_deltas.get("missing_bloom_level_count", 0) > 0:
+        previous_period = trend.get("previous_period") or "上期"
+        recs.append({
+            "category": "题目标注趋势",
+            "priority": "中",
+            "suggestion": (
+                f"相比{previous_period}，缺少 Bloom 标注的题目增加了"
+                f"{quality_metric_deltas['missing_bloom_level_count']}道，建议回查最近入库题目"
+            ),
+        })
+    if quality_metrics.get("missing_explanation_count", 0) > 0:
+        recs.append({
+            "category": "题目解析",
+            "priority": "中",
+            "suggestion": f"有{quality_metrics['missing_explanation_count']}道题缺少解析，建议补充解析以提升可复核性",
+        })
+    if quality_metric_deltas.get("missing_explanation_count", 0) > 0:
+        previous_period = trend.get("previous_period") or "上期"
+        recs.append({
+            "category": "题目解析趋势",
+            "priority": "中",
+            "suggestion": (
+                f"相比{previous_period}，缺少解析的题目增加了"
+                f"{quality_metric_deltas['missing_explanation_count']}道，建议检查生成后保存流程"
+            ),
         })
 
     # Materials

@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import posixpath
+import re
 import tempfile
 import zipfile
 from abc import ABC, abstractmethod
@@ -345,18 +346,104 @@ def parse_material(file_data: bytes, filename: str, format: str) -> str:
 
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
-    """Split text into overlapping chunks for vectorization."""
+    """Split text into overlap-aware chunks without breaking structure when possible."""
     sanitized_text = sanitize_text(text)
     if not sanitized_text:
         return []
 
-    chunks = []
-    start = 0
-    while start < len(sanitized_text):
-        end = start + chunk_size
-        chunk = sanitized_text[start:end]
-        if chunk.strip():
-            chunks.append(chunk.strip())
-        start = end - overlap
+    def split_long_segment(segment: str) -> list[str]:
+        if len(segment) <= chunk_size:
+            return [segment]
+
+        sentence_candidates = re.findall(r"[^。！？!?；;\n]+[。！？!?；;]?", segment)
+        sentences = [item.strip() for item in sentence_candidates if item.strip()]
+        if not sentences:
+            return [segment[i:i + chunk_size].strip() for i in range(0, len(segment), chunk_size)]
+
+        parts: list[str] = []
+        current = ""
+        for sentence in sentences:
+            if len(sentence) > chunk_size:
+                if current.strip():
+                    parts.append(current.strip())
+                    current = ""
+                parts.extend(
+                    piece.strip()
+                    for piece in (
+                        sentence[i:i + chunk_size]
+                        for i in range(0, len(sentence), chunk_size)
+                    )
+                    if piece.strip()
+                )
+                continue
+            candidate = f"{current}\n{sentence}".strip() if current else sentence
+            if len(candidate) <= chunk_size:
+                current = candidate
+            else:
+                if current.strip():
+                    parts.append(current.strip())
+                current = sentence
+        if current.strip():
+            parts.append(current.strip())
+        return parts
+
+    raw_segments = [
+        segment.strip()
+        for segment in re.split(r"\n\s*\n+", sanitized_text)
+        if segment.strip()
+    ]
+    if not raw_segments:
+        raw_segments = [sanitized_text.strip()]
+
+    merged_segments: list[str] = []
+    index = 0
+    short_segment_threshold = max(40, chunk_size // 4)
+    while index < len(raw_segments):
+        segment = raw_segments[index]
+        if (
+            len(segment) <= short_segment_threshold
+            and index + 1 < len(raw_segments)
+        ):
+            merged_segments.append(f"{segment}\n\n{raw_segments[index + 1]}".strip())
+            index += 2
+            continue
+        merged_segments.append(segment)
+        index += 1
+
+    segments: list[str] = []
+    for segment in merged_segments:
+        segments.extend(split_long_segment(segment))
+
+    chunks: list[str] = []
+    index = 0
+    while index < len(segments):
+        chunk_start = index
+        current_segments: list[str] = []
+        current_length = 0
+
+        while index < len(segments):
+            segment = segments[index]
+            candidate_length = current_length + len(segment) + (2 if current_segments else 0)
+            if current_segments and candidate_length > chunk_size:
+                break
+            current_segments.append(segment)
+            current_length = candidate_length
+            index += 1
+            if current_length >= chunk_size:
+                break
+
+        chunk = "\n\n".join(current_segments).strip()
+        if chunk:
+            chunks.append(chunk)
+
+        if index >= len(segments):
+            break
+
+        overlap_chars = 0
+        rewind = index
+        while rewind > chunk_start + 1 and overlap_chars < overlap:
+            rewind -= 1
+            overlap_chars += len(segments[rewind])
+        index = max(rewind, chunk_start + 1)
 
     return chunks

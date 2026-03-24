@@ -3,19 +3,21 @@ import uuid
 import zipfile
 import pytest
 from httpx import AsyncClient, ASGITransport
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from app.main import app
 from app.core.database import Base, get_db
 from app.core.config import settings
-from app.services.user_service import init_roles
+from app.core.security import create_access_token
+from app.services.user_service import init_roles, create_user
 from app.services.parsing_service import (
     parse_material, chunk_text,
     PDFParser, EPUBParser, WordParser, MarkdownParser, HTMLParser, CSVParser, JSONParser,
 )
 from app.services.parse_worker import parse_and_store
-from app.models.material import Material, MaterialFormat, MaterialStatus
+from app.models.material import KnowledgeUnit, Material, MaterialFormat, MaterialStatus
+from app.models.question import Question
 
 
 # ---- Unit Tests for Parsers ----
@@ -186,6 +188,15 @@ def test_chunk_text_strips_nul_bytes():
     assert chunks == ["ABCD"]
 
 
+def test_chunk_text_prefers_paragraph_boundaries():
+    text = "第一段第一句。第一段第二句。\n\n第二段第一句。第二段第二句。"
+    chunks = chunk_text(text, chunk_size=20, overlap=5)
+    assert len(chunks) >= 2
+    assert "第一段第一句。" in chunks[0]
+    assert "第一段第二句。" in chunks[0]
+    assert any("第二段第一句" in chunk for chunk in chunks[1:])
+
+
 # ---- PDF Parser Test (with real PyPDF2) ----
 
 def test_pdf_parser():
@@ -291,6 +302,28 @@ async def register_user(client, role="organizer"):
         "role": role,
     })
     return resp.json()["access_token"]
+
+
+async def create_direct_token(role="organizer"):
+    unique = uuid.uuid4().hex[:8]
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = await create_user(
+            session,
+            username=f"direct_{unique}",
+            email=f"direct_{unique}@test.com",
+            password="password123",
+            role_name=role,
+            is_active=True,
+        )
+        await session.commit()
+        token = create_access_token(
+            subject=str(user.id),
+            extra_claims={"role": user.role.name.value},
+        )
+    await engine.dispose()
+    return token
 
 
 @pytest.mark.asyncio
@@ -493,3 +526,221 @@ async def test_auto_parse_on_upload():
     assert resp.status_code == 200
     # Auto-parsing should have created knowledge units
     assert resp.json()["total_units"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_safe_reparse_replaces_units_and_detaches_linked_questions(monkeypatch):
+    async def fake_trigger_parse(_material_id):
+        return None
+
+    async def fake_fetch_file_from_minio(_file_path: str) -> bytes:
+        return b"ignored"
+
+    monkeypatch.setattr("app.api.v1.endpoints.materials.trigger_parse", fake_trigger_parse)
+    monkeypatch.setattr("app.services.parse_worker.fetch_file_from_minio", fake_fetch_file_from_minio)
+    monkeypatch.setattr("app.services.parse_worker.parse_material", lambda *_args, **_kwargs: "AI基础知识")
+    monkeypatch.setattr(
+        "app.services.parse_worker.chunk_text",
+        lambda *_args, **_kwargs: ["旧片段 A", "旧片段 B"],
+    )
+
+    async with get_client() as client:
+        token = await create_direct_token("organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+        upload = await client.post(
+            "/api/v1/materials",
+            files={"file": ("reparse.md", b"content", "text/markdown")},
+            data={"title": "安全重解析素材"},
+            headers=headers,
+        )
+        mid = upload.json()["id"]
+
+        parse_resp = await client.post(f"/api/v1/materials/{mid}/parse", headers=headers)
+        assert parse_resp.status_code == 200
+
+        ku_resp = await client.get(f"/api/v1/materials/{mid}/knowledge-units", headers=headers)
+        assert ku_resp.status_code == 200
+        old_units = ku_resp.json()["units"]
+        assert len(old_units) == 2
+        old_unit_id = old_units[0]["id"]
+
+        question_resp = await client.post(
+            "/api/v1/questions",
+            json={
+                "question_type": "single_choice",
+                "stem": f"重解析解绑题-{uuid.uuid4().hex[:8]}",
+                "correct_answer": "A",
+                "options": {"A": "正确", "B": "错误"},
+                "source_material_id": mid,
+                "source_knowledge_unit_id": old_unit_id,
+            },
+            headers=headers,
+        )
+        assert question_resp.status_code == 201
+        question_id = question_resp.json()["id"]
+
+        monkeypatch.setattr(
+            "app.services.parse_worker.chunk_text",
+            lambda *_args, **_kwargs: ["新片段 A"],
+        )
+
+        reparse_resp = await client.post(f"/api/v1/materials/{mid}/reparse", headers=headers)
+        assert reparse_resp.status_code == 200
+        result = reparse_resp.json()
+        assert result["old_unit_count"] == 2
+        assert result["new_unit_count"] == 1
+        assert result["detached_question_count"] == 1
+        assert result["deleted_vector_count"] == 0
+        assert result["revectorized"] is False
+        assert result["status"] == "parsed"
+
+        new_ku_resp = await client.get(f"/api/v1/materials/{mid}/knowledge-units", headers=headers)
+        assert new_ku_resp.status_code == 200
+        new_units = new_ku_resp.json()["units"]
+        assert len(new_units) == 1
+        assert new_units[0]["content"] == "新片段 A"
+
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        question = (
+            await session.execute(select(Question).where(Question.id == uuid.UUID(question_id)))
+        ).scalar_one()
+        assert question.source_material_id == uuid.UUID(mid)
+        assert question.source_knowledge_unit_id is None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_safe_reparse_rebuilds_vectors_for_vectorized_material(monkeypatch):
+    async def fake_trigger_parse(_material_id):
+        return None
+
+    async def fake_fetch_file_from_minio(_file_path: str) -> bytes:
+        return b"ignored"
+
+    deleted_material_ids = []
+    inserted_batches = []
+
+    def fake_delete_material_vectors(material_id: str) -> int:
+        deleted_material_ids.append(material_id)
+        return 2
+
+    def fake_insert_vectors(knowledge_unit_ids, material_id, chunk_indices, contents) -> int:
+        inserted_batches.append({
+            "knowledge_unit_ids": knowledge_unit_ids,
+            "material_id": material_id,
+            "chunk_indices": chunk_indices,
+            "contents": contents,
+        })
+        return len(contents)
+
+    monkeypatch.setattr("app.api.v1.endpoints.materials.trigger_parse", fake_trigger_parse)
+    monkeypatch.setattr("app.services.parse_worker.fetch_file_from_minio", fake_fetch_file_from_minio)
+    monkeypatch.setattr("app.services.parse_worker.parse_material", lambda *_args, **_kwargs: "AI基础知识")
+    monkeypatch.setattr(
+        "app.services.parse_worker.chunk_text",
+        lambda *_args, **_kwargs: ["旧片段 A", "旧片段 B"],
+    )
+    monkeypatch.setattr("app.services.vector_service.delete_material_vectors", fake_delete_material_vectors)
+    monkeypatch.setattr("app.services.vector_service.insert_vectors", fake_insert_vectors)
+
+    async with get_client() as client:
+        token = await create_direct_token("organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+        upload = await client.post(
+            "/api/v1/materials",
+            files={"file": ("vectorized.md", b"content", "text/markdown")},
+            data={"title": "向量化重解析素材"},
+            headers=headers,
+        )
+        mid = upload.json()["id"]
+
+        parse_resp = await client.post(f"/api/v1/materials/{mid}/parse", headers=headers)
+        assert parse_resp.status_code == 200
+
+        engine = create_async_engine(settings.DATABASE_URL, echo=False)
+        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with session_factory() as session:
+            material = (
+                await session.execute(select(Material).where(Material.id == uuid.UUID(mid)))
+            ).scalar_one()
+            units = list((
+                await session.execute(
+                    select(KnowledgeUnit)
+                    .where(KnowledgeUnit.material_id == uuid.UUID(mid))
+                    .order_by(KnowledgeUnit.chunk_index)
+                )
+            ).scalars().all())
+            material.status = MaterialStatus.VECTORIZED
+            for unit in units:
+                unit.vector_id = str(unit.id)
+            await session.commit()
+        await engine.dispose()
+
+        monkeypatch.setattr(
+            "app.services.parse_worker.chunk_text",
+            lambda *_args, **_kwargs: ["新片段 A", "新片段 B", "新片段 C"],
+        )
+
+        reparse_resp = await client.post(f"/api/v1/materials/{mid}/reparse", headers=headers)
+
+    assert reparse_resp.status_code == 200
+    result = reparse_resp.json()
+    assert result["old_unit_count"] == 2
+    assert result["new_unit_count"] == 3
+    assert result["deleted_vector_count"] == 2
+    assert result["revectorized"] is True
+    assert result["vectorized_count"] == 3
+    assert result["status"] == "vectorized"
+    assert deleted_material_ids == [mid]
+    assert inserted_batches and inserted_batches[0]["material_id"] == mid
+    assert inserted_batches[0]["contents"] == ["新片段 A", "新片段 B", "新片段 C"]
+
+
+@pytest.mark.asyncio
+async def test_safe_reparse_rejects_placeholder_material_without_deleting_old_units(monkeypatch):
+    async def fake_trigger_parse(_material_id):
+        return None
+
+    async def fake_fetch_file_from_minio(_file_path: str) -> bytes:
+        return b"ignored"
+
+    monkeypatch.setattr("app.api.v1.endpoints.materials.trigger_parse", fake_trigger_parse)
+    monkeypatch.setattr("app.services.parse_worker.fetch_file_from_minio", fake_fetch_file_from_minio)
+    monkeypatch.setattr("app.services.parse_worker.parse_material", lambda *_args, **_kwargs: "AI基础知识")
+    monkeypatch.setattr(
+        "app.services.parse_worker.chunk_text",
+        lambda *_args, **_kwargs: ["旧片段 A", "旧片段 B"],
+    )
+
+    async with get_client() as client:
+        token = await create_direct_token("organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+        upload = await client.post(
+            "/api/v1/materials",
+            files={"file": ("placeholder.png", b"content", "image/png")},
+            data={"title": "占位素材"},
+            headers=headers,
+        )
+        mid = upload.json()["id"]
+
+        parse_resp = await client.post(f"/api/v1/materials/{mid}/parse", headers=headers)
+        assert parse_resp.status_code == 200
+
+        monkeypatch.setattr(
+            "app.services.parse_worker.parse_material",
+            lambda *_args, **_kwargs: "[图片素材: placeholder.png - 待OCR处理]",
+        )
+
+        reparse_resp = await client.post(f"/api/v1/materials/{mid}/reparse", headers=headers)
+        assert reparse_resp.status_code == 400
+        assert "占位解析结果" in reparse_resp.json()["detail"]
+
+        ku_resp = await client.get(f"/api/v1/materials/{mid}/knowledge-units", headers=headers)
+        assert ku_resp.status_code == 200
+        assert ku_resp.json()["total_units"] == 2
+
+        material_resp = await client.get(f"/api/v1/materials/{mid}", headers=headers)
+        assert material_resp.status_code == 200
+        assert material_resp.json()["status"] == "parsed"

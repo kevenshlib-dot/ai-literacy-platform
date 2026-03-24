@@ -22,6 +22,16 @@ from scripts.compare_question_generation import (
     write_run_outputs,
 )
 
+VALID_TEST_USER_PROMPT_TEMPLATE = (
+    "题型={{question_types}}\n"
+    "数量={{count}}\n"
+    "{{difficulty_section}}\n"
+    "{{diversity_rules}}\n"
+    "{{question_plan_section}}\n"
+    "{{custom_requirements}}\n"
+    "{{content_section}}"
+)
+
 
 def test_build_user_prompt_is_deterministic_for_same_seed():
     prompt1 = question_agent._build_user_prompt(
@@ -67,6 +77,28 @@ def test_build_user_prompt_changes_when_seed_changes():
     assert prompt1 != prompt2
 
 
+def test_build_question_plan_is_deterministic_for_same_seed():
+    plan1 = question_agent.build_question_plan(
+        content="【知识单元标题】\n隐私最小化\n\n【知识单元摘要】\n推荐系统上线前需检查脱敏与授权范围。\n\n【知识单元关键词】\n隐私最小化、授权范围、推荐系统\n\n【知识单元正文】\n推荐系统上线前，需要完成数据脱敏、用途评估和访问审计配置。",
+        question_types=["single_choice", "true_false"],
+        count=2,
+        difficulty=3,
+        prompt_seed=42,
+    )
+    plan2 = question_agent.build_question_plan(
+        content="【知识单元标题】\n隐私最小化\n\n【知识单元摘要】\n推荐系统上线前需检查脱敏与授权范围。\n\n【知识单元关键词】\n隐私最小化、授权范围、推荐系统\n\n【知识单元正文】\n推荐系统上线前，需要完成数据脱敏、用途评估和访问审计配置。",
+        question_types=["single_choice", "true_false"],
+        count=2,
+        difficulty=3,
+        prompt_seed=42,
+    )
+
+    assert plan1 == plan2
+    assert len(plan1) == 2
+    assert plan1[0]["knowledge_point"]
+    assert plan1[0]["evidence"]
+
+
 def test_build_user_prompt_material_generation_includes_material_only_rules():
     prompt = question_agent._build_user_prompt(
         content="大模型应用需要隐私脱敏与合规审查。",
@@ -82,6 +114,41 @@ def test_build_user_prompt_material_generation_includes_material_only_rules():
     assert "\"一位……\"开头的题干最多只能出现2题" in prompt
     assert "判断题题干必须是陈述句，禁止使用疑问句" in prompt
     assert "生成后必须先自检" in prompt
+
+
+def test_build_user_prompt_adds_type_hard_rules_for_strict_types():
+    prompt = question_agent._build_user_prompt(
+        content="推荐系统上线前需要完成隐私审查与数据脱敏。",
+        question_types=["true_false", "fill_blank"],
+        count=2,
+        difficulty=3,
+        prompt_seed=42,
+    )
+
+    assert "【题型硬约束——优先级高于多样性要求】" in prompt
+    assert "判断题：题干必须写成可直接判断真假的完整陈述句" in prompt
+    assert "填空题：题干必须包含明确空位标记" in prompt
+    assert "若冲突，以题型硬约束为准" in prompt
+
+
+def test_build_user_prompt_includes_question_plan_section():
+    prompt = question_agent._build_user_prompt(
+        content="【知识单元标题】\n隐私最小化\n\n【知识单元摘要】\n推荐系统上线前需检查脱敏与授权范围。\n\n【知识单元关键词】\n隐私最小化、授权范围、推荐系统\n\n【知识单元正文】\n推荐系统上线前，需要完成数据脱敏、用途评估和访问审计配置。",
+        question_types=["single_choice"],
+        count=1,
+        difficulty=3,
+        prompt_seed=42,
+        question_plan=question_agent.build_question_plan(
+            content="【知识单元标题】\n隐私最小化\n\n【知识单元摘要】\n推荐系统上线前需检查脱敏与授权范围。\n\n【知识单元关键词】\n隐私最小化、授权范围、推荐系统\n\n【知识单元正文】\n推荐系统上线前，需要完成数据脱敏、用途评估和访问审计配置。",
+            question_types=["single_choice"],
+            count=1,
+            difficulty=3,
+            prompt_seed=42,
+        ),
+    )
+
+    assert "【知识点出题规划】" in prompt
+    assert "证据锚点" in prompt
 
 
 def test_build_user_prompt_free_generation_omits_material_only_rules():
@@ -122,12 +189,25 @@ def test_get_compare_models_rejects_unknown_slug():
 def test_request_question_generation_routes_gemini_to_openai_compatible(monkeypatch):
     called = {}
 
-    def fake_openai(model_config, api_key, system_prompt, user_prompt, max_tokens, empty_usage):
+    def fake_openai(
+        model_config,
+        api_key,
+        system_prompt,
+        user_prompt,
+        max_tokens,
+        count,
+        empty_usage,
+        response_format=None,
+        temperature=0.4,
+    ):
         called["slug"] = model_config.slug
         called["api_key"] = api_key
         called["system_prompt"] = system_prompt
         called["user_prompt"] = user_prompt
         called["max_tokens"] = max_tokens
+        called["count"] = count
+        called["response_format"] = response_format
+        called["temperature"] = temperature
         return {"content": "[]", "usage": empty_usage}
 
     monkeypatch.setattr(
@@ -142,6 +222,7 @@ def test_request_question_generation_routes_gemini_to_openai_compatible(monkeypa
         system_prompt="system",
         user_prompt="prompt",
         max_tokens=512,
+        count=2,
         empty_usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     )
 
@@ -151,8 +232,65 @@ def test_request_question_generation_routes_gemini_to_openai_compatible(monkeypa
         "system_prompt": "system",
         "user_prompt": "prompt",
         "max_tokens": 512,
+        "count": 2,
+        "response_format": None,
+        "temperature": 0.4,
     }
     assert result["content"] == "[]"
+
+
+def test_supports_structured_output_skips_local_qwen():
+    assert question_agent._supports_structured_output(get_compare_models(["local_qwen"])[0]) is False
+    assert question_agent._supports_structured_output(get_compare_models(["gemini"])[0]) is True
+
+
+def test_openai_compatible_request_retries_without_response_format(monkeypatch):
+    captured_calls = []
+
+    class FakeUsage:
+        prompt_tokens = 1
+        completion_tokens = 2
+        total_tokens = 3
+
+    class FakeMessage:
+        content = "[]"
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        usage = FakeUsage()
+        choices = [FakeChoice()]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured_calls.append(kwargs)
+            if "response_format" in kwargs:
+                raise Exception("response_format is not supported by this endpoint")
+            return FakeResponse()
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+    monkeypatch.setattr(question_agent, "OpenAI", FakeClient)
+
+    result = question_agent._request_question_generation_openai_compatible(
+        model_config=get_compare_models(["gemini"])[0],
+        api_key="test-key",
+        system_prompt="system",
+        user_prompt="prompt",
+        max_tokens=512,
+        count=2,
+        empty_usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        response_format=question_agent._build_question_response_format(2, ["single_choice"]),
+    )
+
+    assert len(captured_calls) == 2
+    assert "response_format" in captured_calls[0]
+    assert "response_format" not in captured_calls[1]
+    assert result["content"] == "[]"
+    assert result["usage"]["total_tokens"] == 3
 
 
 def test_validate_user_prompt_template_rejects_unknown_placeholder():
@@ -173,7 +311,10 @@ def test_build_user_prompt_supports_custom_template():
         difficulty=3,
         custom_prompt="侧重工作场景",
         prompt_seed=42,
-        user_prompt_template="题型={{question_types}} | 数量={{count}} | 要求={{custom_requirements}}",
+        user_prompt_template=(
+            "题型={{question_types}} | 数量={{count}} | "
+            "{{difficulty_section}} | {{diversity_rules}} | {{question_plan_section}} | {{custom_requirements}} | {{content_section}}"
+        ),
     )
 
     assert "题型=单选题(single_choice)" in prompt
@@ -183,11 +324,19 @@ def test_build_user_prompt_supports_custom_template():
 
 def test_render_user_prompt_keeps_backslashes_in_replacement_values():
     rendered = question_agent.render_user_prompt(
-        "内容={{content_section}}",
-        {"content_section": r"C:\\temp\\demo\\1.txt"},
+        VALID_TEST_USER_PROMPT_TEMPLATE,
+        {
+            "question_types": "单选题(single_choice)",
+            "count": "1",
+            "difficulty_section": "难度=3",
+            "diversity_rules": "多样性约束",
+            "question_plan_section": "规划",
+            "custom_requirements": "",
+            "content_section": r"C:\\temp\\demo\\1.txt",
+        },
     )
 
-    assert rendered == r"内容=C:\\temp\\demo\\1.txt"
+    assert r"C:\\temp\\demo\\1.txt" in rendered
 
 
 def test_disable_thinking_extra_body_skips_gemini_hosts():
@@ -231,6 +380,184 @@ def test_generate_questions_via_llm_marks_fallback_errors(monkeypatch):
     assert result["fallback_used"] is True
     assert "timed out" in result["error"]
     assert len(result["questions"]) == 1
+    assert len(result["question_plan"]) == 1
+
+
+def test_generate_question_plan_via_llm_falls_back_to_local_plan(monkeypatch):
+    monkeypatch.setattr(question_agent, "resolve_api_key", lambda model: "test-key")
+    monkeypatch.setattr(
+        question_agent,
+        "_request_question_generation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("planner timed out")),
+    )
+
+    result = question_agent.generate_question_plan_via_llm(
+        content="【知识单元正文】\n推荐系统上线前，需要完成数据脱敏、用途评估和访问审计配置。",
+        question_types=["single_choice"],
+        count=1,
+        difficulty=3,
+        model_config=get_compare_models(["gemini"])[0],
+        prompt_seed=42,
+    )
+
+    assert result["fallback_used"] is True
+    assert "planner timed out" in result["error"]
+    assert len(result["question_plan"]) == 1
+
+
+def test_generate_questions_via_llm_uses_llm_planner_and_accumulates_usage(monkeypatch):
+    monkeypatch.setattr(question_agent, "resolve_api_key", lambda model: "test-key")
+    responses = [
+        {
+            "content": json.dumps([
+                {
+                    "knowledge_point": "隐私最小化",
+                    "evidence": "推荐系统上线前，需要完成数据脱敏。",
+                    "question_type": "single_choice",
+                    "stem_style": "情景应用型",
+                    "scenario": "职场工作场景（如项目管理、数据分析、内容创作、客户服务）",
+                    "answer_focus": "先做数据脱敏与用途评估",
+                    "distractor_focus": "混入扩大采集或跳过审计等常见误解",
+                    "knowledge_tags": ["隐私最小化", "推荐系统"],
+                    "dimension": "AI伦理安全",
+                }
+            ]),
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        },
+        {
+            "content": json.dumps([
+                {
+                    "question_type": "single_choice",
+                    "dimension": "AI伦理安全",
+                    "stem": "推荐系统上线前，哪项做法最符合隐私最小化原则？",
+                    "options": {"A": "只保留必要字段", "B": "扩大原始日志采集", "C": "长期保存未脱敏数据", "D": "关闭访问审计"},
+                    "correct_answer": "A",
+                    "explanation": "隐私最小化要求只保留完成任务所必需的数据字段。",
+                    "knowledge_tags": ["隐私最小化", "推荐系统"],
+                }
+            ]),
+            "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28},
+        },
+    ]
+    calls = []
+
+    def fake_request(*args, **kwargs):
+        calls.append(kwargs)
+        return responses[len(calls) - 1]
+
+    monkeypatch.setattr(question_agent, "_request_question_generation", fake_request)
+
+    result = question_agent.generate_questions_via_llm(
+        content="【知识单元正文】\n推荐系统上线前，需要完成数据脱敏、用途评估和访问审计配置。",
+        question_types=["single_choice"],
+        count=1,
+        difficulty=3,
+        model_config=get_compare_models(["gemini"])[0],
+        prompt_seed=42,
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["temperature"] == 0.2
+    assert calls[1]["temperature"] == 0.4
+    assert calls[0]["response_format"]["type"] == "json_schema"
+    assert calls[1]["response_format"]["type"] == "json_schema"
+    assert result["usage"]["total_tokens"] == 43
+    assert result["fallback_used"] is False
+    assert result["planner_fallback_used"] is False
+    assert result["question_plan"][0]["knowledge_point"] == "隐私最小化"
+
+
+def test_build_question_response_format_is_type_aware():
+    true_false_schema = question_agent._build_question_response_format(1, ["true_false"])
+    item_schema = true_false_schema["json_schema"]["schema"]["items"]
+
+    assert item_schema["properties"]["question_type"]["const"] == "true_false"
+    assert item_schema["properties"]["options"]["properties"]["A"]["const"] == "正确"
+    assert item_schema["properties"]["correct_answer"]["enum"] == ["A", "B"]
+
+    fill_blank_schema = question_agent._build_question_response_format(1, ["fill_blank"])
+    fill_blank_item = fill_blank_schema["json_schema"]["schema"]["items"]
+    assert fill_blank_item["properties"]["options"]["type"] == "null"
+    assert fill_blank_item["properties"]["stem"]["pattern"]
+
+
+def test_generate_questions_via_llm_retries_strict_type_with_feedback(monkeypatch):
+    monkeypatch.setattr(question_agent, "resolve_api_key", lambda model: "test-key")
+    monkeypatch.setattr(
+        question_agent,
+        "generate_question_plan_via_llm",
+        lambda **kwargs: {
+            "question_plan": [
+                {
+                    "knowledge_point": "隐私审查",
+                    "evidence": "推荐系统上线前仍需完成隐私审查。",
+                    "question_type": "true_false",
+                    "stem_style": "直接知识型",
+                    "scenario": "职场工作场景",
+                    "answer_focus": "仍需完成隐私审查",
+                    "distractor_focus": "混入跳过审查的错误做法",
+                    "knowledge_tags": ["隐私审查"],
+                    "dimension": "AI伦理安全",
+                }
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "fallback_used": False,
+            "error": None,
+        },
+    )
+
+    responses = [
+        {
+            "content": json.dumps([
+                {
+                    "question_type": "true_false",
+                    "dimension": "AI伦理安全",
+                    "stem": "以下哪项说法是正确的？",
+                    "options": {"A": "正确", "B": "错误"},
+                    "correct_answer": "A",
+                    "explanation": "仍需合规审查。",
+                    "knowledge_tags": ["隐私审查"],
+                }
+            ]),
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+        },
+        {
+            "content": json.dumps([
+                {
+                    "question_type": "true_false",
+                    "dimension": "AI伦理安全",
+                    "stem": "推荐系统上线前仍需完成隐私审查。",
+                    "options": {"A": "正确", "B": "错误"},
+                    "correct_answer": "A",
+                    "explanation": "即使数据来自公共来源，也不能跳过审查。",
+                    "knowledge_tags": ["隐私审查"],
+                }
+            ]),
+            "usage": {"prompt_tokens": 13, "completion_tokens": 8, "total_tokens": 21},
+        },
+    ]
+    captured_prompts = []
+
+    def fake_request(*args, **kwargs):
+        captured_prompts.append(args[3])
+        return responses[len(captured_prompts) - 1]
+
+    monkeypatch.setattr(question_agent, "_request_question_generation", fake_request)
+
+    result = question_agent.generate_questions_via_llm(
+        content="【知识单元正文】\n推荐系统上线前仍需完成隐私审查。",
+        question_types=["true_false"],
+        count=1,
+        difficulty=3,
+        model_config=get_compare_models(["gemini"])[0],
+        prompt_seed=42,
+    )
+
+    assert len(captured_prompts) == 2
+    assert "【上次输出问题——本次必须修正】" in captured_prompts[1]
+    assert "判断题题干必须是陈述句" in captured_prompts[1]
+    assert result["fallback_used"] is False
+    assert result["questions"][0]["stem"] == "推荐系统上线前仍需完成隐私审查。"
 
 
 def test_validate_generated_question_set_rejects_material_metadata_duplicates_and_tf_format():

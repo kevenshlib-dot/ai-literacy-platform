@@ -1,3 +1,4 @@
+import logging
 import uuid
 from typing import Optional
 
@@ -9,14 +10,26 @@ from app.agents.question_agent import (
     DEFAULT_QUESTION_USER_PROMPT_TEMPLATE,
     QUESTION_PROMPT_TEMPLATE_PLACEHOLDERS,
     TYPE_LABELS,
+    build_question_plan,
     build_question_prompt_context,
     render_user_prompt,
     validate_user_prompt_template,
 )
 from app.models.material import KnowledgeUnit, Material
 from app.models.question_prompt_profile import QuestionPromptProfile
+from app.services.question_service import (
+    _allocate_counts_by_weights,
+    _build_knowledge_unit_prompt_content,
+    _count_requested_questions,
+    _material_generation_weight,
+    _prepare_material_generation_units,
+    _plan_unit_type_distribution,
+    _select_material_generation_units,
+    _normalize_selection_mode,
+)
 
 PROMPT_TEXT_MAX_LENGTH = 20000
+logger = logging.getLogger(__name__)
 
 
 def get_default_prompt_config() -> dict:
@@ -76,9 +89,27 @@ async def get_effective_prompt_config(
             "placeholders": get_prompt_placeholders(),
         }
 
+    try:
+        validated = validate_prompt_config(
+            profile.system_prompt,
+            profile.user_prompt_template,
+        )
+    except ValueError as exc:
+        logger.warning(
+            "Saved question prompt profile for user %s is invalid after template upgrade, falling back to defaults: %s",
+            user_id,
+            exc,
+        )
+        return {
+            **defaults,
+            "has_saved_config": False,
+            "defaults": defaults,
+            "placeholders": get_prompt_placeholders(),
+        }
+
     return {
-        "system_prompt": profile.system_prompt,
-        "user_prompt_template": profile.user_prompt_template,
+        "system_prompt": validated["system_prompt"],
+        "user_prompt_template": validated["user_prompt_template"],
         "has_saved_config": True,
         "defaults": defaults,
         "placeholders": get_prompt_placeholders(),
@@ -172,6 +203,15 @@ def _render_prompt_preview_item(
     prompt_seed: int,
     title: str,
 ) -> dict:
+    question_plan = build_question_plan(
+        content=content,
+        question_types=question_types,
+        count=count,
+        difficulty=difficulty,
+        bloom_level=bloom_level,
+        custom_prompt=custom_prompt,
+        prompt_seed=prompt_seed,
+    )
     context = build_question_prompt_context(
         content=content,
         question_types=question_types,
@@ -180,6 +220,7 @@ def _render_prompt_preview_item(
         bloom_level=bloom_level,
         custom_prompt=custom_prompt,
         prompt_seed=prompt_seed,
+        question_plan=question_plan,
     )
     return {
         "title": title,
@@ -201,8 +242,11 @@ async def _build_material_prompt_preview_items(
     bloom_level: Optional[str],
     custom_prompt: Optional[str],
     prompt_seed: int,
+    selection_mode: str,
 ) -> list[dict]:
     rendered_items: list[dict] = []
+    material_contexts: list[dict] = []
+    normalized_selection_mode = _normalize_selection_mode(selection_mode)
 
     for material_id in material_ids:
         material = await db.get(Material, material_id)
@@ -213,24 +257,74 @@ async def _build_material_prompt_preview_items(
             select(KnowledgeUnit)
             .where(KnowledgeUnit.material_id == material_id)
             .order_by(KnowledgeUnit.chunk_index)
-            .limit(max_units)
         )
-        units = list(result.scalars().all())
+        units, _ = await _select_material_generation_units(
+            db=db,
+            material_id=material_id,
+            units=list(result.scalars().all()),
+            max_units=max_units,
+            selection_mode=normalized_selection_mode,
+        )
         if not units:
             raise ValueError(f"素材《{material.title}》没有可用于预览的知识单元，请先完成解析")
 
-        num_units = len(units)
-        for question_type, total_count in type_distribution:
-            base = total_count // num_units
-            remainder = total_count % num_units
-            for index, unit in enumerate(units):
-                count_for_unit = base + (1 if index < remainder else 0)
+        material_contexts.append(
+            {
+                "material": material,
+                "units": units,
+                "weight": _material_generation_weight(units),
+            }
+        )
+
+    material_type_plan = {
+        str(item["material"].id): {} for item in material_contexts
+    }
+    for question_type, total_count in type_distribution:
+        allocation = _allocate_counts_by_weights(
+            [
+                (
+                    str(item["material"].id),
+                    item["weight"],
+                    (-item["weight"], item["material"].title or "", str(item["material"].id)),
+                )
+                for item in material_contexts
+            ],
+            total_count,
+        )
+        for material_key, allocated_count in allocation.items():
+            if allocated_count > 0:
+                material_type_plan[material_key][question_type] = allocated_count
+
+    for item in material_contexts:
+        material = item["material"]
+        planned_distribution = material_type_plan.get(str(material.id), {})
+        requested_total = _count_requested_questions(planned_distribution)
+        if requested_total > 0:
+            result = await db.execute(
+                select(KnowledgeUnit)
+                .where(KnowledgeUnit.material_id == material.id)
+                .order_by(KnowledgeUnit.chunk_index)
+            )
+            units, _ = await _prepare_material_generation_units(
+                db=db,
+                material=material,
+                units=list(result.scalars().all()),
+                requested_total=requested_total,
+                max_units=max_units,
+                selection_mode=normalized_selection_mode,
+            )
+        else:
+            units = item["units"]
+        unit_type_plan = _plan_unit_type_distribution(units, planned_distribution)
+
+        for index, unit in enumerate(units):
+            for question_type, count_for_unit in unit_type_plan.get(unit.id, {}).items():
                 if count_for_unit <= 0:
                     continue
                 rendered_items.append(
                     _render_prompt_preview_item(
                         prompt_config=prompt_config,
-                        content=unit.content,
+                        content=_build_knowledge_unit_prompt_content(unit),
                         question_types=[question_type],
                         count=count_for_unit,
                         difficulty=difficulty,
@@ -284,6 +378,7 @@ async def render_generation_prompt_preview(
     prompt_seed: Optional[int] = None,
     material_ids: Optional[list[uuid.UUID]] = None,
     max_units: int = 10,
+    selection_mode: str = "stable",
 ) -> dict:
     prompt_config = await resolve_generation_prompts(
         db=db,
@@ -305,10 +400,13 @@ async def render_generation_prompt_preview(
             bloom_level=bloom_level,
             custom_prompt=custom_prompt,
             prompt_seed=effective_prompt_seed,
+            selection_mode=selection_mode,
         )
+        selection_mode_label = "覆盖优先" if _normalize_selection_mode(selection_mode) == "coverage" else "稳定优先"
         preview_note = (
             f"本次生成将按实际调用顺序向模型发送 {len(rendered_items)} 条用户提示词。"
-            "已选素材模式下，题目会按“素材 / 知识单元 / 题型”拆分调用。"
+            f"已选素材模式下，系统会先生成知识点规划，再按“素材 / 知识单元 / 题型”拆分调用最终出题提示词。"
+            f"当前知识片段策略：{selection_mode_label}。"
         )
     else:
         rendered_items = _build_free_prompt_preview_items(
@@ -321,7 +419,7 @@ async def render_generation_prompt_preview(
         )
         preview_note = (
             f"本次生成将按实际调用顺序向模型发送 {len(rendered_items)} 条用户提示词。"
-            "自由出题模式下，题目会按题型拆分调用。"
+            "自由出题模式下，系统会先构建题目规划，再按题型拆分调用最终出题提示词。"
         )
 
     return {

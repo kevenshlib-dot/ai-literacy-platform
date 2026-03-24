@@ -23,6 +23,7 @@ env/
 .env
 .env.production
 !.env.example
+.env.test
 
 # Docker
 docker-data/

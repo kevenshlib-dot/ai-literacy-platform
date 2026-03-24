@@ -91,6 +91,27 @@
         </a-row>
       </a-card>
 
+      <a-card :bordered="false" style="margin-bottom: 16px" :loading="questionStatsLoading">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap;">
+          <a-space :size="24" wrap>
+            <a-statistic title="题目总数" :value="questionStats?.total || 0" />
+            <a-statistic title="已通过" :value="questionStats?.by_status?.approved || 0" />
+            <a-statistic title="缺维度" :value="questionStats?.quality_metrics?.missing_dimension_count || 0" :value-style="{ color: '#d46b08' }" />
+            <a-statistic title="缺 Bloom" :value="questionStats?.quality_metrics?.missing_bloom_level_count || 0" :value-style="{ color: '#d46b08' }" />
+            <a-statistic title="缺解析" :value="questionStats?.quality_metrics?.missing_explanation_count || 0" :value-style="{ color: '#cf1322' }" />
+            <a-statistic title="已关联素材" :value="questionStats?.quality_metrics?.source_linked_count || 0" />
+          </a-space>
+          <div v-if="questionStats?.by_bloom_level && Object.keys(questionStats.by_bloom_level).length > 0" style="max-width: 420px;">
+            <div style="margin-bottom: 8px; color: #666; font-size: 13px;">认知层次分布</div>
+            <a-space wrap>
+              <a-tag v-for="(count, level) in questionStats.by_bloom_level" :key="level" color="geekblue">
+                {{ bloomSummaryLabel(String(level)) }} {{ count }}
+              </a-tag>
+            </a-space>
+          </div>
+        </div>
+      </a-card>
+
       <!-- Batch Actions -->
       <a-card v-if="selectedRowKeys.length > 0" :bordered="false" style="margin-bottom: 16px">
         <div style="display: flex; justify-content: space-between; align-items: center">
@@ -527,6 +548,33 @@
           <p v-if="aiCheckResult.comments" style="margin-top: 8px; color: #666">{{ aiCheckResult.comments }}</p>
         </a-card>
 
+        <a-card v-if="detailQuestion.calibration_review" title="后验校准" size="small" style="margin-top: 16px">
+          <a-descriptions :column="2" size="small">
+            <a-descriptions-item label="校准结论">
+              <a-tag :color="detailQuestion.calibration_review.severity === 'severe' ? 'red' : detailQuestion.calibration_review.severity === 'warn' ? 'orange' : 'green'">
+                {{ detailQuestion.calibration_review.severity === 'severe' ? '偏差较大' : detailQuestion.calibration_review.severity === 'warn' ? '存在偏差' : '基本一致' }}
+              </a-tag>
+            </a-descriptions-item>
+            <a-descriptions-item label="难度">
+              声明 {{ detailQuestion.calibration_review.requested_difficulty }} / 估计 {{ detailQuestion.calibration_review.estimated_difficulty }}
+            </a-descriptions-item>
+            <a-descriptions-item v-if="detailQuestion.calibration_review.requested_bloom_level" label="认知层次">
+              声明 {{ bloomLabel(detailQuestion.calibration_review.requested_bloom_level) }} / 估计 {{ bloomLabel(detailQuestion.calibration_review.estimated_bloom_level) }}
+            </a-descriptions-item>
+          </a-descriptions>
+          <div v-if="detailQuestion.calibration_review.warnings?.length" style="margin-top: 8px">
+            <a-tag v-for="item in detailQuestion.calibration_review.warnings" :key="item" color="orange" style="margin-bottom: 4px;">
+              {{ item }}
+            </a-tag>
+          </div>
+          <p v-if="detailQuestion.calibration_review.difficulty_reasons?.length" style="margin-top: 8px; color: #666">
+            难度依据：{{ detailQuestion.calibration_review.difficulty_reasons.join('；') }}
+          </p>
+          <p v-if="detailQuestion.calibration_review.bloom_reasons?.length" style="color: #666">
+            Bloom依据：{{ detailQuestion.calibration_review.bloom_reasons.join('；') }}
+          </p>
+        </a-card>
+
         <!-- Review History -->
         <a-card title="审核记录" size="small" style="margin-top: 16px" v-if="reviewHistory.length > 0">
           <a-timeline>
@@ -671,6 +719,17 @@
           :message="bankBuildModal.materialInfo"
           style="margin-bottom: 16px"
         />
+
+        <a-form-item label="知识片段策略">
+          <a-radio-group v-model:value="bankBuildModal.selectionMode" button-style="solid">
+            <a-radio-button value="stable">稳定优先</a-radio-button>
+            <a-radio-button value="coverage">覆盖优先</a-radio-button>
+          </a-radio-group>
+          <div style="margin-top: 8px; color: #999; line-height: 1.6">
+            稳定优先：固定条件下优先选中同一批高价值知识片段。
+            覆盖优先：会参考该素材最近几次建库已命中的知识片段，对高频片段降权，提升未覆盖片段进入候选的机会。
+          </div>
+        </a-form-item>
 
         <a-form-item>
           <template #label>
@@ -839,6 +898,15 @@
             </a-form-item>
           </a-col>
         </a-row>
+
+        <a-form-item label="最多使用知识片段">
+          <a-input-number
+            v-model:value="bankBuildModal.maxUnits"
+            :min="1"
+            :max="50"
+            style="width: 100%"
+          />
+        </a-form-item>
       </a-form>
 
       <div v-if="bankBuildModal.loading" style="margin-top: 16px">
@@ -1009,10 +1077,25 @@
 
       <!-- Preview Stats Summary -->
       <div v-if="previewStats" style="margin-bottom: 12px;">
+        <a-alert
+          v-if="previewWarnings.length > 0"
+          type="warning"
+          show-icon
+          :message="previewHasQualityRisk ? '当前预览包含质量风险，仍可保存为草稿，建议先审阅。' : '当前预览包含质量提醒。'"
+          :description="previewWarnings.join('；')"
+          style="margin-bottom: 12px"
+        />
         <a-space :size="16">
           <span style="color: #666; font-size: 13px;">模型: <b>{{ previewStats.modelName || '-' }}</b></span>
           <span style="color: #666; font-size: 13px;">耗时: <b>{{ previewStats.durationText || '-' }}</b></span>
           <span style="color: #666; font-size: 13px;">Token: <b>{{ previewStats.totalTokens?.toLocaleString() || '-' }}</b></span>
+          <span style="color: #666; font-size: 13px;">目标 / 实际: <b>{{ previewStats.requestedTotal || 0 }} / {{ previewStats.generatedTotal || previewQuestions.length }}</b></span>
+          <span v-if="previewStats.qualityReviewCount" style="color: #666; font-size: 13px;">质检: <b>{{ previewStats.qualityReviewCount }}</b></span>
+          <span v-if="previewStats.nearDuplicateCount" style="color: #d46b08; font-size: 13px;">近重复: <b>{{ previewStats.nearDuplicateCount }}</b></span>
+          <span v-if="previewStats.existingNearDuplicateCount" style="color: #cf1322; font-size: 13px;">题库近重复: <b>{{ previewStats.existingNearDuplicateCount }}</b></span>
+          <span v-if="previewStats.difficultyMismatchCount" style="color: #d46b08; font-size: 13px;">难度偏差: <b>{{ previewStats.difficultyMismatchCount }}</b></span>
+          <span v-if="previewStats.bloomMismatchCount" style="color: #d46b08; font-size: 13px;">Bloom偏差: <b>{{ previewStats.bloomMismatchCount }}</b></span>
+          <span v-if="previewStats.fallbackCount" style="color: #d46b08; font-size: 13px;">降级次数: <b>{{ previewStats.fallbackCount }}</b></span>
         </a-space>
       </div>
 
@@ -1039,6 +1122,16 @@
           <template v-if="column.key === 'dimension'">
             <a-tag v-if="record.dimension" :color="dimensionColor(record.dimension)">{{ record.dimension }}</a-tag>
             <span v-else style="color: #ccc">未分类</span>
+          </template>
+          <template v-if="column.key === 'quality_review'">
+            <a-tag
+              v-if="record.quality_review"
+              :color="record.quality_review.recommendation === 'approve' ? 'green' : record.quality_review.recommendation === 'revise' ? 'orange' : 'red'"
+            >
+              {{ record.quality_review.recommendation === 'approve' ? '通过' : record.quality_review.recommendation === 'revise' ? '修改' : '拒绝' }}
+              {{ typeof record.quality_review.overall_score === 'number' ? ` ${record.quality_review.overall_score}` : '' }}
+            </a-tag>
+            <span v-else style="color: #ccc">未质检</span>
           </template>
           <template v-if="column.key === 'correct_answer'">
             <span style="color: #52c41a; font-weight: 600;">{{ record.correct_answer }}</span>
@@ -1232,7 +1325,9 @@ import request from '@/utils/request'
 const loading = ref(false)
 const submitLoading = ref(false)
 const aiCheckLoading = ref(false)
+const questionStatsLoading = ref(false)
 const questions = ref<any[]>([])
+const questionStats = ref<any>(null)
 const selectedRowKeys = ref<string[]>([])
 const createModalVisible = ref(false)
 const detailVisible = ref(false)
@@ -1335,6 +1430,7 @@ const previewColumns = [
   { title: '题型', key: 'question_type', dataIndex: 'question_type', width: 90 },
   { title: '难度', key: 'difficulty', dataIndex: 'difficulty', width: 140 },
   { title: '维度', key: 'dimension', dataIndex: 'dimension', width: 120, ellipsis: true },
+  { title: '质检', key: 'quality_review', dataIndex: 'quality_review', width: 120 },
   { title: '答案', key: 'correct_answer', dataIndex: 'correct_answer', width: 80 },
   { title: '操作', key: 'preview_actions', width: 100 },
 ]
@@ -1383,6 +1479,7 @@ const scoreMap: Record<string, string> = {
 function typeLabel(t: string) { return typeMap[t] || t }
 function statusLabel(s: string) { return statusMap[s] || s }
 function bloomLabel(b: string) { return bloomMap[b] || b }
+function bloomSummaryLabel(b: string) { return b ? bloomLabel(b) : '未标注' }
 function scoreLabel(k: string) { return scoreMap[k] || k }
 function actionLabel(a: string) {
   return a === 'approve' ? '通过' : a === 'reject' ? '拒绝' : a === 'ai_check' ? 'AI检查' : a
@@ -1457,13 +1554,29 @@ async function fetchQuestions() {
     if (filters.dimension) params.dimension = filters.dimension
     if (filters.only_mine) params.only_mine = true
 
-    const data: any = await request.get('/questions', { params })
+    const [data, statsData]: any[] = await Promise.all([
+      request.get('/questions', { params }),
+      fetchQuestionStats(params),
+    ])
     questions.value = data.items || []
     pagination.total = data.total || 0
+    questionStats.value = statsData
   } catch (e) {
     message.error('加载题目列表失败')
   } finally {
     loading.value = false
+  }
+}
+
+async function fetchQuestionStats(baseParams?: Record<string, any>) {
+  questionStatsLoading.value = true
+  try {
+    const params = { ...(baseParams || {}) }
+    delete params.skip
+    delete params.limit
+    return await request.get('/questions/stats', { params }) as any
+  } finally {
+    questionStatsLoading.value = false
   }
 }
 
@@ -2032,8 +2145,10 @@ const bankBuildModal = reactive({
   promptConfigCollapsed: true,
   materialIds: [] as string[],
   materialInfo: null as string | null,
+  selectionMode: 'stable' as 'stable' | 'coverage',
   difficulty: 3,
   bloomLevel: undefined as string | undefined,
+  maxUnits: 10,
   customPrompt: '',
   systemPrompt: '',
   userPromptTemplate: '',
@@ -2080,6 +2195,13 @@ const previewQuestions = ref<any[]>([])
 const previewSelectedKeys = ref<string[]>([])
 const previewSaving = ref(false)
 const previewStats = ref<any>(null)
+const previewWarnings = computed(() => {
+  if (!previewStats.value?.warnings) return []
+  return (previewStats.value.warnings as string[]).filter(Boolean)
+})
+const previewHasQualityRisk = computed(() => (
+  !!previewStats.value?.qualityGateFailed || previewWarnings.value.length > 0
+))
 
 // Candidate selector
 const candidateSelectorVisible = ref(false)
@@ -2182,10 +2304,166 @@ function stopGenProgress(success: boolean) {
 }
 
 const parsedMaterials = ref<any[]>([])
+const QUESTION_TYPE_KEYS = [
+  'single_choice',
+  'multiple_choice',
+  'true_false',
+  'fill_blank',
+  'short_answer',
+] as const
+
+type MaterialSuggestion = {
+  materialId: string
+  materialTitle: string
+  totalUnits: number
+  suggestedDistribution: Record<string, number>
+  suggestedTotal: number
+  difficulty: number
+  weight: number
+}
+
+type MaterialGenerationPlan = {
+  materialId: string
+  materialTitle: string
+  typeDistribution: Record<string, number>
+}
 
 const bankTotalCount = computed(() => {
   return Object.values(bankTypeDist).reduce((sum, v) => sum + (v || 0), 0)
 })
+
+function buildPositiveTypeDistribution() {
+  const dist: Record<string, number> = {}
+  for (const [key, value] of Object.entries(bankTypeDist)) {
+    if (value > 0) dist[key] = value
+  }
+  return dist
+}
+
+function createEmptyTypeDistribution(): Record<(typeof QUESTION_TYPE_KEYS)[number], number> {
+  const dist = {} as Record<(typeof QUESTION_TYPE_KEYS)[number], number>
+  for (const key of QUESTION_TYPE_KEYS) dist[key] = 0
+  return dist
+}
+
+function sumTypeDistribution(dist: Record<string, number>) {
+  return Object.values(dist).reduce((sum, value) => sum + (value || 0), 0)
+}
+
+function allocateCountsByWeights(total: number, weightedItems: Array<{ key: string; weight: number }>) {
+  const allocations: Record<string, number> = {}
+  if (total <= 0 || weightedItems.length === 0) return allocations
+
+  const normalized = weightedItems.map((item, index) => ({
+    ...item,
+    index,
+    weight: item.weight > 0 ? item.weight : 1,
+  }))
+  const totalWeight = normalized.reduce((sum, item) => sum + item.weight, 0)
+  const raws = normalized.map(item => ({
+    ...item,
+    raw: (total * item.weight) / totalWeight,
+    count: Math.floor((total * item.weight) / totalWeight),
+  }))
+
+  for (const item of raws) allocations[item.key] = item.count
+
+  let remainder = total - raws.reduce((sum, item) => sum + item.count, 0)
+  raws.sort((a, b) => {
+    const fracDiff = (b.raw - b.count) - (a.raw - a.count)
+    if (Math.abs(fracDiff) > 1e-9) return fracDiff
+    const weightDiff = b.weight - a.weight
+    if (Math.abs(weightDiff) > 1e-9) return weightDiff
+    return a.index - b.index
+  })
+
+  for (let i = 0; i < remainder; i += 1) {
+    const target = raws[i % raws.length]
+    if (!target) continue
+    allocations[target.key] = (allocations[target.key] || 0) + 1
+  }
+
+  return allocations
+}
+
+async function fetchMaterialSuggestions(materialIds: string[]): Promise<MaterialSuggestion[]> {
+  return Promise.all(materialIds.map(async materialId => {
+    try {
+      const suggestion: any = await request.get(`/questions/generate/suggest/${materialId}`, {
+        params: {
+          max_units: bankBuildModal.maxUnits,
+          selection_mode: bankBuildModal.selectionMode,
+        },
+      })
+      const suggestedDistribution = suggestion.suggested_distribution || {}
+      const suggestedTotal = suggestion.suggested_total || sumTypeDistribution(suggestedDistribution)
+      const totalUnits = suggestion.total_units || 1
+      return {
+        materialId,
+        materialTitle: suggestion.material_title || parsedMaterials.value.find(item => item.id === materialId)?.title || materialId,
+        totalUnits,
+        suggestedDistribution,
+        suggestedTotal,
+        difficulty: suggestion.difficulty || 3,
+        weight: Math.max(suggestedTotal || totalUnits || 1, 1),
+      }
+    } catch {
+      return {
+        materialId,
+        materialTitle: parsedMaterials.value.find(item => item.id === materialId)?.title || materialId,
+        totalUnits: 1,
+        suggestedDistribution: createEmptyTypeDistribution(),
+        suggestedTotal: 1,
+        difficulty: bankBuildModal.difficulty || 3,
+        weight: 1,
+      }
+    }
+  }))
+}
+
+function buildMaterialGenerationPlans(
+  materialIds: string[],
+  totalDistribution: Record<string, number>,
+  suggestions: MaterialSuggestion[],
+): MaterialGenerationPlan[] {
+  const suggestionMap = new Map(suggestions.map(item => [item.materialId, item]))
+  const planMap = new Map<string, Record<string, number>>(
+    materialIds.map(materialId => [materialId, createEmptyTypeDistribution()]),
+  )
+
+  for (const [questionType, totalCount] of Object.entries(totalDistribution)) {
+    const allocation = allocateCountsByWeights(
+      totalCount,
+      materialIds.map(materialId => ({
+        key: materialId,
+        weight: suggestionMap.get(materialId)?.weight || 1,
+      })),
+    )
+    for (const materialId of materialIds) {
+      const assigned = allocation[materialId] || 0
+      if (assigned > 0) {
+        planMap.get(materialId)![questionType] = assigned
+      }
+    }
+  }
+
+  return materialIds
+    .map(materialId => {
+      const rawDistribution = planMap.get(materialId) || {}
+      const typeDistribution: Record<string, number> = {}
+      for (const [questionType, count] of Object.entries(rawDistribution)) {
+        if (count > 0) typeDistribution[questionType] = count
+      }
+      return {
+        materialId,
+        materialTitle: suggestionMap.get(materialId)?.materialTitle
+          || parsedMaterials.value.find(item => item.id === materialId)?.title
+          || materialId,
+        typeDistribution,
+      }
+    })
+    .filter(plan => sumTypeDistribution(plan.typeDistribution) > 0)
+}
 
 const isUsingDefaultPromptConfig = computed(() => (
   bankBuildModal.systemPrompt === bankBuildModal.promptDefaults.system_prompt
@@ -2228,15 +2506,12 @@ function clearPromptPreview(markDirty = false) {
 }
 
 function buildPromptPreviewPayload() {
-  const dist: Record<string, number> = {}
-  for (const [k, v] of Object.entries(bankTypeDist)) {
-    if (v > 0) dist[k] = v
-  }
-
   return {
-    type_distribution: dist,
+    type_distribution: buildPositiveTypeDistribution(),
     difficulty: bankBuildModal.difficulty,
     bloom_level: bankBuildModal.bloomLevel || undefined,
+    max_units: bankBuildModal.maxUnits,
+    selection_mode: bankBuildModal.selectionMode,
     custom_prompt: bankBuildModal.customPrompt || undefined,
     system_prompt: bankBuildModal.systemPrompt.trim() || undefined,
     user_prompt_template: bankBuildModal.userPromptTemplate.trim() || undefined,
@@ -2327,8 +2602,10 @@ async function copyPromptPlaceholder(text: string) {
 async function showBankBuildModal() {
   bankBuildModal.materialIds = []
   bankBuildModal.materialInfo = null
+  bankBuildModal.selectionMode = 'stable'
   bankBuildModal.difficulty = 3
   bankBuildModal.bloomLevel = undefined
+  bankBuildModal.maxUnits = 10
   bankBuildModal.customPrompt = ''
   bankBuildModal.systemPrompt = ''
   bankBuildModal.userPromptTemplate = ''
@@ -2381,8 +2658,10 @@ watch(
   () => [
     bankBuildModal.visible,
     bankBuildModal.materialIds.join(','),
+    bankBuildModal.selectionMode,
     bankBuildModal.difficulty,
     bankBuildModal.bloomLevel || '',
+    bankBuildModal.maxUnits,
     bankBuildModal.customPrompt,
     bankBuildModal.systemPrompt,
     bankBuildModal.userPromptTemplate,
@@ -2405,16 +2684,26 @@ async function autoSuggest() {
   bankBuildModal.suggestLoading = true
   try {
     if (bankBuildModal.materialIds.length > 0) {
-      // Use first material for suggestion
-      const suggestion: any = await request.get(`/questions/generate/suggest/${bankBuildModal.materialIds[0]}`)
-      const dist = suggestion.suggested_distribution || {}
-      bankTypeDist.single_choice = dist.single_choice || 0
-      bankTypeDist.multiple_choice = dist.multiple_choice || 0
-      bankTypeDist.true_false = dist.true_false || 0
-      bankTypeDist.fill_blank = dist.fill_blank || 0
-      bankTypeDist.short_answer = dist.short_answer || 0
-      bankBuildModal.difficulty = suggestion.difficulty || 3
-      message.success(`AI建议：生成 ${suggestion.suggested_total} 道题目`)
+      const suggestions = await fetchMaterialSuggestions(bankBuildModal.materialIds)
+      const mergedDistribution = createEmptyTypeDistribution()
+      let weightedDifficulty = 0
+      let totalWeight = 0
+
+      for (const suggestion of suggestions) {
+        for (const questionType of QUESTION_TYPE_KEYS) {
+          mergedDistribution[questionType] += suggestion.suggestedDistribution[questionType] || 0
+        }
+        weightedDifficulty += (suggestion.difficulty || 3) * suggestion.weight
+        totalWeight += suggestion.weight
+      }
+
+      bankTypeDist.single_choice = mergedDistribution.single_choice || 0
+      bankTypeDist.multiple_choice = mergedDistribution.multiple_choice || 0
+      bankTypeDist.true_false = mergedDistribution.true_false || 0
+      bankTypeDist.fill_blank = mergedDistribution.fill_blank || 0
+      bankTypeDist.short_answer = mergedDistribution.short_answer || 0
+      bankBuildModal.difficulty = totalWeight > 0 ? Math.round(weightedDifficulty / totalWeight) : 3
+      message.success(`AI建议：基于 ${suggestions.length} 个素材，生成 ${sumTypeDistribution(mergedDistribution)} 道题目`)
     } else {
       // Default suggestion when no material selected
       bankTypeDist.single_choice = 5
@@ -2433,10 +2722,7 @@ async function autoSuggest() {
 }
 
 async function handleBankBuild() {
-  const dist: Record<string, number> = {}
-  for (const [k, v] of Object.entries(bankTypeDist)) {
-    if (v > 0) dist[k] = v
-  }
+  const dist = buildPositiveTypeDistribution()
   if (Object.keys(dist).length === 0) {
     message.warning('请至少设置一种题型的数量')
     return
@@ -2454,12 +2740,23 @@ async function handleBankBuild() {
   let aggTokens = { total: 0, prompt: 0, completion: 0 }
   let aggDuration = 0
   let modelName = ''
+  let aggRequestedTotal = 0
+  let aggGeneratedTotal = 0
+  let aggFallbackCount = 0
+  let aggQualityReviewCount = 0
+  let aggNearDuplicateCount = 0
+  let aggExistingNearDuplicateCount = 0
+  let aggDifficultyMismatchCount = 0
+  let aggBloomMismatchCount = 0
+  let aggWarnings: string[] = []
+  let aggQualityGateFailed = false
 
   try {
     const payload = {
-      type_distribution: dist,
       difficulty: bankBuildModal.difficulty,
       bloom_level: bankBuildModal.bloomLevel || undefined,
+      max_units: bankBuildModal.maxUnits,
+      selection_mode: bankBuildModal.selectionMode,
       custom_prompt: bankBuildModal.customPrompt || undefined,
       system_prompt: bankBuildModal.systemPrompt.trim() || undefined,
       user_prompt_template: bankBuildModal.userPromptTemplate.trim() || undefined,
@@ -2467,11 +2764,19 @@ async function handleBankBuild() {
     }
 
     if (bankBuildModal.materialIds.length > 0) {
-      // Preview from each selected material (no DB save)
-      for (const matId of bankBuildModal.materialIds) {
+      const suggestions = await fetchMaterialSuggestions(bankBuildModal.materialIds)
+      const materialPlans = buildMaterialGenerationPlans(bankBuildModal.materialIds, dist, suggestions)
+      if (materialPlans.length === 0) {
+        throw new Error('未生成有效的素材分配计划')
+      }
+
+      for (const plan of materialPlans) {
         const result: any = await request.post(
-          `/questions/preview/bank/${matId}`,
-          payload,
+          `/questions/preview/bank/${plan.materialId}`,
+          {
+            ...payload,
+            type_distribution: plan.typeDistribution,
+          },
           { timeout: 600000 },
         )
         allPreviewItems.push(...(result.questions || []))
@@ -2481,6 +2786,16 @@ async function handleBankBuild() {
           aggTokens.prompt += result.stats.prompt_tokens || 0
           aggTokens.completion += result.stats.completion_tokens || 0
           aggDuration += result.stats.duration_seconds || 0
+          aggRequestedTotal += result.stats.requested_total || sumTypeDistribution(plan.typeDistribution)
+          aggGeneratedTotal += result.stats.generated_total || (result.questions || []).length
+          aggFallbackCount += result.stats.fallback_count || 0
+          aggQualityReviewCount += result.stats.quality_review_count || 0
+          aggNearDuplicateCount += result.stats.near_duplicate_count || 0
+          aggExistingNearDuplicateCount += result.stats.existing_near_duplicate_count || 0
+          aggDifficultyMismatchCount += result.stats.difficulty_mismatch_count || 0
+          aggBloomMismatchCount += result.stats.bloom_mismatch_count || 0
+          aggWarnings.push(...((result.stats.warnings || []) as string[]).map(warning => `《${plan.materialTitle}》：${warning}`))
+          aggQualityGateFailed = aggQualityGateFailed || !!result.stats.quality_gate_failed
         }
       }
     } else {
@@ -2497,6 +2812,16 @@ async function handleBankBuild() {
         aggTokens.prompt = result.stats.prompt_tokens || 0
         aggTokens.completion = result.stats.completion_tokens || 0
         aggDuration = result.stats.duration_seconds || 0
+        aggRequestedTotal = result.stats.requested_total || sumTypeDistribution(dist)
+        aggGeneratedTotal = result.stats.generated_total || allPreviewItems.length
+        aggFallbackCount = result.stats.fallback_count || 0
+        aggQualityReviewCount = result.stats.quality_review_count || 0
+        aggNearDuplicateCount = result.stats.near_duplicate_count || 0
+        aggExistingNearDuplicateCount = result.stats.existing_near_duplicate_count || 0
+        aggDifficultyMismatchCount = result.stats.difficulty_mismatch_count || 0
+        aggBloomMismatchCount = result.stats.bloom_mismatch_count || 0
+        aggWarnings = [...(result.stats.warnings || [])]
+        aggQualityGateFailed = !!result.stats.quality_gate_failed
       }
     }
 
@@ -2515,9 +2840,23 @@ async function handleBankBuild() {
       totalTokens: aggTokens.total,
       promptTokens: aggTokens.prompt,
       completionTokens: aggTokens.completion,
+      requestedTotal: aggRequestedTotal || bankTotalCount.value,
+      generatedTotal: aggGeneratedTotal || allPreviewItems.length,
+      fallbackCount: aggFallbackCount,
+      qualityReviewCount: aggQualityReviewCount,
+      nearDuplicateCount: aggNearDuplicateCount,
+      existingNearDuplicateCount: aggExistingNearDuplicateCount,
+      difficultyMismatchCount: aggDifficultyMismatchCount,
+      bloomMismatchCount: aggBloomMismatchCount,
+      warnings: Array.from(new Set(aggWarnings.filter(Boolean))),
+      qualityGateFailed: aggQualityGateFailed,
     }
     previewDrawerVisible.value = true
-    message.success(`已生成 ${allPreviewItems.length} 道题目，请审阅后保存`)
+    if (aggQualityGateFailed) {
+      message.warning(`已生成 ${allPreviewItems.length} 道题目，当前预览包含质量风险，请审阅后决定是否保存`)
+    } else {
+      message.success(`已生成 ${allPreviewItems.length} 道题目，请审阅后保存`)
+    }
   } catch {
     stopGenProgress(false)
     message.error('题目生成失败，请重试')
@@ -2560,8 +2899,8 @@ async function savePreviewQuestions() {
     previewDrawerVisible.value = false
     previewQuestions.value = []
     fetchQuestions()
-  } catch {
-    message.error('保存失败，请重试')
+  } catch (e: any) {
+    message.error(e?.response?.data?.detail || '保存失败，请重试')
   } finally {
     previewSaving.value = false
   }
@@ -2594,7 +2933,7 @@ function showPreviewDetail(record: any) {
     usage_count: 0,
     created_at: new Date().toISOString(),
   }
-  aiCheckResult.value = null
+  aiCheckResult.value = record.quality_review || null
   reviewHistory.value = []
   detailVisible.value = true
 }
