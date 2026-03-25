@@ -23,7 +23,6 @@ from app.agents.question_agent import (
 )
 from app.agents.model_registry import ModelConfig
 from app.agents.review_agent import ai_review_question
-from app.services.preview_review_store import preview_review_store
 
 logger = logging.getLogger(__name__)
 MATERIAL_PLACEHOLDER_MARKERS = ("待OCR处理", "待转录处理", "待ASR处理")
@@ -114,9 +113,18 @@ def _format_keywords(keywords: object) -> str:
     return str(keywords).strip()
 
 
+def _should_include_knowledge_unit_title(title: object) -> bool:
+    title_text = str(title or "").strip()
+    if not title_text:
+        return False
+    if re.search(r"\s-\s片段\s*\d+\s*$", title_text):
+        return False
+    return True
+
+
 def _build_knowledge_unit_prompt_content(ku: KnowledgeUnit) -> str:
     parts: list[str] = []
-    if ku.title:
+    if _should_include_knowledge_unit_title(ku.title):
         parts.append(f"【知识单元标题】\n{ku.title}")
     if ku.summary:
         parts.append(f"【知识单元摘要】\n{ku.summary}")
@@ -129,7 +137,7 @@ def _build_knowledge_unit_prompt_content(ku: KnowledgeUnit) -> str:
 
 def _build_knowledge_unit_planner_content(ku: KnowledgeUnit, body_limit: int = 360) -> str:
     parts: list[str] = []
-    if ku.title:
+    if _should_include_knowledge_unit_title(ku.title):
         parts.append(f"【知识单元标题】\n{ku.title}")
     if ku.summary:
         parts.append(f"【知识单元摘要】\n{ku.summary}")
@@ -977,159 +985,6 @@ def _review_preview_calibration(raw_questions: list[dict]) -> dict:
         "bloom_severe_mismatch_count": bloom_severe_mismatch_count,
         "warnings": warnings,
     }
-
-
-def _review_preview_questions(raw_questions: list[dict]) -> dict:
-    warnings: list[str] = []
-    blocked_items: list[str] = []
-    reviewed_count = 0
-
-    for index, question in enumerate(raw_questions, start=1):
-        review = ai_review_question(
-            stem=question.get("stem", ""),
-            options=question.get("options"),
-            correct_answer=question.get("correct_answer", ""),
-            explanation=question.get("explanation"),
-            question_type=question.get("question_type", "single_choice"),
-            difficulty=question.get("difficulty", 3),
-            dimension=question.get("dimension"),
-        )
-        question["quality_review"] = review
-        reviewed_count += 1
-
-        recommendation = str(review.get("recommendation", "") or "").lower()
-        overall_score = _normalize_review_overall_score(review)
-        comments = str(review.get("comments", "") or "").strip()
-
-        if recommendation == "reject" or overall_score < 2.5:
-            blocked_items.append(f"第{index}题 AI质检建议拒绝（{overall_score:.1f}分）")
-        elif recommendation == "revise" or overall_score < 3.5:
-            warnings.append(f"第{index}题 AI质检建议修改（{overall_score:.1f}分）：{comments or '题目质量需人工复核'}")
-
-    return {
-        "reviewed_count": reviewed_count,
-        "blocked_items": blocked_items,
-        "warnings": warnings,
-    }
-
-
-def _attach_preview_item_ids(raw_questions: list[dict]) -> list[dict]:
-    for question in raw_questions:
-        preview_item_id = question.get("preview_item_id")
-        if preview_item_id:
-            question["preview_item_id"] = str(preview_item_id)
-            continue
-        question["preview_item_id"] = str(uuid.uuid4())
-    return raw_questions
-
-
-def _build_preview_review_items(raw_questions: list[dict]) -> list[dict]:
-    items: list[dict] = []
-    for question in raw_questions:
-        preview_item_id = question.get("preview_item_id")
-        if not preview_item_id:
-            continue
-        items.append({
-            "preview_item_id": str(preview_item_id),
-            "quality_review": question.get("quality_review"),
-        })
-    return items
-
-
-def create_preview_review_batch(raw_questions: list[dict], stats: dict) -> Optional[uuid.UUID]:
-    if not raw_questions:
-        return None
-    _attach_preview_item_ids(raw_questions)
-    return preview_review_store.create_batch(raw_questions, stats)
-
-
-def get_preview_review_batch(batch_id: uuid.UUID | str) -> Optional[dict]:
-    payload = preview_review_store.get_batch(batch_id)
-    if not payload:
-        return None
-    return {
-        "preview_batch_id": payload.get("preview_batch_id"),
-        "pending": payload.get("pending", False),
-        "completed": payload.get("completed", False),
-        "failed": payload.get("failed", False),
-        "error": payload.get("error"),
-        "questions": _build_preview_review_items(payload.get("questions", [])),
-        "stats": payload.get("stats"),
-    }
-
-
-async def populate_preview_ai_review(batch_id: uuid.UUID | str) -> None:
-    payload = preview_review_store.get_batch(batch_id)
-    if not payload or not payload.get("pending"):
-        return
-
-    raw_questions = payload.get("questions", [])
-    stats = dict(payload.get("stats") or {})
-    if not raw_questions:
-        stats["ai_review_pending"] = False
-        stats["ai_review_completed"] = True
-        preview_review_store.update_batch(
-            batch_id,
-            stats=stats,
-            pending=False,
-            completed=True,
-            failed=False,
-            error=None,
-        )
-        return
-
-    try:
-        review_summary = await asyncio.to_thread(_review_preview_questions, raw_questions)
-        warnings = list(
-            dict.fromkeys(
-                [
-                    *(stats.get("warnings") or []),
-                    *review_summary["warnings"],
-                    *review_summary["blocked_items"],
-                ]
-            )
-        )
-        stats.update({
-            "quality_review_count": review_summary["reviewed_count"],
-            "quality_review_blocked": len(review_summary["blocked_items"]),
-            "quality_gate_failed": bool(stats.get("quality_gate_failed")) or bool(review_summary["blocked_items"]),
-            "ai_review_pending": False,
-            "ai_review_completed": True,
-            "warnings": warnings,
-        })
-        preview_review_store.update_batch(
-            batch_id,
-            questions=raw_questions,
-            stats=stats,
-            pending=False,
-            completed=True,
-            failed=False,
-            error=None,
-        )
-    except Exception as exc:
-        logger.exception("Preview AI review failed for batch %s", batch_id)
-        warnings = list(
-            dict.fromkeys(
-                [
-                    *(stats.get("warnings") or []),
-                    f"AI质检回填失败：{exc}",
-                ]
-            )
-        )
-        stats.update({
-            "ai_review_pending": False,
-            "ai_review_completed": False,
-            "warnings": warnings,
-        })
-        preview_review_store.update_batch(
-            batch_id,
-            stats=stats,
-            pending=False,
-            completed=False,
-            failed=True,
-            error=str(exc),
-        )
-
 
 async def enrich_question_source_titles(
     db: AsyncSession,
@@ -2121,6 +1976,10 @@ async def preview_question_bank_from_material(
             "save_blocked": save_blocked,
             "quality_review_count": 0,
             "quality_review_blocked": 0,
+            "factual_risk_count": 0,
+            "distractor_risk_count": 0,
+            "type_mismatch_count": 0,
+            "difficulty_risk_count": 0,
             "near_duplicate_count": len(near_duplicate_warnings),
             "existing_near_duplicate_count": len(existing_near_duplicate_warnings),
             "calibration_review_count": calibration_summary["reviewed_count"],
@@ -2135,15 +1994,11 @@ async def preview_question_bank_from_material(
             "selected_unit_count": len(units),
             "history_window_size": selection_stats["history_window_size"],
             "cooled_unit_count": selection_stats["cooled_unit_count"],
-            "ai_review_pending": generated_total > 0,
+            "ai_review_pending": False,
             "ai_review_completed": False,
             "warnings": list(dict.fromkeys(warnings)),
         }
-        last_result = {
-            "preview_batch_id": None,
-            "questions": all_preview,
-            "stats": stats,
-        }
+        last_result = {"questions": all_preview, "stats": stats}
         if validation["passed"] and not quality_gate_failed:
             if generated_total > 0 and planned_unit_ids:
                 await _record_material_generation_run(
@@ -2153,7 +2008,6 @@ async def preview_question_bank_from_material(
                     selection_mode=selection_stats["selection_mode"],
                     created_by=created_by,
                 )
-            last_result["preview_batch_id"] = create_preview_review_batch(all_preview, stats)
             return last_result
 
         last_reasons = validation["reasons"]
@@ -2172,12 +2026,7 @@ async def preview_question_bank_from_material(
             selection_mode=selection_stats["selection_mode"],
             created_by=created_by,
         )
-        last_result["preview_batch_id"] = create_preview_review_batch(
-            last_result.get("questions", []),
-            last_result.get("stats", {}),
-        )
     return last_result or {
-        "preview_batch_id": None,
         "questions": [],
         "stats": {
             "validation_reasons": last_reasons,
@@ -2301,6 +2150,10 @@ async def preview_questions_free(
         "save_blocked": save_blocked,
         "quality_review_count": 0,
         "quality_review_blocked": 0,
+        "factual_risk_count": 0,
+        "distractor_risk_count": 0,
+        "type_mismatch_count": 0,
+        "difficulty_risk_count": 0,
         "near_duplicate_count": len(near_duplicate_warnings),
         "calibration_review_count": calibration_summary["reviewed_count"],
         "calibration_warning_count": calibration_summary["warning_count"],
@@ -2311,13 +2164,11 @@ async def preview_questions_free(
         "configured_max_units": 0,
         "effective_max_units": 0,
         "selected_unit_count": 0,
-        "ai_review_pending": generated_total > 0,
+        "ai_review_pending": False,
         "ai_review_completed": False,
         "warnings": list(dict.fromkeys(warnings)),
     }
-    preview_batch_id = create_preview_review_batch(all_preview, stats)
     return {
-        "preview_batch_id": preview_batch_id,
         "questions": all_preview,
         "stats": stats,
     }

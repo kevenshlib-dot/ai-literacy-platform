@@ -1097,9 +1097,6 @@
             知识片段设置 / 实际选片:
             <b>{{ previewStats.configuredMaxUnits || 0 }} / {{ previewStats.selectedUnitCount }}</b>
           </span>
-          <span v-if="previewStats.aiReviewPending" style="color: #1677ff; font-size: 13px;">AI质检: <b>处理中</b></span>
-          <span v-else-if="previewStats.aiReviewCompleted" style="color: #389e0d; font-size: 13px;">AI质检: <b>已完成</b></span>
-          <span v-if="previewStats.qualityReviewCount" style="color: #666; font-size: 13px;">质检: <b>{{ previewStats.qualityReviewCount }}</b></span>
           <span v-if="previewStats.nearDuplicateCount" style="color: #d46b08; font-size: 13px;">近重复: <b>{{ previewStats.nearDuplicateCount }}</b></span>
           <span v-if="previewStats.existingNearDuplicateCount" style="color: #cf1322; font-size: 13px;">题库近重复: <b>{{ previewStats.existingNearDuplicateCount }}</b></span>
           <span v-if="previewStats.difficultyMismatchCount" style="color: #d46b08; font-size: 13px;">难度偏差: <b>{{ previewStats.difficultyMismatchCount }}</b></span>
@@ -1131,17 +1128,6 @@
           <template v-if="column.key === 'dimension'">
             <a-tag v-if="record.dimension" :color="dimensionColor(record.dimension)">{{ record.dimension }}</a-tag>
             <span v-else style="color: #ccc">未分类</span>
-          </template>
-          <template v-if="column.key === 'quality_review'">
-            <a-tag
-              v-if="record.quality_review"
-              :color="record.quality_review.recommendation === 'approve' ? 'green' : record.quality_review.recommendation === 'revise' ? 'orange' : 'red'"
-            >
-              {{ record.quality_review.recommendation === 'approve' ? '通过' : record.quality_review.recommendation === 'revise' ? '修改' : '拒绝' }}
-              {{ typeof record.quality_review.overall_score === 'number' ? ` ${record.quality_review.overall_score}` : '' }}
-            </a-tag>
-            <span v-else-if="previewStats?.aiReviewPending" style="color: #1677ff">处理中</span>
-            <span v-else style="color: #ccc">未质检</span>
           </template>
           <template v-if="column.key === 'correct_answer'">
             <span style="color: #52c41a; font-weight: 600;">{{ record.correct_answer }}</span>
@@ -1440,7 +1426,6 @@ const previewColumns = [
   { title: '题型', key: 'question_type', dataIndex: 'question_type', width: 90 },
   { title: '难度', key: 'difficulty', dataIndex: 'difficulty', width: 140 },
   { title: '维度', key: 'dimension', dataIndex: 'dimension', width: 120, ellipsis: true },
-  { title: '质检', key: 'quality_review', dataIndex: 'quality_review', width: 120 },
   { title: '答案', key: 'correct_answer', dataIndex: 'correct_answer', width: 80 },
   { title: '操作', key: 'preview_actions', width: 100 },
 ]
@@ -2205,9 +2190,6 @@ const previewQuestions = ref<any[]>([])
 const previewSelectedKeys = ref<string[]>([])
 const previewSaving = ref(false)
 const previewStats = ref<any>(null)
-const previewBatchIds = ref<string[]>([])
-const previewBatchStats = ref<Record<string, any>>({})
-const previewBatchLabels = ref<Record<string, string>>({})
 const previewWarnings = computed(() => {
   if (!previewStats.value?.warnings) return []
   return (previewStats.value.warnings as string[]).filter(Boolean)
@@ -2215,7 +2197,6 @@ const previewWarnings = computed(() => {
 const previewHasQualityRisk = computed(() => (
   !!previewStats.value?.qualityGateFailed || previewWarnings.value.length > 0
 ))
-let previewReviewPollTimer: ReturnType<typeof setTimeout> | null = null
 
 // Candidate selector
 const candidateSelectorVisible = ref(false)
@@ -2239,195 +2220,6 @@ let previewUidCounter = 0
 function assignPreviewUid(item: any) {
   item._uid = `preview_${++previewUidCounter}`
   return item
-}
-
-function stopPreviewReviewPolling() {
-  if (previewReviewPollTimer) {
-    clearTimeout(previewReviewPollTimer)
-    previewReviewPollTimer = null
-  }
-}
-
-function normalizePreviewStats(raw: any) {
-  if (!raw) return null
-  return {
-    totalTokens: raw.total_tokens ?? raw.totalTokens ?? 0,
-    promptTokens: raw.prompt_tokens ?? raw.promptTokens ?? 0,
-    completionTokens: raw.completion_tokens ?? raw.completionTokens ?? 0,
-    durationSeconds: raw.duration_seconds ?? raw.durationSeconds ?? 0,
-    requestedTotal: raw.requested_total ?? raw.requestedTotal ?? 0,
-    generatedTotal: raw.generated_total ?? raw.generatedTotal ?? 0,
-    fallbackCount: raw.fallback_count ?? raw.fallbackCount ?? 0,
-    qualityReviewCount: raw.quality_review_count ?? raw.qualityReviewCount ?? 0,
-    qualityReviewBlocked: raw.quality_review_blocked ?? raw.qualityReviewBlocked ?? 0,
-    nearDuplicateCount: raw.near_duplicate_count ?? raw.nearDuplicateCount ?? 0,
-    existingNearDuplicateCount: raw.existing_near_duplicate_count ?? raw.existingNearDuplicateCount ?? 0,
-    difficultyMismatchCount: raw.difficulty_mismatch_count ?? raw.difficultyMismatchCount ?? 0,
-    bloomMismatchCount: raw.bloom_mismatch_count ?? raw.bloomMismatchCount ?? 0,
-    configuredMaxUnits: raw.configured_max_units ?? raw.configuredMaxUnits ?? 0,
-    selectedUnitCount: raw.selected_unit_count ?? raw.selectedUnitCount ?? 0,
-    qualityGateFailed: raw.quality_gate_failed ?? raw.qualityGateFailed ?? false,
-    aiReviewPending: raw.ai_review_pending ?? raw.aiReviewPending ?? false,
-    aiReviewCompleted: raw.ai_review_completed ?? raw.aiReviewCompleted ?? false,
-    warnings: Array.isArray(raw.warnings) ? raw.warnings.filter(Boolean) : [],
-  }
-}
-
-function buildAggregatedPreviewStats(modelName: string) {
-  const batchEntries = Object.entries(previewBatchStats.value)
-  if (batchEntries.length === 0) {
-    return previewStats.value
-  }
-
-  const warnings: string[] = []
-  let totalTokens = 0
-  let promptTokens = 0
-  let completionTokens = 0
-  let durationSeconds = 0
-  let requestedTotal = 0
-  let generatedTotal = 0
-  let fallbackCount = 0
-  let qualityReviewCount = 0
-  let qualityReviewBlocked = 0
-  let nearDuplicateCount = 0
-  let existingNearDuplicateCount = 0
-  let difficultyMismatchCount = 0
-  let bloomMismatchCount = 0
-  let configuredMaxUnits = 0
-  let selectedUnitCount = 0
-  let qualityGateFailed = false
-  let aiReviewPending = false
-  let aiReviewCompleted = batchEntries.length > 0
-
-  for (const [batchId, stats] of batchEntries) {
-    const label = previewBatchLabels.value[batchId]
-    totalTokens += stats.totalTokens || 0
-    promptTokens += stats.promptTokens || 0
-    completionTokens += stats.completionTokens || 0
-    durationSeconds += stats.durationSeconds || 0
-    requestedTotal += stats.requestedTotal || 0
-    generatedTotal += stats.generatedTotal || 0
-    fallbackCount += stats.fallbackCount || 0
-    qualityReviewCount += stats.qualityReviewCount || 0
-    qualityReviewBlocked += stats.qualityReviewBlocked || 0
-    nearDuplicateCount += stats.nearDuplicateCount || 0
-    existingNearDuplicateCount += stats.existingNearDuplicateCount || 0
-    difficultyMismatchCount += stats.difficultyMismatchCount || 0
-    bloomMismatchCount += stats.bloomMismatchCount || 0
-    configuredMaxUnits = stats.configuredMaxUnits || configuredMaxUnits
-    selectedUnitCount += stats.selectedUnitCount || 0
-    qualityGateFailed = qualityGateFailed || !!stats.qualityGateFailed
-    aiReviewPending = aiReviewPending || !!stats.aiReviewPending
-    aiReviewCompleted = aiReviewCompleted && !!stats.aiReviewCompleted
-    for (const warning of stats.warnings || []) {
-      warnings.push(label ? `《${label}》：${warning}` : warning)
-    }
-  }
-
-  return {
-    modelName,
-    durationText: formatDuration(durationSeconds * 1000),
-    totalTokens,
-    promptTokens,
-    completionTokens,
-    requestedTotal,
-    generatedTotal,
-    fallbackCount,
-    qualityReviewCount,
-    qualityReviewBlocked,
-    nearDuplicateCount,
-    existingNearDuplicateCount,
-    difficultyMismatchCount,
-    bloomMismatchCount,
-    configuredMaxUnits,
-    selectedUnitCount,
-    qualityGateFailed,
-    aiReviewPending,
-    aiReviewCompleted,
-    warnings: Array.from(new Set(warnings.filter(Boolean))),
-  }
-}
-
-function mergePreviewReviewItems(items: Array<{ preview_item_id: string; quality_review?: any }>) {
-  const reviewMap = new Map(
-    items
-      .filter(item => item?.preview_item_id)
-      .map(item => [item.preview_item_id, item.quality_review]),
-  )
-  if (reviewMap.size === 0) return
-  previewQuestions.value = previewQuestions.value.map(question => {
-    if (!question.preview_item_id || !reviewMap.has(question.preview_item_id)) {
-      return question
-    }
-    return {
-      ...question,
-      quality_review: reviewMap.get(question.preview_item_id) || null,
-    }
-  })
-}
-
-async function pollPreviewReviewResults() {
-  stopPreviewReviewPolling()
-  if (!previewDrawerVisible.value || previewBatchIds.value.length === 0) return
-
-  try {
-    const responses: any[] = await Promise.all(
-      previewBatchIds.value.map(async batchId => {
-        try {
-          return await request.get(`/questions/preview/batch/${batchId}`) as any
-        } catch (e: any) {
-          if (e?.response?.status === 404) {
-            return {
-              preview_batch_id: batchId,
-              pending: false,
-              completed: false,
-              failed: true,
-              error: '预览批次不存在或已过期',
-              questions: [],
-              stats: null,
-            }
-          }
-          throw e
-        }
-      }),
-    )
-
-    let hasPending = false
-    for (const data of responses) {
-      if (!data) continue
-      if (Array.isArray(data.questions)) {
-        mergePreviewReviewItems(data.questions)
-      }
-      if (data.preview_batch_id && data.stats) {
-        previewBatchStats.value = {
-          ...previewBatchStats.value,
-          [data.preview_batch_id]: normalizePreviewStats(data.stats),
-        }
-      }
-      hasPending = hasPending || !!data.pending
-    }
-
-    previewStats.value = buildAggregatedPreviewStats(previewStats.value?.modelName || genModelName.value)
-    if (hasPending && previewDrawerVisible.value) {
-      previewReviewPollTimer = setTimeout(() => {
-        void pollPreviewReviewResults()
-      }, 2000)
-    }
-  } catch {
-    if (previewDrawerVisible.value) {
-      previewReviewPollTimer = setTimeout(() => {
-        void pollPreviewReviewResults()
-      }, 4000)
-    }
-  }
-}
-
-function startPreviewReviewPolling() {
-  stopPreviewReviewPolling()
-  if (previewBatchIds.value.length === 0) return
-  previewReviewPollTimer = setTimeout(() => {
-    void pollPreviewReviewResults()
-  }, 1500)
 }
 
 // ---- Generation Progress ----
@@ -2942,10 +2734,6 @@ async function handleBankBuild() {
   }
 
   bankBuildModal.loading = true
-  stopPreviewReviewPolling()
-  previewBatchIds.value = []
-  previewBatchStats.value = {}
-  previewBatchLabels.value = {}
   startGenProgress(bankTotalCount.value)
 
   // Aggregated stats
@@ -2956,7 +2744,6 @@ async function handleBankBuild() {
   let aggRequestedTotal = 0
   let aggGeneratedTotal = 0
   let aggFallbackCount = 0
-  let aggQualityReviewCount = 0
   let aggNearDuplicateCount = 0
   let aggExistingNearDuplicateCount = 0
   let aggDifficultyMismatchCount = 0
@@ -2965,9 +2752,6 @@ async function handleBankBuild() {
   let aggQualityGateFailed = false
   let aggSelectedUnitCount = 0
   let aggConfiguredMaxUnits = bankBuildModal.maxUnits
-  const nextPreviewBatchIds: string[] = []
-  const nextPreviewBatchStats: Record<string, any> = {}
-  const nextPreviewBatchLabels: Record<string, string> = {}
 
   try {
     const payload = {
@@ -3000,7 +2784,6 @@ async function handleBankBuild() {
         allPreviewItems.push(...(result.questions || []))
         if (result.model_name) modelName = result.model_name
         if (result.stats) {
-          const normalizedStats = normalizePreviewStats(result.stats)
           aggTokens.total += result.stats.total_tokens || 0
           aggTokens.prompt += result.stats.prompt_tokens || 0
           aggTokens.completion += result.stats.completion_tokens || 0
@@ -3008,7 +2791,6 @@ async function handleBankBuild() {
           aggRequestedTotal += result.stats.requested_total || sumTypeDistribution(plan.typeDistribution)
           aggGeneratedTotal += result.stats.generated_total || (result.questions || []).length
           aggFallbackCount += result.stats.fallback_count || 0
-          aggQualityReviewCount += result.stats.quality_review_count || 0
           aggNearDuplicateCount += result.stats.near_duplicate_count || 0
           aggExistingNearDuplicateCount += result.stats.existing_near_duplicate_count || 0
           aggDifficultyMismatchCount += result.stats.difficulty_mismatch_count || 0
@@ -3017,11 +2799,6 @@ async function handleBankBuild() {
           aggConfiguredMaxUnits = result.stats.configured_max_units || aggConfiguredMaxUnits
           aggWarnings.push(...((result.stats.warnings || []) as string[]).map(warning => `《${plan.materialTitle}》：${warning}`))
           aggQualityGateFailed = aggQualityGateFailed || !!result.stats.quality_gate_failed
-          if (result.preview_batch_id) {
-            nextPreviewBatchIds.push(result.preview_batch_id)
-            nextPreviewBatchStats[result.preview_batch_id] = normalizedStats
-            nextPreviewBatchLabels[result.preview_batch_id] = plan.materialTitle
-          }
         }
       }
     } else {
@@ -3034,7 +2811,6 @@ async function handleBankBuild() {
       allPreviewItems = result.questions || []
       if (result.model_name) modelName = result.model_name
       if (result.stats) {
-        const normalizedStats = normalizePreviewStats(result.stats)
         aggTokens.total = result.stats.total_tokens || 0
         aggTokens.prompt = result.stats.prompt_tokens || 0
         aggTokens.completion = result.stats.completion_tokens || 0
@@ -3042,7 +2818,6 @@ async function handleBankBuild() {
         aggRequestedTotal = result.stats.requested_total || sumTypeDistribution(dist)
         aggGeneratedTotal = result.stats.generated_total || allPreviewItems.length
         aggFallbackCount = result.stats.fallback_count || 0
-        aggQualityReviewCount = result.stats.quality_review_count || 0
         aggNearDuplicateCount = result.stats.near_duplicate_count || 0
         aggExistingNearDuplicateCount = result.stats.existing_near_duplicate_count || 0
         aggDifficultyMismatchCount = result.stats.difficulty_mismatch_count || 0
@@ -3051,11 +2826,6 @@ async function handleBankBuild() {
         aggConfiguredMaxUnits = result.stats.configured_max_units || aggConfiguredMaxUnits
         aggWarnings = [...(result.stats.warnings || [])]
         aggQualityGateFailed = !!result.stats.quality_gate_failed
-        if (result.preview_batch_id) {
-          nextPreviewBatchIds.push(result.preview_batch_id)
-          nextPreviewBatchStats[result.preview_batch_id] = normalizedStats
-          nextPreviewBatchLabels[result.preview_batch_id] = ''
-        }
       }
     }
 
@@ -3067,13 +2837,8 @@ async function handleBankBuild() {
     previewUidCounter = 0
     previewQuestions.value = allPreviewItems.map(assignPreviewUid)
     previewSelectedKeys.value = []
-    previewBatchIds.value = nextPreviewBatchIds
-    previewBatchStats.value = nextPreviewBatchStats
-    previewBatchLabels.value = nextPreviewBatchLabels
     const dur = aggDuration || (Date.now() - genStartTime) / 1000
-    previewStats.value = nextPreviewBatchIds.length > 0
-      ? buildAggregatedPreviewStats(modelName)
-      : {
+    previewStats.value = {
       modelName,
       durationText: formatDuration(dur * 1000),
       totalTokens: aggTokens.total,
@@ -3082,7 +2847,6 @@ async function handleBankBuild() {
       requestedTotal: aggRequestedTotal || bankTotalCount.value,
       generatedTotal: aggGeneratedTotal || allPreviewItems.length,
       fallbackCount: aggFallbackCount,
-      qualityReviewCount: aggQualityReviewCount,
       nearDuplicateCount: aggNearDuplicateCount,
       existingNearDuplicateCount: aggExistingNearDuplicateCount,
       difficultyMismatchCount: aggDifficultyMismatchCount,
@@ -3091,11 +2855,8 @@ async function handleBankBuild() {
       selectedUnitCount: aggSelectedUnitCount,
       warnings: Array.from(new Set(aggWarnings.filter(Boolean))),
       qualityGateFailed: aggQualityGateFailed,
-      aiReviewPending: false,
-      aiReviewCompleted: false,
     }
     previewDrawerVisible.value = true
-    startPreviewReviewPolling()
     if (aggQualityGateFailed) {
       message.warning(`已生成 ${allPreviewItems.length} 道题目，当前预览包含质量风险，请审阅后决定是否保存`)
     } else {
@@ -3140,10 +2901,6 @@ async function savePreviewQuestions() {
       questions: payload,
     })
     message.success(`成功保存 ${result.generated} 道题目为草稿`)
-    stopPreviewReviewPolling()
-    previewBatchIds.value = []
-    previewBatchStats.value = {}
-    previewBatchLabels.value = {}
     previewDrawerVisible.value = false
     previewQuestions.value = []
     fetchQuestions()
@@ -3156,10 +2913,6 @@ async function savePreviewQuestions() {
 
 function onPreviewDrawerClose() {
   if (previewQuestions.value.length === 0) {
-    stopPreviewReviewPolling()
-    previewBatchIds.value = []
-    previewBatchStats.value = {}
-    previewBatchLabels.value = {}
     previewDrawerVisible.value = false
     return
   }
@@ -3171,10 +2924,6 @@ function onPreviewDrawerClose() {
       okType: 'danger',
       cancelText: '继续编辑',
       onOk() {
-        stopPreviewReviewPolling()
-        previewBatchIds.value = []
-        previewBatchStats.value = {}
-        previewBatchLabels.value = {}
         previewQuestions.value = []
         previewDrawerVisible.value = false
       },
@@ -3287,7 +3036,6 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
-  stopPreviewReviewPolling()
 })
 </script>
 

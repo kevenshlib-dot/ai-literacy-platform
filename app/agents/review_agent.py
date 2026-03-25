@@ -29,6 +29,12 @@ REVIEW_SYSTEM_PROMPT = """你是一个专业的题目质量审核专家。你需
 4. **知识对齐** (knowledge_alignment): 题目是否与标注的知识维度一致
 5. **难度校准** (difficulty_calibration): 难度标注是否与题目实际难度匹配
 
+审核时重点关注：
+- 正确答案是否被题干或素材证据充分支持，避免把争议性表述写成唯一正确答案。
+- 选择题的四个选项是否同层级、同粒度、可比较，干扰项是否围绕真实误解而非离题内容。
+- `fill_blank` 是开放式填空题，不需要选项；`short_answer` 是开放式简答题，不得使用填空标记，也不需要选项；`true_false` 必须使用 A/B 两个标准选项。
+- 若题目涉及“首位/公认/奠基/关键文献/提出者/起源”等唯一归属型表述，应重点检查事实依据是否充分。
+
 请严格按照以下JSON格式输出：
 ```json
 {
@@ -52,6 +58,80 @@ BOOLEAN_TRUE_LABELS = {"正确", "对", "true", "是", "yes"}
 BOOLEAN_FALSE_LABELS = {"错误", "错", "false", "否", "no"}
 BLANK_MARKERS = ("____", "___", "（ ）", "( )", "（）", "【 】", "[]", "＿", "填空")
 SHORT_ANSWER_HINTS = ("请", "说明", "分析", "简述", "解释", "论述", "阐述", "为什么", "如何", "结合")
+ABSOLUTE_CLAIM_MARKERS = ("首位", "公认", "唯一", "首要", "第一位", "首次")
+
+
+def _infer_review_risk_tags(
+    *,
+    stem: str,
+    options: Optional[dict],
+    correct_answer: str,
+    explanation: Optional[str],
+    question_type: str,
+    scores: Optional[dict],
+    comments: str,
+) -> list[str]:
+    scores = scores or {}
+    comments_text = str(comments or "")
+    tags: list[str] = []
+
+    answer_score = float(scores.get("answer_correctness", 0) or 0)
+    option_score = float(scores.get("option_quality", 0) or 0)
+    difficulty_score = float(scores.get("difficulty_calibration", 0) or 0)
+    has_absolute_claim = any(marker in str(stem or "") for marker in ABSOLUTE_CLAIM_MARKERS)
+
+    if has_absolute_claim or answer_score <= 3 or any(token in comments_text for token in ("事实", "正确答案", "学术", "共识", "不准确", "争议")):
+        tags.append("factual_risk")
+    if question_type in ("single_choice", "multiple_choice") and (
+        option_score <= 3 or has_absolute_claim or any(token in comments_text for token in ("干扰项", "选项", "区分度", "对等"))
+    ):
+        tags.append("distractor_risk")
+    if difficulty_score <= 3 or "难度" in comments_text:
+        tags.append("difficulty_risk")
+
+    normalized_options = _normalize_option_map(options)
+    if question_type == "true_false":
+        if set(normalized_options.keys()) != {"A", "B"}:
+            tags.append("type_mismatch")
+    elif question_type == "fill_blank":
+        if normalized_options or not _has_blank_marker(stem):
+            tags.append("type_mismatch")
+    elif question_type in ("short_answer", "essay"):
+        if (
+            normalized_options
+            or _has_blank_marker(stem)
+            or _looks_like_option_answer(correct_answer)
+            or len(str(correct_answer or "").strip()) < 8
+        ):
+            tags.append("type_mismatch")
+    elif question_type in ("single_choice", "multiple_choice"):
+        if len(normalized_options) < 4:
+            tags.append("type_mismatch")
+
+    return list(dict.fromkeys(tags))
+
+
+def _finalize_review_payload(
+    payload: dict,
+    *,
+    stem: str,
+    options: Optional[dict],
+    correct_answer: str,
+    explanation: Optional[str],
+    question_type: str,
+) -> dict:
+    payload = dict(payload or {})
+    comments = str(payload.get("comments", "") or "")
+    payload["risk_tags"] = _infer_review_risk_tags(
+        stem=stem,
+        options=options,
+        correct_answer=correct_answer,
+        explanation=explanation,
+        question_type=question_type,
+        scores=payload.get("scores"),
+        comments=comments,
+    )
+    return payload
 
 
 def _normalize_option_map(options: Optional[dict]) -> dict[str, str]:
@@ -145,7 +225,14 @@ def ai_review_question(
         elif "```" in raw:
             raw = raw.split("```", 1)[1].split("```", 1)[0].strip()
 
-        return json.loads(raw)
+        return _finalize_review_payload(
+            json.loads(raw),
+            stem=stem,
+            options=options,
+            correct_answer=correct_answer,
+            explanation=explanation,
+            question_type=question_type,
+        )
 
     except Exception as e:
         logger.error(f"AI review failed: {e}")
@@ -306,9 +393,9 @@ def _rule_based_review(
     if scores["answer_correctness"] < 3 and "答案格式可能有误" not in comments_parts:
         comments_parts.append("答案格式或内容可能有误")
 
-    return {
+    return _finalize_review_payload({
         "scores": scores,
         "overall_score": round(overall, 1),
         "recommendation": recommendation,
         "comments": "；".join(dict.fromkeys(comments_parts)) if comments_parts else "题目质量整体良好",
-    }
+    }, stem=stem, options=options, correct_answer=correct_answer, explanation=explanation, question_type=question_type)

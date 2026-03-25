@@ -110,6 +110,10 @@ class GenerateStats(BaseModel):
     save_blocked: bool = False
     quality_review_count: int = 0
     quality_review_blocked: int = 0
+    factual_risk_count: int = 0
+    distractor_risk_count: int = 0
+    type_mismatch_count: int = 0
+    difficulty_risk_count: int = 0
     near_duplicate_count: int = 0
     existing_near_duplicate_count: int = 0
     calibration_review_count: int = 0
@@ -176,6 +180,7 @@ class AIReviewResponse(BaseModel):
     overall_score: float
     recommendation: str
     comments: str
+    risk_tags: List[str] = Field(default_factory=list)
 
 
 class QuestionBankBuildRequest(PromptOverrideMixin):
@@ -234,26 +239,10 @@ class PreviewQuestionItem(BaseModel):
 
 class PreviewResponse(BaseModel):
     """预览生成结果（不存DB）。"""
-    preview_batch_id: Optional[UUID] = None
     questions: List[PreviewQuestionItem]
     total: int
     stats: Optional[GenerateStats] = None
     model_name: Optional[str] = None
-
-
-class PreviewBatchReviewItem(BaseModel):
-    preview_item_id: str
-    quality_review: Optional[dict] = None
-
-
-class PreviewBatchReviewResponse(BaseModel):
-    preview_batch_id: UUID
-    pending: bool = False
-    completed: bool = False
-    failed: bool = False
-    error: Optional[str] = None
-    questions: List[PreviewBatchReviewItem] = Field(default_factory=list)
-    stats: Optional[GenerateStats] = None
 
 
 class BatchCreateFromRawRequest(BaseModel):

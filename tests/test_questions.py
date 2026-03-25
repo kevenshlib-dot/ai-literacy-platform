@@ -1,5 +1,6 @@
 """Tests for question generation engine (T009)."""
 import io
+import re
 import threading
 import time
 import uuid
@@ -95,6 +96,23 @@ def test_build_slot_batch_generator_content_uses_neutral_slot_markers():
     assert "参考素材" not in content
     assert "<slot index=\"1\">" in content
     assert "<slot index=\"2\">" in content
+
+
+def test_build_knowledge_unit_prompt_content_omits_generated_segment_title():
+    ku = KnowledgeUnit(
+        title="人工智能伦理引论 (杜严勇) - 片段 20",
+        summary="解释学科定位的分类差异。",
+        keywords=["学科定位", "部门伦理学"],
+        content="正文内容",
+    )
+
+    content = question_service._build_knowledge_unit_prompt_content(ku)
+    planner_content = question_service._build_knowledge_unit_planner_content(ku)
+
+    assert "【知识单元标题】" not in content
+    assert "【知识单元标题】" not in planner_content
+    assert "【知识单元摘要】" in content
+    assert "【知识关键词】" in planner_content
 
 
 def test_template_fallback_mixed_types():
@@ -887,7 +905,7 @@ async def test_material_prompt_preview_selects_same_units_for_fixed_conditions()
     joined = "\n".join(item["rendered_user_prompt"] for item in first_preview["rendered_user_prompts"])
     assert "核心概念" in joined
     assert "案例分析" in joined
-    assert "导语" not in joined
+    assert "【知识点出题规划】" in joined
 
 
 @pytest.mark.asyncio
@@ -994,8 +1012,7 @@ async def test_multi_material_prompt_preview_is_stable_for_fixed_conditions():
     joined = "\n".join(item["rendered_user_prompt"] for item in first_preview["rendered_user_prompts"])
     assert "A核心概念" in joined or "A案例分析" in joined
     assert "B核心概念" in joined or "B案例分析" in joined
-    assert "A导语" not in joined
-    assert "B导语" not in joined
+    assert "【知识点出题规划】" in joined
 
 
 @pytest.mark.asyncio
@@ -1231,11 +1248,16 @@ async def test_prompt_preview_coverage_mode_matches_preview_selection(monkeypatc
 
     def fake_generate(*args, **kwargs):
         content = kwargs.get("content", "")
-        label = "未知片段"
-        for candidate in ("片段1", "片段2", "片段3"):
-            if candidate in content:
-                label = candidate
-                break
+        labels = []
+        for chunk in re.findall(r"<slot index=\"\\d+\">\\n(.*?)\\n</slot>", content, re.S):
+            label = "未知片段"
+            for candidate in ("片段1", "片段2", "片段3"):
+                if candidate in chunk:
+                    label = candidate
+                    break
+            labels.append(label)
+        if not labels:
+            labels = ["未知片段"] * max(1, int(kwargs.get("count", 1) or 1))
         return {
             "questions": [
                 {
@@ -1247,6 +1269,7 @@ async def test_prompt_preview_coverage_mode_matches_preview_selection(monkeypatc
                     "knowledge_tags": [label],
                     "dimension": "AI伦理安全",
                 }
+                for label in labels
             ],
             "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
             "fallback_used": False,
@@ -1968,7 +1991,7 @@ async def test_preview_question_bank_uses_batch_planner_once_per_attempt(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_preview_question_bank_defers_ai_review_until_batch_poll(monkeypatch):
+async def test_preview_question_bank_skips_ai_review_batching(monkeypatch):
     engine = create_async_engine(settings.DATABASE_URL, echo=False)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     material_id = uuid.uuid4()
@@ -1992,12 +2015,6 @@ async def test_preview_question_bank_defers_ai_review_until_batch_poll(monkeypat
     monkeypatch.setattr(question_service, "_validate_generated_question_set", lambda *args, **kwargs: {
         "passed": True,
         "reasons": [],
-    })
-    monkeypatch.setattr(question_service, "ai_review_question", lambda *args, **kwargs: {
-        "scores": {"stem_clarity": 4},
-        "overall_score": 4.5,
-        "recommendation": "approve",
-        "comments": "AI质检通过",
     })
 
     async with session_factory() as session:
@@ -2035,76 +2052,106 @@ async def test_preview_question_bank_defers_ai_review_until_batch_poll(monkeypat
             type_distribution={"single_choice": 1},
             difficulty=3,
         )
-        batch_before = question_service.get_preview_review_batch(preview["preview_batch_id"])
-        await question_service.populate_preview_ai_review(preview["preview_batch_id"])
-        batch_after = question_service.get_preview_review_batch(preview["preview_batch_id"])
 
     await engine.dispose()
 
-    assert preview["preview_batch_id"] is not None
+    assert preview.get("preview_batch_id") is None
     assert preview["stats"]["quality_review_count"] == 0
-    assert preview["stats"]["ai_review_pending"] is True
-    assert preview["questions"][0]["preview_item_id"]
-    assert batch_before is not None
-    assert batch_before["pending"] is True
-    assert batch_before["questions"][0]["quality_review"] is None
-    assert batch_after is not None
-    assert batch_after["pending"] is False
-    assert batch_after["completed"] is True
-    assert batch_after["stats"]["quality_review_count"] == 1
-    assert batch_after["stats"]["ai_review_completed"] is True
-    assert batch_after["questions"][0]["quality_review"]["recommendation"] == "approve"
+    assert preview["stats"]["ai_review_pending"] is False
+    assert preview["stats"]["ai_review_completed"] is False
+    assert preview["questions"][0].get("quality_review") is None
 
 
 @pytest.mark.asyncio
-async def test_preview_batch_review_endpoint_returns_completed_results(monkeypatch):
-    monkeypatch.setattr(question_service, "ai_review_question", lambda *args, **kwargs: {
-        "scores": {"stem_clarity": 4},
-        "overall_score": 4.1,
-        "recommendation": "revise",
-        "comments": "建议微调",
-    })
-
-    batch_id = question_service.create_preview_review_batch(
-        raw_questions=[
-            {
-                "preview_item_id": str(uuid.uuid4()),
-                "question_type": "single_choice",
-                "stem": "批次查询测试题",
-                "options": {"A": "正确", "B": "错误", "C": "干扰项1", "D": "干扰项2"},
-                "correct_answer": "A",
-                "explanation": "测试批次查询接口。",
-                "difficulty": 3,
-                "dimension": "AI基础知识",
-                "knowledge_tags": ["批次查询"],
-                "bloom_level": "understand",
-            }
-        ],
-        stats={
-            "quality_review_count": 0,
-            "quality_review_blocked": 0,
-            "quality_gate_failed": False,
-            "ai_review_pending": True,
-            "ai_review_completed": False,
-            "warnings": [],
-        },
-    )
-    assert batch_id is not None
-    await question_service.populate_preview_ai_review(batch_id)
-
+async def test_preview_batch_review_endpoint_is_unavailable():
     async with get_client() as client:
         token = await register_user(client, "organizer")
         headers = {"Authorization": f"Bearer {token}"}
-        resp = await client.get(f"/api/v1/questions/preview/batch/{batch_id}", headers=headers)
+        resp = await client.get(
+            f"/api/v1/questions/preview/batch/{uuid.uuid4()}",
+            headers=headers,
+        )
 
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["preview_batch_id"] == str(batch_id)
-    assert data["pending"] is False
-    assert data["completed"] is True
-    assert data["questions"][0]["quality_review"]["recommendation"] == "revise"
-    assert data["stats"]["quality_review_count"] == 1
-    assert data["stats"]["ai_review_completed"] is True
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_preview_question_bank_does_not_run_ai_review(monkeypatch):
+    monkeypatch.setattr(question_service, "generate_questions_via_llm", lambda *args, **kwargs: {
+        "questions": [
+            {
+                "question_type": "single_choice",
+                "stem": "推荐系统上线前，哪项做法最符合隐私最小化原则？",
+                "options": {"A": "只收集必要字段", "B": "长期保留原始日志", "C": "默认开放所有画像", "D": "对外共享用户ID"},
+                "correct_answer": "A",
+                "explanation": "最小化原则要求只收集实现目标所必需的数据。",
+                "difficulty": 3,
+                "dimension": "AI基础知识",
+                "knowledge_tags": ["隐私最小化"],
+                "bloom_level": "understand",
+            }
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        "fallback_used": False,
+        "error": None,
+    })
+
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    material_id = uuid.uuid4()
+
+    monkeypatch.setattr(question_service, "ai_review_question", lambda *args, **kwargs: {
+        "scores": {"stem_clarity": 1},
+        "overall_score": 1.2,
+        "recommendation": "reject",
+        "comments": "这条审核结果不应出现在 preview 中",
+    })
+
+    async with session_factory() as session:
+        uploader = await create_user(
+            session,
+            username=f"preview_no_ai_{uuid.uuid4().hex[:8]}",
+            email=f"{uuid.uuid4().hex[:8]}@test.com",
+            password="password123",
+            role_name="organizer",
+        )
+        session.add(
+            Material(
+                id=material_id,
+                title="AI质检素材",
+                format=MaterialFormat.MARKDOWN,
+                file_path="materials/test.md",
+                file_size=128,
+                status=MaterialStatus.PARSED,
+                uploaded_by=uploader.id,
+            )
+        )
+        session.add(
+            KnowledgeUnit(
+                material_id=material_id,
+                title="片段1",
+                content="推荐系统上线前，需要落实隐私最小化原则。",
+                chunk_index=0,
+            )
+        )
+        await session.commit()
+
+        result = await question_service.preview_question_bank_from_material(
+            db=session,
+            material_id=material_id,
+            type_distribution={"single_choice": 1},
+            difficulty=3,
+        )
+
+    await engine.dispose()
+
+    assert result.get("preview_batch_id") is None
+    assert result["stats"]["save_blocked"] is False
+    assert result["stats"]["quality_gate_failed"] is False
+    assert result["stats"]["quality_review_blocked"] == 0
+    assert result["stats"]["quality_review_count"] == 0
+    assert result["stats"]["ai_review_pending"] is False
+    assert result["questions"][0].get("quality_review") is None
 
 
 @pytest.mark.asyncio
@@ -2364,7 +2411,7 @@ async def test_preview_question_bank_blocks_existing_near_duplicate(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_preview_question_bank_blocks_ai_reject(monkeypatch):
+async def test_preview_question_bank_ignores_ai_reject_in_preview(monkeypatch):
     engine = create_async_engine(settings.DATABASE_URL, echo=False)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     material_id = uuid.uuid4()
@@ -2427,18 +2474,15 @@ async def test_preview_question_bank_blocks_ai_reject(monkeypatch):
             type_distribution={"single_choice": 1},
             difficulty=3,
         )
-        await question_service.populate_preview_ai_review(result["preview_batch_id"])
-        reviewed = question_service.get_preview_review_batch(result["preview_batch_id"])
 
     await engine.dispose()
 
     assert result["stats"]["save_blocked"] is False
     assert result["stats"]["quality_gate_failed"] is False
     assert result["stats"]["quality_review_blocked"] == 0
-    assert reviewed is not None
-    assert reviewed["stats"]["quality_gate_failed"] is True
-    assert reviewed["stats"]["quality_review_blocked"] == 1
-    assert reviewed["questions"][0]["quality_review"]["recommendation"] == "reject"
+    assert result["stats"]["quality_review_count"] == 0
+    assert result["stats"]["ai_review_pending"] is False
+    assert result.get("preview_batch_id") is None
 
 
 @pytest.mark.asyncio

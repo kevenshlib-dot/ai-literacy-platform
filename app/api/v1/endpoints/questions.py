@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,7 +32,6 @@ from app.schemas.question import (
     FreeGenerateRequest,
     PreviewQuestionItem,
     PreviewResponse,
-    PreviewBatchReviewResponse,
     BatchCreateFromRawRequest,
     QuestionPromptConfigResponse,
     QuestionPromptConfigUpdateRequest,
@@ -546,7 +545,6 @@ async def generate_free(
 async def preview_question_bank(
     material_id: UUID,
     body: QuestionBankBuildRequest,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "organizer"])),
 ):
@@ -579,11 +577,7 @@ async def preview_question_bank(
 
     preview_items = result.get("questions", [])
     stats = result.get("stats")
-    preview_batch_id = result.get("preview_batch_id")
-    if preview_batch_id:
-        background_tasks.add_task(question_service.populate_preview_ai_review, preview_batch_id)
     return PreviewResponse(
-        preview_batch_id=preview_batch_id,
         questions=[PreviewQuestionItem(**item) for item in preview_items],
         total=len(preview_items),
         stats=stats,
@@ -594,7 +588,6 @@ async def preview_question_bank(
 @router.post("/preview/free", response_model=PreviewResponse)
 async def preview_free(
     body: FreeGenerateRequest,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "organizer"])),
 ):
@@ -621,27 +614,12 @@ async def preview_free(
 
     preview_items = result.get("questions", [])
     stats = result.get("stats")
-    preview_batch_id = result.get("preview_batch_id")
-    if preview_batch_id:
-        background_tasks.add_task(question_service.populate_preview_ai_review, preview_batch_id)
     return PreviewResponse(
-        preview_batch_id=preview_batch_id,
         questions=[PreviewQuestionItem(**item) for item in preview_items],
         total=len(preview_items),
         stats=stats,
         model_name=settings.LLM_MODEL,
     )
-
-
-@router.get("/preview/batch/{preview_batch_id}", response_model=PreviewBatchReviewResponse)
-async def get_preview_batch_review(
-    preview_batch_id: UUID,
-    current_user: User = Depends(require_role(["admin", "organizer"])),
-):
-    batch = question_service.get_preview_review_batch(preview_batch_id)
-    if not batch:
-        raise HTTPException(status_code=404, detail="预览批次不存在或已过期")
-    return PreviewBatchReviewResponse(**batch)
 
 
 @router.post("/batch/create-raw", response_model=GenerateResponse)

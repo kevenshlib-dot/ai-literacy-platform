@@ -104,3 +104,103 @@ def test_validate_and_fix_question_rejects_prompt_instruction_leakage():
 
     assert fixed is None
     assert rejection_reasons == ["题目泄漏了规划或提示词标记"]
+
+
+def test_validate_and_fix_question_rejects_choice_options_with_mixed_granularity():
+    rejection_reasons = []
+    fixed = _validate_and_fix_question(
+        {
+            "question_type": "single_choice",
+            "dimension": "AI基础知识",
+            "stem": "以下哪项更符合要求？",
+            "options": {
+                "A": "建立最小必要采集机制",
+                "B": "随意扩大字段采集范围并长期保留原始数据以便未来所有潜在分析任务都能继续使用",
+                "C": "执行访问审计",
+                "D": "明确用途边界",
+            },
+            "correct_answer": "A",
+            "explanation": "解释说明。",
+            "knowledge_tags": ["测试"],
+        },
+        ["single_choice"],
+        rejection_reasons,
+    )
+
+    assert fixed is None
+    assert rejection_reasons == ["选择题选项粒度不一致"]
+
+
+def test_validate_and_fix_question_rejects_absolute_claim_without_anchor_support():
+    rejection_reasons = []
+    fixed = _validate_and_fix_question(
+        {
+            "question_type": "single_choice",
+            "dimension": "AI伦理安全",
+            "stem": "在人工智能伦理研究中，被公认的首要议题是什么？",
+            "options": {
+                "A": "机器人权利",
+                "B": "界面配色",
+                "C": "商业融资",
+                "D": "办公效率",
+            },
+            "correct_answer": "A",
+            "explanation": "解释中没有给出明确证据。",
+            "knowledge_tags": ["人工智能伦理"],
+            "_plan_meta": {
+                "fact_anchor": "学科定位与部门伦理学",
+                "evidence_span": "将科技伦理视为部门伦理学有助于突出科技工作者的伦理责任。",
+                "knowledge_point": "学科定位",
+            },
+        },
+        ["single_choice"],
+        rejection_reasons,
+    )
+
+    assert fixed is None
+    assert rejection_reasons == ["题目包含绝对化表述但缺少明确素材锚点"]
+
+
+def test_validate_and_fix_question_rejects_short_answer_with_blank_marker():
+    rejection_reasons = []
+    fixed = _validate_and_fix_question(
+        {
+            "question_type": "short_answer",
+            "dimension": "AI伦理安全",
+            "stem": "请说明将科技伦理冠名为______更合理的原因。",
+            "options": None,
+            "correct_answer": "部门伦理学",
+            "explanation": "这一表述更强调其具体学科归属。",
+            "knowledge_tags": ["部门伦理学"],
+        },
+        ["short_answer"],
+        rejection_reasons,
+    )
+
+    assert fixed is None
+    assert rejection_reasons == ["简答题题干不得包含填空标记"]
+
+
+def test_validate_and_fix_question_rejects_incomplete_stem_fragment():
+    rejection_reasons = []
+    fixed = _validate_and_fix_question(
+        {
+            "question_type": "single_choice",
+            "dimension": "AI伦理安全",
+            "stem": "某科技媒体在报道",
+            "options": {
+                "A": "方案A",
+                "B": "方案B",
+                "C": "方案C",
+                "D": "方案D",
+            },
+            "correct_answer": "A",
+            "explanation": "解释说明。",
+            "knowledge_tags": ["测试"],
+        },
+        ["single_choice"],
+        rejection_reasons,
+    )
+
+    assert fixed is None
+    assert rejection_reasons == ["题干必须是完整句，不得只保留场景片段"]

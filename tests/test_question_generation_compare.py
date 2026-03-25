@@ -59,7 +59,7 @@ def test_build_user_prompt_is_deterministic_for_same_seed():
 
 def test_build_user_prompt_changes_when_seed_changes():
     prompt1 = question_agent._build_user_prompt(
-        content="人工智能帮助提升工作效率。",
+        content="",
         question_types=["single_choice", "true_false"],
         count=3,
         difficulty=3,
@@ -67,7 +67,7 @@ def test_build_user_prompt_changes_when_seed_changes():
         prompt_seed=42,
     )
     prompt2 = question_agent._build_user_prompt(
-        content="人工智能帮助提升工作效率。",
+        content="",
         question_types=["single_choice", "true_false"],
         count=3,
         difficulty=3,
@@ -98,6 +98,60 @@ def test_build_question_plan_is_deterministic_for_same_seed():
     assert len(plan1) == 2
     assert plan1[0]["knowledge_point"]
     assert plan1[0]["evidence"]
+    assert plan1[0]["fact_anchor"]
+    assert plan1[0]["evidence_span"]
+    assert plan1[0]["question_goal"]
+    assert plan1[0]["forbidden_confusions"]
+    assert plan1[0]["scenario_mode"] in {"contextual", "direct"}
+    assert "scenario_brief" in plan1[0]
+    assert "scenario_intent" in plan1[0]
+
+
+def test_build_question_plan_assigns_contextual_mix_only_to_supported_types():
+    plan = question_agent.build_question_plan(
+        content="【知识单元标题】\n隐私最小化\n\n【知识单元摘要】\n推荐系统上线前需检查脱敏与授权范围。\n\n【知识单元关键词】\n隐私最小化、授权范围、推荐系统\n\n【知识单元正文】\n推荐系统上线前，需要完成数据脱敏、用途评估和访问审计配置。系统还应记录高风险访问审批流程，并比较不同脱敏策略的影响。",
+        question_types=["single_choice", "multiple_choice", "true_false", "short_answer", "fill_blank"],
+        count=5,
+        difficulty=3,
+        prompt_seed=42,
+    )
+
+    contextual_items = [item for item in plan if item["scenario_mode"] == "contextual"]
+    assert len(contextual_items) == 2
+    assert all(item["question_type"] in {"single_choice", "multiple_choice", "short_answer"} for item in contextual_items)
+    assert all(item["scenario_brief"] for item in contextual_items)
+    assert all(item["scenario_intent"] in {"application", "comparison", "decision", "explanation"} for item in plan)
+    assert all(item["scenario_mode"] == "direct" for item in plan if item["question_type"] in {"true_false", "fill_blank"})
+
+
+def test_build_question_plan_batch_assigns_contextual_mix_for_material_slots():
+    plan = question_agent.build_question_plan_batch(
+        [
+            {"slot_index": 1, "question_type": "single_choice", "content": "【知识单元正文】\n上线前需要完成数据脱敏。"},
+            {"slot_index": 2, "question_type": "multiple_choice", "content": "【知识单元正文】\n比较不同授权策略的影响。"},
+            {"slot_index": 3, "question_type": "true_false", "content": "【知识单元正文】\n高风险访问前需要审批控制。"},
+            {"slot_index": 4, "question_type": "short_answer", "content": "【知识单元正文】\n说明访问审计为什么重要。"},
+        ],
+        difficulty=3,
+        prompt_seed=42,
+        source_mode="material",
+    )
+
+    assert [item["question_type"] for item in plan] == ["single_choice", "multiple_choice", "true_false", "short_answer"]
+    contextual_items = [item for item in plan if item["scenario_mode"] == "contextual"]
+    assert len(contextual_items) == 2
+    assert all(item["question_type"] in {"single_choice", "multiple_choice", "short_answer"} for item in contextual_items)
+    assert all(item["scenario_brief"].startswith("在") for item in contextual_items)
+
+
+def test_default_system_prompt_is_minimized_and_planner_led():
+    prompt = question_agent.DEFAULT_QUESTION_SYSTEM_PROMPT
+
+    assert "事实锚定优先" in prompt
+    assert "题型服从格式" in prompt
+    assert "题目风格目录" not in prompt
+    assert "正确答案位置分散" not in prompt
+    assert "资深社会人文学科教授" not in prompt
 
 
 def test_build_user_prompt_material_generation_includes_material_only_rules():
@@ -110,11 +164,12 @@ def test_build_user_prompt_material_generation_includes_material_only_rules():
         prompt_seed=42,
     )
 
-    assert "禁止出现书名、作者、出版信息、章节编号" in prompt
-    assert "同套题禁止重复知识点" in prompt
-    assert "\"一位……\"开头的题干最多只能出现2题" in prompt
-    assert "判断题题干必须是陈述句，禁止使用疑问句" in prompt
-    assert "生成后必须先自检" in prompt
+    assert "【素材使用原则】" in prompt
+    assert "只使用素材支持的知识点和结论出题" in prompt
+    assert "不考查作者、书名、章节、出版社、目录等素材出处信息" in prompt
+    assert "不要补充外部事实" in prompt
+    assert "同套题禁止重复知识点" not in prompt
+    assert "生成后必须先自检" not in prompt
 
 
 def test_build_user_prompt_adds_type_hard_rules_for_strict_types():
@@ -126,10 +181,23 @@ def test_build_user_prompt_adds_type_hard_rules_for_strict_types():
         prompt_seed=42,
     )
 
-    assert "【题型硬约束——优先级高于多样性要求】" in prompt
-    assert "判断题：题干必须写成可直接判断真假的完整陈述句" in prompt
+    assert "【题型最低约束】" in prompt
+    assert "判断题：题干必须是完整陈述句" in prompt
     assert "填空题：题干必须包含明确空位标记" in prompt
-    assert "若冲突，以题型硬约束为准" in prompt
+    assert "优先级高于多样性要求" not in prompt
+
+
+def test_build_user_prompt_adds_choice_quality_constraints():
+    prompt = question_agent._build_user_prompt(
+        content="人工智能伦理研究需要避免把争议观点写成唯一正确答案。",
+        question_types=["single_choice", "multiple_choice"],
+        count=2,
+        difficulty=3,
+        prompt_seed=42,
+    )
+
+    assert "单选题/多选题：必须提供 A/B/C/D 四个标准选项" in prompt
+    assert "四个选项必须同层级、同粒度、可比较" in prompt
 
 
 def test_build_user_prompt_includes_question_plan_section():
@@ -149,7 +217,12 @@ def test_build_user_prompt_includes_question_plan_section():
     )
 
     assert "【知识点出题规划】" in prompt
-    assert "证据锚点" in prompt
+    assert "核心事实锚点" in prompt
+    assert "证据摘录" in prompt
+    assert "考查目标" in prompt
+    assert "出题模式" in prompt
+    assert "轻场景导语" in prompt
+    assert "场景用途" in prompt
 
 
 def test_build_user_prompt_free_generation_omits_material_only_rules():
@@ -162,9 +235,11 @@ def test_build_user_prompt_free_generation_omits_material_only_rules():
         prompt_seed=42,
     )
 
-    assert "禁止出现书名、作者、出版信息、章节编号" not in prompt
+    assert "【素材使用原则】" not in prompt
     assert "同套题禁止重复知识点" not in prompt
     assert "生成后必须先自检" not in prompt
+    assert "先满足事实准确和题型格式" in prompt
+    assert "scenario_mode=contextual" in prompt
 
 
 def test_get_compare_models_defaults_to_all_supported_models():
@@ -200,6 +275,7 @@ def test_request_question_generation_routes_gemini_to_openai_compatible(monkeypa
         empty_usage,
         response_format=None,
         parse_response_format=None,
+        allow_text_fallback_on_parse_error=True,
         temperature=0.4,
     ):
         called["slug"] = model_config.slug
@@ -210,6 +286,7 @@ def test_request_question_generation_routes_gemini_to_openai_compatible(monkeypa
         called["count"] = count
         called["response_format"] = response_format
         called["parse_response_format"] = parse_response_format
+        called["allow_text_fallback_on_parse_error"] = allow_text_fallback_on_parse_error
         called["temperature"] = temperature
         return {"content": "[]", "usage": empty_usage}
 
@@ -238,6 +315,7 @@ def test_request_question_generation_routes_gemini_to_openai_compatible(monkeypa
         "count": 2,
         "response_format": None,
         "parse_response_format": None,
+        "allow_text_fallback_on_parse_error": True,
         "temperature": 0.4,
     }
     assert result["content"] == "[]"

@@ -11,6 +11,7 @@ from app.agents.question_agent import (
     QUESTION_PROMPT_TEMPLATE_PLACEHOLDERS,
     TYPE_LABELS,
     build_question_plan,
+    build_question_plan_batch,
     build_question_prompt_context,
     render_user_prompt,
     validate_user_prompt_template,
@@ -19,6 +20,7 @@ from app.models.material import KnowledgeUnit, Material
 from app.models.question_prompt_profile import QuestionPromptProfile
 from app.services.question_service import (
     _allocate_counts_by_weights,
+    _build_material_generation_slots,
     _build_knowledge_unit_prompt_content,
     _count_requested_questions,
     _material_generation_weight,
@@ -202,8 +204,9 @@ def _render_prompt_preview_item(
     custom_prompt: Optional[str],
     prompt_seed: int,
     title: str,
+    question_plan: Optional[list[dict]] = None,
 ) -> dict:
-    question_plan = build_question_plan(
+    resolved_plan = question_plan or build_question_plan(
         content=content,
         question_types=question_types,
         count=count,
@@ -220,7 +223,7 @@ def _render_prompt_preview_item(
         bloom_level=bloom_level,
         custom_prompt=custom_prompt,
         prompt_seed=prompt_seed,
-        question_plan=question_plan,
+        question_plan=resolved_plan,
     )
     return {
         "title": title,
@@ -316,27 +319,48 @@ async def _build_material_prompt_preview_items(
         else:
             units = item["units"]
         unit_type_plan = _plan_unit_type_distribution(units, planned_distribution)
+        generation_slots = _build_material_generation_slots(
+            units,
+            planned_distribution,
+            unit_type_plan,
+        )
+        planned_items = build_question_plan_batch(
+            [
+                {
+                    "slot_index": slot["slot_index"],
+                    "question_type": slot["question_type"],
+                    "content": slot["planner_content"],
+                }
+                for slot in generation_slots
+            ],
+            difficulty=difficulty,
+            bloom_level=bloom_level,
+            custom_prompt=custom_prompt,
+            prompt_seed=prompt_seed,
+            source_mode="material",
+        )
 
-        for index, unit in enumerate(units):
-            for question_type, count_for_unit in unit_type_plan.get(unit.id, {}).items():
-                if count_for_unit <= 0:
-                    continue
-                rendered_items.append(
-                    _render_prompt_preview_item(
-                        prompt_config=prompt_config,
-                        content=_build_knowledge_unit_prompt_content(unit),
-                        question_types=[question_type],
-                        count=count_for_unit,
-                        difficulty=difficulty,
-                        bloom_level=bloom_level,
-                        custom_prompt=custom_prompt,
-                        prompt_seed=prompt_seed,
-                        title=(
-                            f"素材《{material.title}》 / 知识单元 {index + 1} / "
-                            f"{TYPE_LABELS.get(question_type, question_type)} / {count_for_unit} 题"
-                        ),
-                    )
+        unit_index_map = {unit.id: index for index, unit in enumerate(units, start=1)}
+        for slot_index, slot in enumerate(generation_slots):
+            unit = slot["knowledge_unit"]
+            question_type = slot["question_type"]
+            rendered_items.append(
+                _render_prompt_preview_item(
+                    prompt_config=prompt_config,
+                    content=slot["generator_content"],
+                    question_types=[question_type],
+                    count=1,
+                    difficulty=difficulty,
+                    bloom_level=bloom_level,
+                    custom_prompt=custom_prompt,
+                    prompt_seed=prompt_seed,
+                    title=(
+                        f"素材《{material.title}》 / 知识单元 {unit_index_map.get(unit.id, slot_index + 1)} / "
+                        f"{TYPE_LABELS.get(question_type, question_type)} / 1 题"
+                    ),
+                    question_plan=[planned_items[slot_index]] if slot_index < len(planned_items) else None,
                 )
+            )
 
     return rendered_items
 
