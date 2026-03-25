@@ -1,5 +1,6 @@
 import io
 import zipfile
+import uuid
 
 import pytest
 from httpx import AsyncClient, ASGITransport
@@ -9,7 +10,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from app.main import app
 from app.core.database import Base, get_db
 from app.core.config import settings
-from app.services.user_service import init_roles
+from app.core.security import create_access_token
+from app.services.user_service import create_user, init_roles
 
 
 async def override_get_db():
@@ -44,21 +46,39 @@ async def setup_db():
     yield
 
 
+@pytest.fixture(autouse=True)
+def disable_material_auto_parse(monkeypatch):
+    async def _noop_trigger_parse(material_id):
+        return None
+
+    monkeypatch.setattr("app.api.v1.endpoints.materials.trigger_parse", _noop_trigger_parse)
+
+
 def get_client():
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
 
 async def register_user(client, role="organizer"):
     """Helper to register a user and return auth token."""
-    import uuid
     unique = uuid.uuid4().hex[:8]
-    resp = await client.post("/api/v1/auth/register", json={
-        "username": f"user_{unique}",
-        "email": f"{unique}@test.com",
-        "password": "password123",
-        "role": role,
-    })
-    return resp.json()["access_token"]
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = await create_user(
+            session,
+            username=f"user_{unique}",
+            email=f"{unique}@test.com",
+            password="password123",
+            role_name=role,
+            is_active=True,
+        )
+        await session.commit()
+        token = create_access_token(
+            subject=str(user.id),
+            extra_claims={"role": user.role.name.value},
+        )
+    await engine.dispose()
+    return token
 
 
 def build_test_epub_bytes() -> bytes:
@@ -287,6 +307,85 @@ async def test_list_materials_with_keyword():
         )
     assert resp.status_code == 200
     assert resp.json()["total"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_list_materials_includes_approved_question_count():
+    async with get_client() as client:
+        org_token = await register_user(client, "organizer")
+        rev_token = await register_user(client, "reviewer")
+        org_headers = {"Authorization": f"Bearer {org_token}"}
+        rev_headers = {"Authorization": f"Bearer {rev_token}"}
+
+        upload = await client.post(
+            "/api/v1/materials",
+            files={"file": ("count.pdf", b"content", "application/pdf")},
+            data={"title": f"题目数量素材-{uuid.uuid4().hex[:8]}"},
+            headers=org_headers,
+        )
+        material_id = upload.json()["id"]
+        material_title = upload.json()["title"]
+
+        approved_question = await client.post(
+            "/api/v1/questions",
+            json={
+                "question_type": "single_choice",
+                "stem": "已通过题目",
+                "correct_answer": "A",
+                "options": {"A": "1", "B": "2"},
+                "source_material_id": material_id,
+            },
+            headers=org_headers,
+        )
+        approved_question_id = approved_question.json()["id"]
+        await client.post(f"/api/v1/questions/{approved_question_id}/submit", headers=org_headers)
+        await client.post(
+            f"/api/v1/questions/{approved_question_id}/review",
+            json={"action": "approve", "comment": "通过"},
+            headers=rev_headers,
+        )
+
+        rejected_question = await client.post(
+            "/api/v1/questions",
+            json={
+                "question_type": "single_choice",
+                "stem": "已拒绝题目",
+                "correct_answer": "A",
+                "options": {"A": "1", "B": "2"},
+                "source_material_id": material_id,
+            },
+            headers=org_headers,
+        )
+        rejected_question_id = rejected_question.json()["id"]
+        await client.post(f"/api/v1/questions/{rejected_question_id}/submit", headers=org_headers)
+        await client.post(
+            f"/api/v1/questions/{rejected_question_id}/review",
+            json={"action": "reject", "comment": "拒绝"},
+            headers=rev_headers,
+        )
+
+        await client.post(
+            "/api/v1/questions",
+            json={
+                "question_type": "single_choice",
+                "stem": "草稿题目",
+                "correct_answer": "A",
+                "options": {"A": "1", "B": "2"},
+                "source_material_id": material_id,
+            },
+            headers=org_headers,
+        )
+
+        resp = await client.get(
+            f"/api/v1/materials?keyword={material_title}",
+            headers=org_headers,
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] >= 1
+    item = next(entry for entry in data["data"] if entry["id"] == material_id)
+    assert item["approved_question_count"] == 1
 
 
 # ---- Get / Download / Delete Tests ----

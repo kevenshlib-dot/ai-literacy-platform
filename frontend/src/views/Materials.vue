@@ -269,6 +269,7 @@ interface Material {
   tags: string[] | null
   source_url: string | null
   quality_score: number | null
+  approved_question_count: number
   uploaded_by: string
   created_at: string
   updated_at: string
@@ -280,6 +281,7 @@ const columns = [
   { title: '格式', key: 'format', width: 100 },
   { title: '大小', key: 'file_size', width: 100 },
   { title: '状态', key: 'status', width: 100 },
+  { title: '题目数量（已审核）', dataIndex: 'approved_question_count', key: 'approved_question_count', width: 140 },
   { title: '分类', dataIndex: 'category', key: 'category', width: 120 },
   { title: '上传时间', key: 'created_at', width: 160 },
   { title: '操作', key: 'actions', width: 200, fixed: 'right' as const },

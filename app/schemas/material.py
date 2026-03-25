@@ -33,6 +33,7 @@ class MaterialResponse(BaseModel):
     tags: Optional[list] = None
     source_url: Optional[str] = None
     quality_score: Optional[float] = None
+    approved_question_count: int = 0
     uploaded_by: UUID
     created_at: datetime
     updated_at: datetime

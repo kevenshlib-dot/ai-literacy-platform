@@ -6,7 +6,7 @@ from sqlalchemy import select, func, desc, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.material import Material, MaterialStatus, KnowledgeUnit
-from app.models.question import Question
+from app.models.question import Question, QuestionStatus
 from app.services.minio_service import upload_file, delete_file, get_presigned_url
 
 
@@ -61,7 +61,25 @@ async def list_materials(
     uploaded_by: uuid.UUID = None,
 ) -> tuple[list[Material], int]:
     """List materials with filters and pagination."""
-    query = select(Material)
+    approved_question_counts = (
+        select(
+            Question.source_material_id.label("material_id"),
+            func.count(Question.id).label("approved_question_count"),
+        )
+        .where(
+            Question.source_material_id.isnot(None),
+            Question.status == QuestionStatus.APPROVED,
+        )
+        .group_by(Question.source_material_id)
+        .subquery()
+    )
+
+    query = select(
+        Material,
+        func.coalesce(approved_question_counts.c.approved_question_count, 0).label(
+            "approved_question_count"
+        ),
+    ).outerjoin(approved_question_counts, approved_question_counts.c.material_id == Material.id)
     count_query = select(func.count(Material.id))
 
     if status:
@@ -84,7 +102,10 @@ async def list_materials(
     total = await db.scalar(count_query)
     query = query.order_by(desc(Material.created_at)).offset(skip).limit(limit)
     result = await db.execute(query)
-    materials = list(result.scalars().all())
+    materials: list[Material] = []
+    for material, approved_question_count in result.all():
+        setattr(material, "approved_question_count", int(approved_question_count or 0))
+        materials.append(material)
 
     return materials, total
 
