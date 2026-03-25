@@ -2,6 +2,7 @@
 
 from app.agents.question_agent import (
     _contains_material_reference,
+    _contains_prompt_instruction_leakage,
     _validate_and_fix_question,
 )
 
@@ -17,6 +18,12 @@ def test_contains_material_reference_still_blocks_real_material_metadata():
     assert _contains_material_reference("第3章介绍了系统部署") is True
     assert _contains_material_reference("作者：张三") is True
     assert _contains_material_reference("出版社：测试出版社") is True
+
+
+def test_contains_prompt_instruction_leakage_detects_planning_markers():
+    assert _contains_prompt_instruction_leakage("【题目槽位 1 参考素材】") is True
+    assert _contains_prompt_instruction_leakage("请参考证据锚点设计题目") is True
+    assert _contains_prompt_instruction_leakage("多个节点环境中部署实例") is False
 
 
 def test_validate_and_fix_question_rejects_non_statement_true_false():
@@ -57,3 +64,43 @@ def test_validate_and_fix_question_rejects_fill_blank_without_blank_marker():
 
     assert fixed is None
     assert rejection_reasons == ["填空题题干必须包含明确空位标记"]
+
+
+def test_validate_and_fix_question_rejects_material_reference_content():
+    rejection_reasons = []
+    fixed = _validate_and_fix_question(
+        {
+            "question_type": "single_choice",
+            "dimension": "AI基础知识",
+            "stem": "根据本文内容，以下哪项做法更合理？",
+            "options": {"A": "方案A", "B": "方案B", "C": "方案C", "D": "方案D"},
+            "correct_answer": "A",
+            "explanation": "解释说明。",
+            "knowledge_tags": ["测试"],
+        },
+        ["single_choice"],
+        rejection_reasons,
+    )
+
+    assert fixed is None
+    assert rejection_reasons == ["题目包含素材元信息或禁用表述"]
+
+
+def test_validate_and_fix_question_rejects_prompt_instruction_leakage():
+    rejection_reasons = []
+    fixed = _validate_and_fix_question(
+        {
+            "question_type": "single_choice",
+            "dimension": "AI基础知识",
+            "stem": "【题目槽位 2 参考素材】以下哪项更符合要求？",
+            "options": {"A": "方案A", "B": "方案B", "C": "方案C", "D": "方案D"},
+            "correct_answer": "A",
+            "explanation": "请参考证据锚点作答。",
+            "knowledge_tags": ["测试"],
+        },
+        ["single_choice"],
+        rejection_reasons,
+    )
+
+    assert fixed is None
+    assert rejection_reasons == ["题目泄漏了规划或提示词标记"]

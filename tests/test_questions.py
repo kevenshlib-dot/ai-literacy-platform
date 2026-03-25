@@ -85,6 +85,18 @@ def test_template_fallback_short_answer():
     assert questions[0]["question_type"] == "short_answer"
 
 
+def test_build_slot_batch_generator_content_uses_neutral_slot_markers():
+    content = question_service._build_slot_batch_generator_content([
+        {"slot_index": 1, "generator_content": "【知识单元正文】\n片段一"},
+        {"slot_index": 2, "generator_content": "【知识单元正文】\n片段二"},
+    ])
+
+    assert "题目槽位" not in content
+    assert "参考素材" not in content
+    assert "<slot index=\"1\">" in content
+    assert "<slot index=\"2\">" in content
+
+
 def test_template_fallback_mixed_types():
     """Mixed types cycle through the list."""
     questions = _template_fallback(

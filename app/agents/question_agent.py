@@ -5,10 +5,11 @@ import logging
 import random
 import re
 from itertools import combinations
-from typing import Optional
+from typing import Annotated, Any, Literal, Optional
 
 from openai import OpenAI
 from httpx import Timeout
+from pydantic import BaseModel, Field, RootModel
 
 from app.core.config import settings
 from app.agents.llm_utils import (
@@ -244,6 +245,20 @@ FORBIDDEN_MATERIAL_REGEXES = [
 ]
 
 GARBLED_TEXT_MARKERS = ["�", "\x00", "□", "�", "锟斤拷"]
+PROMPT_LEAKAGE_MARKERS = [
+    "题目槽位",
+    "参考素材",
+    "知识点出题规划",
+    "证据锚点",
+    "推荐风格",
+    "推荐场景",
+    "正确答案聚焦",
+    "干扰项设计",
+    "建议标签",
+    "建议维度",
+    "<slot",
+    "slot_index",
+]
 MAX_ROLE_LEAD_STEMS = 2
 MATERIAL_GENERATION_MAX_ATTEMPTS = 2
 STRUCTURED_OUTPUT_UNSUPPORTED_HOSTS = ("localhost", "127.0.0.1", "100.64.", "192.168.", "10.", "172.")
@@ -852,6 +867,8 @@ def _build_question_plan_section(question_plan: Optional[list[dict]]) -> str:
         lines.append(f"   - 干扰项设计：{item.get('distractor_focus', '')}")
         lines.append(f"   - 建议标签：{tags}")
         lines.append(f"   - 建议维度：{item.get('dimension', '')}")
+    lines.append("生成题目时不得直接复述上述字段名，也不得在题干、选项或解析中出现“素材/材料/本文/参考素材/槽位”等来源提示。")
+    lines.append("若多道题使用人物/职业情境，职业角色必须不同，且最多仅 2 道题可以“一位……”开头。")
     return "\n".join(lines)
 
 
@@ -876,6 +893,22 @@ def _build_question_response_format(count: int, question_types: list[str]) -> di
             },
         },
     }
+
+
+class _QuestionPlanItemModel(BaseModel):
+    knowledge_point: str
+    evidence: str
+    question_type: str
+    stem_style: str
+    scenario: str
+    answer_focus: str
+    distractor_focus: str
+    knowledge_tags: list[str]
+    dimension: str
+
+
+class _QuestionPlanResponseModel(RootModel[list[_QuestionPlanItemModel]]):
+    pass
 
 
 def _build_question_plan_response_format(count: int) -> dict:
@@ -1050,7 +1083,7 @@ def _normalize_question_plan_items(
                 fallback_item,
             )
         )
-    return normalized[:count]
+    return _rebalance_duplicate_question_plan_items(normalized[:count], fallback_plan[:count])
 
 
 def _normalize_question_plan_batch_items(
@@ -1083,7 +1116,40 @@ def _normalize_question_plan_batch_items(
         )
         item["question_type"] = slot_request["question_type"]
         normalized.append(item)
-    return normalized
+    return _rebalance_duplicate_question_plan_items(normalized, fallback_plan)
+
+
+def _question_plan_signature(item: Optional[dict]) -> str:
+    if not item:
+        return ""
+    knowledge_point = _normalize_text_for_compare(str(item.get("knowledge_point", "") or ""))
+    evidence = _normalize_text_for_compare(str(item.get("evidence", "") or ""))
+    return knowledge_point or evidence
+
+
+def _rebalance_duplicate_question_plan_items(
+    items: list[dict],
+    fallback_plan: list[dict],
+) -> list[dict]:
+    rebalanced: list[dict] = []
+    used_signatures: set[str] = set()
+
+    for index, item in enumerate(items):
+        fallback_item = fallback_plan[index] if index < len(fallback_plan) else item
+        candidate = dict(item or {})
+        candidate_signature = _question_plan_signature(candidate)
+        fallback_signature = _question_plan_signature(fallback_item)
+
+        if candidate_signature and candidate_signature in used_signatures:
+            if fallback_signature and fallback_signature not in used_signatures:
+                candidate = dict(fallback_item)
+                candidate_signature = fallback_signature
+
+        if candidate_signature:
+            used_signatures.add(candidate_signature)
+        rebalanced.append(candidate)
+
+    return rebalanced
 
 
 def _build_question_plan_user_prompt(
@@ -1111,7 +1177,9 @@ def _build_question_plan_user_prompt(
         "3. question_type 只能从允许题型中选择；\n"
         "4. dimension 必须是五个 AI 素养维度之一；\n"
         "5. knowledge_tags 必须是简洁的字符串数组；\n"
-        "6. 不要输出题干、选项和答案，只输出规划。\n"
+        "6. 若使用人物/职业情境，角色设定要彼此不同，避免多条规划沿用同一角色模板；\n"
+        "7. 最终题目中不得出现“素材/材料/本文/上文/下文/参考素材/槽位”等来源提示，也不得复述规划字段名；\n"
+        "8. 不要输出题干、选项和答案，只输出规划。\n"
         f"{_build_plan_type_requirements(question_types)}\n"
         f"{extra}\n\n"
         f"{content or '【出题范围】AI素养通识知识'}"
@@ -1146,9 +1214,12 @@ def _build_question_plan_batch_user_prompt(
         "1. 每个元素必须通过 slot_index 与对应槽位一一匹配，不得遗漏、重复或合并；\n"
         "2. question_type 必须与槽位指定题型一致；\n"
         "3. 只能基于对应槽位的知识片段规划，不得跨槽位引用其他片段；\n"
-        "4. 不同槽位应尽量覆盖各自片段中最适合考查的不同知识点；\n"
-        "5. evidence 必须是该槽位片段中的证据句或高保真摘要；\n"
-        "6. 不要输出题干、选项和答案，只输出规划。\n"
+        "4. 不同槽位的 knowledge_point 必须在语义上明显不同，不能只是同一概念的改写；\n"
+        "5. 不同槽位应尽量覆盖各自片段中最适合考查的不同知识点；\n"
+        "6. evidence 必须是该槽位片段中的证据句或高保真摘要；\n"
+        "7. 若规划使用人物/职业情境，角色设定必须彼此不同，避免重复使用同一职业模板；\n"
+        "8. 最终题目中不得出现“素材/材料/本文/上文/下文/参考素材/槽位”等来源提示，也不得复述规划字段名；\n"
+        "9. 不要输出题干、选项和答案，只输出规划。\n"
         f"{extra}\n\n"
         f"{chr(10).join(slot_lines)}"
     )
@@ -1202,10 +1273,14 @@ def generate_question_plan_via_llm(
             count,
             empty_usage,
             response_format=_build_question_plan_response_format(count),
+            parse_response_format=_QuestionPlanResponseModel,
             temperature=0.2,
         )
-        raw = extract_json_text(response_data["content"])
-        plan_items = json.loads(raw)
+        if response_data.get("parsed") is not None:
+            plan_items = response_data["parsed"]
+        else:
+            raw = extract_json_text(response_data["content"])
+            plan_items = json.loads(raw)
         normalized = _normalize_question_plan_items(
             plan_items,
             question_types,
@@ -1226,7 +1301,124 @@ def generate_question_plan_via_llm(
             "usage": empty_usage,
             "fallback_used": True,
             "error": str(exc),
-        }
+    }
+
+
+class _QuestionPlanBatchItemModel(_QuestionPlanItemModel):
+    slot_index: int
+
+
+class _QuestionPlanBatchResponseModel(RootModel[list[_QuestionPlanBatchItemModel]]):
+    pass
+
+
+class _ChoiceOptionsModel(BaseModel):
+    A: str
+    B: str
+    C: str
+    D: str
+
+    model_config = {"extra": "forbid"}
+
+
+class _TrueFalseOptionsModel(BaseModel):
+    A: Literal["正确"]
+    B: Literal["错误"]
+
+    model_config = {"extra": "forbid"}
+
+
+class _GeneratedQuestionBaseModel(BaseModel):
+    dimension: str
+    stem: str
+    correct_answer: str
+    explanation: str
+    knowledge_tags: list[str]
+    rubric: Optional[dict] = None
+
+    model_config = {"extra": "allow"}
+
+
+class _GeneratedSingleChoiceModel(_GeneratedQuestionBaseModel):
+    question_type: Literal["single_choice"]
+    options: _ChoiceOptionsModel
+
+
+class _GeneratedMultipleChoiceModel(_GeneratedQuestionBaseModel):
+    question_type: Literal["multiple_choice"]
+    options: _ChoiceOptionsModel
+
+
+class _GeneratedTrueFalseModel(_GeneratedQuestionBaseModel):
+    question_type: Literal["true_false"]
+    options: _TrueFalseOptionsModel
+
+
+class _GeneratedFillBlankModel(_GeneratedQuestionBaseModel):
+    question_type: Literal["fill_blank"]
+    options: None = None
+
+
+class _GeneratedShortAnswerModel(_GeneratedQuestionBaseModel):
+    question_type: Literal["short_answer", "essay", "sjt"]
+    options: None = None
+
+
+GeneratedQuestionUnion = Annotated[
+    (
+        _GeneratedSingleChoiceModel
+        | _GeneratedMultipleChoiceModel
+        | _GeneratedTrueFalseModel
+        | _GeneratedFillBlankModel
+        | _GeneratedShortAnswerModel
+    ),
+    Field(discriminator="question_type"),
+]
+
+
+class _GeneratedSingleChoiceResponseModel(RootModel[list[_GeneratedSingleChoiceModel]]):
+    pass
+
+
+class _GeneratedMultipleChoiceResponseModel(RootModel[list[_GeneratedMultipleChoiceModel]]):
+    pass
+
+
+class _GeneratedTrueFalseResponseModel(RootModel[list[_GeneratedTrueFalseModel]]):
+    pass
+
+
+class _GeneratedFillBlankResponseModel(RootModel[list[_GeneratedFillBlankModel]]):
+    pass
+
+
+class _GeneratedShortAnswerResponseModel(RootModel[list[_GeneratedShortAnswerModel]]):
+    pass
+
+
+class _GeneratedMixedQuestionResponseModel(RootModel[list[GeneratedQuestionUnion]]):
+    pass
+
+
+def _build_generated_question_parse_model(question_types: list[str]) -> type[BaseModel]:
+    normalized_types = [
+        question_type
+        for question_type in dict.fromkeys(question_types)
+        if question_type in VALID_TYPES
+    ] or ["single_choice"]
+    if len(normalized_types) > 1:
+        return _GeneratedMixedQuestionResponseModel
+
+    question_type = normalized_types[0]
+    if question_type == "single_choice":
+        return _GeneratedSingleChoiceResponseModel
+    if question_type == "multiple_choice":
+        return _GeneratedMultipleChoiceResponseModel
+    if question_type == "true_false":
+        return _GeneratedTrueFalseResponseModel
+    if question_type == "fill_blank":
+        return _GeneratedFillBlankResponseModel
+    return _GeneratedShortAnswerResponseModel
 
 
 def _build_question_plan_batch_response_format(count: int) -> dict:
@@ -1274,6 +1466,37 @@ def _build_question_plan_batch_response_format(count: int) -> dict:
             },
         },
     }
+
+
+def _dump_structured_output(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    if isinstance(value, list):
+        return [_dump_structured_output(item) for item in value]
+    if isinstance(value, tuple):
+        return [_dump_structured_output(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _dump_structured_output(item) for key, item in value.items()}
+    return value
+
+
+def _extract_response_content(message: Any) -> str:
+    content = getattr(message, "content", "") or ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+            elif hasattr(item, "text"):
+                parts.append(str(getattr(item, "text", "")))
+            else:
+                parts.append(str(item))
+        return "".join(parts).strip()
+    return str(content).strip()
 
 
 def generate_question_plan_batch_via_llm(
@@ -1342,10 +1565,14 @@ def generate_question_plan_batch_via_llm(
             len(normalized_slot_requests),
             empty_usage,
             response_format=_build_question_plan_batch_response_format(len(normalized_slot_requests)),
+            parse_response_format=_QuestionPlanBatchResponseModel,
             temperature=0.2,
         )
-        raw = extract_json_text(response_data["content"])
-        plan_items = json.loads(raw)
+        if response_data.get("parsed") is not None:
+            plan_items = response_data["parsed"]
+        else:
+            raw = extract_json_text(response_data["content"])
+            plan_items = json.loads(raw)
         normalized = _normalize_question_plan_batch_items(
             plan_items,
             normalized_slot_requests,
@@ -1768,6 +1995,23 @@ def _validate_and_fix_question(
     else:
         raw["explanation"] = explanation.strip()
 
+    combined_text_parts = [raw["stem"], raw["explanation"]]
+    if isinstance(raw.get("options"), dict):
+        combined_text_parts.extend(str(value) for value in raw["options"].values())
+    combined_text = "\n".join(part for part in combined_text_parts if part)
+    if _contains_material_reference(combined_text):
+        logger.warning(f"题目包含素材元信息或禁用表述，已丢弃: {stem[:30]}")
+        reject("题目包含素材元信息或禁用表述")
+        return None
+    if _contains_prompt_instruction_leakage(combined_text):
+        logger.warning(f"题目泄漏了规划或提示词标记，已丢弃: {stem[:30]}")
+        reject("题目泄漏了规划或提示词标记")
+        return None
+    if _contains_garbled_text(combined_text):
+        logger.warning(f"题目存在乱码残留，已丢弃: {stem[:30]}")
+        reject("题目存在乱码残留")
+        return None
+
     # ── 6. knowledge_tags 规范化 ──
     tags = raw.get("knowledge_tags")
     if isinstance(tags, str):
@@ -1825,6 +2069,13 @@ def _contains_material_reference(text: str) -> bool:
     if any(token in text for token in FORBIDDEN_MATERIAL_REFERENCES):
         return True
     return any(pattern.search(text) for pattern in FORBIDDEN_MATERIAL_REGEXES)
+
+
+def _contains_prompt_instruction_leakage(text: str) -> bool:
+    if not text:
+        return False
+    normalized = text.lower()
+    return any(marker.lower() in normalized for marker in PROMPT_LEAKAGE_MARKERS)
 
 
 def _contains_garbled_text(text: str) -> bool:
@@ -2064,11 +2315,16 @@ def generate_questions_via_llm(
                 count,
                 _empty_usage,
                 response_format=_build_question_response_format(count, question_types),
+                parse_response_format=_build_generated_question_parse_model(question_types),
+                allow_text_fallback_on_parse_error=False,
                 temperature=0.4,
             )
             generation_usage = _sum_usage(generation_usage, response_data["usage"])
-            raw = extract_json_text(response_data["content"])
-            questions = _extract_question_payload(json.loads(raw))
+            if response_data.get("parsed") is not None:
+                questions = _extract_question_payload(response_data["parsed"])
+            else:
+                raw = extract_json_text(response_data["content"])
+                questions = _extract_question_payload(json.loads(raw))
 
             validated: list[dict] = []
             rejection_reasons: list[str] = []
@@ -2209,6 +2465,8 @@ def _request_question_generation(
     count: int,
     empty_usage: dict,
     response_format: Optional[dict] = None,
+    parse_response_format: Optional[type[BaseModel]] = None,
+    allow_text_fallback_on_parse_error: bool = True,
     temperature: float = 0.4,
 ) -> dict:
     """Dispatch question generation to the right provider."""
@@ -2221,6 +2479,8 @@ def _request_question_generation(
         count,
         empty_usage,
         response_format=response_format,
+        parse_response_format=parse_response_format,
+        allow_text_fallback_on_parse_error=allow_text_fallback_on_parse_error,
         temperature=temperature,
     )
 
@@ -2234,6 +2494,8 @@ def _request_question_generation_openai_compatible(
     count: int,
     empty_usage: dict,
     response_format: Optional[dict] = None,
+    parse_response_format: Optional[type[BaseModel]] = None,
+    allow_text_fallback_on_parse_error: bool = True,
     temperature: float = 0.4,
 ) -> dict:
     client = OpenAI(
@@ -2258,26 +2520,61 @@ def _request_question_generation_openai_compatible(
     )
     if extra_body:
         request_kwargs["extra_body"] = extra_body
-    if response_format and _supports_structured_output(model_config):
+    supports_structured_output = _supports_structured_output(model_config)
+    if response_format and supports_structured_output:
         request_kwargs["response_format"] = response_format
 
-    try:
-        response = client.chat.completions.create(
-            **request_kwargs,
-        )
-    except Exception as exc:
-        if request_kwargs.get("response_format") and _should_retry_without_structured_output(exc):
-            logger.warning(
-                "Structured output unsupported for model %s, retrying without response_format: %s",
-                model_config.model_name,
-                exc,
+    response = None
+    parsed = None
+    structured_mode = "plain_text"
+
+    if parse_response_format and supports_structured_output:
+        parse_kwargs = dict(request_kwargs)
+        parse_kwargs.pop("response_format", None)
+        try:
+            response = client.beta.chat.completions.parse(
+                **parse_kwargs,
+                response_format=parse_response_format,
             )
-            request_kwargs.pop("response_format", None)
+            message = response.choices[0].message
+            parsed = _dump_structured_output(getattr(message, "parsed", None))
+            structured_mode = "parse" if parsed is not None else "response_format_text"
+        except Exception as exc:
+            if _should_retry_without_structured_output(exc):
+                logger.warning(
+                    "Structured parse unsupported for model %s, retrying without parse path: %s",
+                    model_config.model_name,
+                    exc,
+                )
+            elif allow_text_fallback_on_parse_error:
+                logger.warning(
+                    "Structured parse failed for model %s, falling back to text path: %s",
+                    model_config.model_name,
+                    exc,
+                )
+            else:
+                raise
+
+    if response is None:
+        try:
             response = client.chat.completions.create(
                 **request_kwargs,
             )
-        else:
-            raise
+            structured_mode = "response_format_text" if request_kwargs.get("response_format") else "plain_text"
+        except Exception as exc:
+            if request_kwargs.get("response_format") and _should_retry_without_structured_output(exc):
+                logger.warning(
+                    "Structured output unsupported for model %s, retrying without response_format: %s",
+                    model_config.model_name,
+                    exc,
+                )
+                request_kwargs.pop("response_format", None)
+                response = client.chat.completions.create(
+                    **request_kwargs,
+                )
+                structured_mode = "plain_text"
+            else:
+                raise
 
     usage = empty_usage
     if response.usage:
@@ -2288,7 +2585,9 @@ def _request_question_generation_openai_compatible(
         }
 
     return {
-        "content": response.choices[0].message.content.strip(),
+        "content": _extract_response_content(response.choices[0].message),
+        "parsed": parsed,
+        "structured_mode": structured_mode,
         "usage": usage,
     }
 

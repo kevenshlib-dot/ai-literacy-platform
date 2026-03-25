@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from app.agents import question_agent
 from app.agents.llm_utils import build_disable_thinking_extra_body
@@ -198,6 +199,7 @@ def test_request_question_generation_routes_gemini_to_openai_compatible(monkeypa
         count,
         empty_usage,
         response_format=None,
+        parse_response_format=None,
         temperature=0.4,
     ):
         called["slug"] = model_config.slug
@@ -207,6 +209,7 @@ def test_request_question_generation_routes_gemini_to_openai_compatible(monkeypa
         called["max_tokens"] = max_tokens
         called["count"] = count
         called["response_format"] = response_format
+        called["parse_response_format"] = parse_response_format
         called["temperature"] = temperature
         return {"content": "[]", "usage": empty_usage}
 
@@ -234,6 +237,7 @@ def test_request_question_generation_routes_gemini_to_openai_compatible(monkeypa
         "max_tokens": 512,
         "count": 2,
         "response_format": None,
+        "parse_response_format": None,
         "temperature": 0.4,
     }
     assert result["content"] == "[]"
@@ -315,6 +319,118 @@ def test_openai_compatible_request_retries_without_response_format(monkeypatch):
     assert "response_format" not in captured_calls[1]
     assert result["content"] == "[]"
     assert result["usage"]["total_tokens"] == 3
+
+
+def test_openai_compatible_request_prefers_parse_response_when_available(monkeypatch):
+    parse_calls = []
+    create_calls = []
+
+    class FakeUsage:
+        prompt_tokens = 3
+        completion_tokens = 4
+        total_tokens = 7
+
+    class FakeMessage:
+        content = '[{"knowledge_point":"隐私最小化"}]'
+        parsed = question_agent._QuestionPlanResponseModel([
+            question_agent._QuestionPlanItemModel(
+                knowledge_point="隐私最小化",
+                evidence="上线前需要完成数据脱敏。",
+                question_type="single_choice",
+                stem_style="情景应用型",
+                scenario="课堂学习场景",
+                answer_focus="先做数据脱敏",
+                distractor_focus="混入扩大采集等误解",
+                knowledge_tags=["隐私最小化"],
+                dimension="AI伦理安全",
+            )
+        ])
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        usage = FakeUsage()
+        choices = [FakeChoice()]
+
+    class FakeCompletions:
+        def parse(self, **kwargs):
+            parse_calls.append(kwargs)
+            return FakeResponse()
+
+        def create(self, **kwargs):
+            create_calls.append(kwargs)
+            raise AssertionError("create should not be called when parse succeeds")
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            completions = FakeCompletions()
+            self.chat = type("Chat", (), {"completions": completions})()
+            self.beta = type(
+                "Beta",
+                (),
+                {"chat": type("Chat", (), {"completions": completions})()},
+            )()
+
+    monkeypatch.setattr(question_agent, "OpenAI", FakeClient)
+
+    result = question_agent._request_question_generation_openai_compatible(
+        model_config=get_compare_models(["local_qwen"])[0],
+        api_key="test-key",
+        system_prompt="system",
+        user_prompt="prompt",
+        max_tokens=512,
+        count=1,
+        empty_usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        response_format=question_agent._build_question_plan_response_format(1),
+        parse_response_format=question_agent._QuestionPlanResponseModel,
+    )
+
+    assert len(parse_calls) == 1
+    assert not create_calls
+    assert result["structured_mode"] == "parse"
+    assert result["parsed"][0]["knowledge_point"] == "隐私最小化"
+    assert result["usage"]["total_tokens"] == 7
+
+
+def test_openai_compatible_request_does_not_fallback_to_text_on_parse_validation_error(monkeypatch):
+    create_calls = []
+
+    class FakeCompletions:
+        def parse(self, **kwargs):
+            raise ValueError("Field required: options")
+
+        def create(self, **kwargs):
+            create_calls.append(kwargs)
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            completions = FakeCompletions()
+            self.chat = type("Chat", (), {"completions": completions})()
+            self.beta = type(
+                "Beta",
+                (),
+                {"chat": type("Chat", (), {"completions": completions})()},
+            )()
+
+    monkeypatch.setattr(question_agent, "OpenAI", FakeClient)
+
+    with pytest.raises(ValueError, match="options"):
+        question_agent._request_question_generation_openai_compatible(
+            model_config=get_compare_models(["local_qwen"])[0],
+            api_key="test-key",
+            system_prompt="system",
+            user_prompt="prompt",
+            max_tokens=512,
+            count=1,
+            empty_usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            response_format=question_agent._build_question_response_format(1, ["single_choice"]),
+            parse_response_format=question_agent._GeneratedSingleChoiceResponseModel,
+            allow_text_fallback_on_parse_error=False,
+        )
+
+    assert not create_calls
 
 
 def test_validate_user_prompt_template_rejects_unknown_placeholder():
@@ -429,6 +545,45 @@ def test_generate_question_plan_via_llm_falls_back_to_local_plan(monkeypatch):
     assert len(result["question_plan"]) == 1
 
 
+def test_generate_question_plan_via_llm_prefers_parsed_payload(monkeypatch):
+    monkeypatch.setattr(question_agent, "resolve_api_key", lambda model: "test-key")
+    monkeypatch.setattr(
+        question_agent,
+        "_request_question_generation",
+        lambda *args, **kwargs: {
+            "content": "not-json",
+            "parsed": [
+                {
+                    "knowledge_point": "隐私最小化",
+                    "evidence": "上线前需要完成数据脱敏。",
+                    "question_type": "single_choice",
+                    "stem_style": "情景应用型",
+                    "scenario": "课堂学习场景",
+                    "answer_focus": "先做数据脱敏",
+                    "distractor_focus": "混入扩大采集等常见误解",
+                    "knowledge_tags": ["隐私最小化"],
+                    "dimension": "AI伦理安全",
+                }
+            ],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+            "structured_mode": "parse",
+        },
+    )
+
+    result = question_agent.generate_question_plan_via_llm(
+        content="【知识单元正文】\n推荐系统上线前，需要完成数据脱敏。",
+        question_types=["single_choice"],
+        count=1,
+        difficulty=3,
+        model_config=get_compare_models(["local_qwen"])[0],
+        prompt_seed=42,
+    )
+
+    assert result["fallback_used"] is False
+    assert result["question_plan"][0]["knowledge_point"] == "隐私最小化"
+    assert result["usage"]["total_tokens"] == 5
+
+
 def test_generate_question_plan_batch_via_llm_aligns_slot_indexed_results(monkeypatch):
     monkeypatch.setattr(question_agent, "resolve_api_key", lambda model: "test-key")
     monkeypatch.setattr(
@@ -482,6 +637,132 @@ def test_generate_question_plan_batch_via_llm_aligns_slot_indexed_results(monkey
     assert result["question_plan"][0]["question_type"] == "single_choice"
     assert result["question_plan"][1]["knowledge_point"] == "访问审计"
     assert result["question_plan"][1]["question_type"] == "true_false"
+
+
+def test_generate_question_plan_batch_via_llm_prefers_parsed_payload(monkeypatch):
+    monkeypatch.setattr(question_agent, "resolve_api_key", lambda model: "test-key")
+    monkeypatch.setattr(
+        question_agent,
+        "_request_question_generation",
+        lambda *args, **kwargs: {
+            "content": "not-json",
+            "parsed": [
+                {
+                    "slot_index": 2,
+                    "knowledge_point": "访问审计",
+                    "evidence": "高风险访问前需要审批控制。",
+                    "question_type": "true_false",
+                    "stem_style": "直接知识型",
+                    "scenario": "职场工作场景",
+                    "answer_focus": "高风险访问前需要审批控制",
+                    "distractor_focus": "混入跳过审批的错误做法",
+                    "knowledge_tags": ["访问审计"],
+                    "dimension": "AI伦理安全",
+                },
+                {
+                    "slot_index": 1,
+                    "knowledge_point": "隐私最小化",
+                    "evidence": "上线前需要完成数据脱敏。",
+                    "question_type": "single_choice",
+                    "stem_style": "情景应用型",
+                    "scenario": "课堂学习场景",
+                    "answer_focus": "先做数据脱敏",
+                    "distractor_focus": "混入扩大采集等常见误解",
+                    "knowledge_tags": ["隐私最小化"],
+                    "dimension": "AI伦理安全",
+                },
+            ],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10},
+            "structured_mode": "parse",
+        },
+    )
+
+    result = question_agent.generate_question_plan_batch_via_llm(
+        slot_requests=[
+            {"slot_index": 1, "question_type": "single_choice", "content": "【知识单元正文】\n上线前需要完成数据脱敏。"},
+            {"slot_index": 2, "question_type": "true_false", "content": "【知识单元正文】\n高风险访问前需要审批控制。"},
+        ],
+        difficulty=3,
+        model_config=get_compare_models(["local_qwen"])[0],
+        prompt_seed=42,
+    )
+
+    assert result["fallback_used"] is False
+    assert result["usage"]["total_tokens"] == 10
+    assert result["question_plan"][0]["knowledge_point"] == "隐私最小化"
+    assert result["question_plan"][1]["knowledge_point"] == "访问审计"
+
+
+def test_generate_question_plan_batch_via_llm_rebalances_duplicate_knowledge_points(monkeypatch):
+    monkeypatch.setattr(question_agent, "resolve_api_key", lambda model: "test-key")
+
+    def fake_build_question_plan(**kwargs):
+        content = kwargs["content"]
+        if "访问审计" in content:
+            topic = "访问审计"
+        else:
+            topic = "隐私最小化"
+        return [{
+            "knowledge_point": topic,
+            "evidence": f"{topic}证据",
+            "question_type": kwargs["question_types"][0],
+            "stem_style": "直接知识型",
+            "scenario": "课堂学习场景",
+            "answer_focus": topic,
+            "distractor_focus": f"{topic}误区",
+            "knowledge_tags": [topic],
+            "dimension": "AI伦理安全",
+        }]
+
+    monkeypatch.setattr(question_agent, "build_question_plan", fake_build_question_plan)
+    monkeypatch.setattr(
+        question_agent,
+        "_request_question_generation",
+        lambda *args, **kwargs: {
+            "parsed": [
+                {
+                    "slot_index": 1,
+                    "knowledge_point": "隐私最小化",
+                    "evidence": "上线前需要完成数据脱敏。",
+                    "question_type": "single_choice",
+                    "stem_style": "情景应用型",
+                    "scenario": "课堂学习场景",
+                    "answer_focus": "先做数据脱敏",
+                    "distractor_focus": "混入扩大采集等常见误解",
+                    "knowledge_tags": ["隐私最小化"],
+                    "dimension": "AI伦理安全",
+                },
+                {
+                    "slot_index": 2,
+                    "knowledge_point": "隐私最小化",
+                    "evidence": "上线前需要完成数据脱敏。",
+                    "question_type": "single_choice",
+                    "stem_style": "情景应用型",
+                    "scenario": "课堂学习场景",
+                    "answer_focus": "先做数据脱敏",
+                    "distractor_focus": "混入扩大采集等常见误解",
+                    "knowledge_tags": ["隐私最小化"],
+                    "dimension": "AI伦理安全",
+                },
+            ],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10},
+            "structured_mode": "parse",
+        },
+    )
+
+    result = question_agent.generate_question_plan_batch_via_llm(
+        slot_requests=[
+            {"slot_index": 1, "question_type": "single_choice", "content": "【知识单元正文】\n上线前需要完成数据脱敏。"},
+            {"slot_index": 2, "question_type": "single_choice", "content": "【知识单元正文】\n高风险访问前需要审批控制和访问审计。"},
+        ],
+        difficulty=3,
+        model_config=get_compare_models(["local_qwen"])[0],
+        prompt_seed=42,
+    )
+
+    assert result["fallback_used"] is False
+    assert result["question_plan"][0]["knowledge_point"] == "隐私最小化"
+    assert result["question_plan"][1]["knowledge_point"] == "访问审计"
 
 
 def test_generate_questions_via_llm_uses_llm_planner_and_accumulates_usage(monkeypatch):
@@ -604,6 +885,86 @@ def test_generate_questions_via_llm_uses_injected_question_plan_without_calling_
     assert result["usage"]["total_tokens"] == 28
     assert result["planner_fallback_used"] is False
     assert result["question_plan"][0]["knowledge_point"] == "隐私最小化"
+
+
+def test_generate_questions_via_llm_prefers_parsed_payload(monkeypatch):
+    monkeypatch.setattr(question_agent, "resolve_api_key", lambda model: "test-key")
+    monkeypatch.setattr(
+        question_agent,
+        "generate_question_plan_via_llm",
+        lambda **kwargs: {
+            "question_plan": [
+                {
+                    "knowledge_point": "隐私最小化",
+                    "evidence": "推荐系统上线前，需要完成数据脱敏。",
+                    "question_type": "single_choice",
+                    "stem_style": "情景应用型",
+                    "scenario": "课堂学习场景",
+                    "answer_focus": "先做数据脱敏",
+                    "distractor_focus": "混入扩大采集等常见误解",
+                    "knowledge_tags": ["隐私最小化", "推荐系统"],
+                    "dimension": "AI伦理安全",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            "fallback_used": False,
+            "error": None,
+        },
+    )
+
+    captured_calls = []
+
+    def fake_request(*args, **kwargs):
+        captured_calls.append(kwargs)
+        return {
+            "content": "not-json",
+            "parsed": [
+                {
+                    "question_type": "single_choice",
+                    "dimension": "AI伦理安全",
+                    "stem": "推荐系统上线前，哪项做法最符合隐私最小化原则？",
+                    "options": {"A": "只保留必要字段", "B": "扩大原始日志采集", "C": "长期保存未脱敏数据", "D": "关闭访问审计"},
+                    "correct_answer": "A",
+                    "explanation": "隐私最小化要求只保留完成任务所必需的数据字段。",
+                    "knowledge_tags": ["隐私最小化", "推荐系统"],
+                }
+            ],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28},
+            "structured_mode": "parse",
+        }
+
+    monkeypatch.setattr(question_agent, "_request_question_generation", fake_request)
+
+    result = question_agent.generate_questions_via_llm(
+        content="【知识单元正文】\n推荐系统上线前，需要完成数据脱敏、用途评估和访问审计配置。",
+        question_types=["single_choice"],
+        count=1,
+        difficulty=3,
+        model_config=get_compare_models(["local_qwen"])[0],
+        prompt_seed=42,
+    )
+
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["parse_response_format"] is question_agent._GeneratedSingleChoiceResponseModel
+    assert result["fallback_used"] is False
+    assert result["usage"]["total_tokens"] == 43
+    assert result["questions"][0]["stem"] == "推荐系统上线前，哪项做法最符合隐私最小化原则？"
+
+
+def test_build_generated_question_parse_model_requires_options_for_choice_types():
+    model = question_agent._build_generated_question_parse_model(["single_choice"])
+
+    with pytest.raises(ValidationError):
+        model.model_validate([
+            {
+                "question_type": "single_choice",
+                "dimension": "AI基础知识",
+                "stem": "推荐系统上线前，哪项做法最符合隐私最小化原则？",
+                "correct_answer": "A",
+                "explanation": "解释",
+                "knowledge_tags": ["隐私最小化"],
+            }
+        ])
 
 
 def test_build_question_response_format_is_type_aware():

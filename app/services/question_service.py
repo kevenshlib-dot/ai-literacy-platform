@@ -453,8 +453,9 @@ def _build_slot_batch_generator_content(slots: list[dict]) -> str:
     sections: list[str] = []
     for slot in slots:
         sections.append(
-            f"【题目槽位 {slot['slot_index']} 参考素材】\n"
-            f"{slot['generator_content']}"
+            f"<slot index=\"{slot['slot_index']}\">\n"
+            f"{slot['generator_content']}\n"
+            "</slot>"
         )
     return "\n\n".join(sections)
 
