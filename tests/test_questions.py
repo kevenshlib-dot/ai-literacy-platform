@@ -12,10 +12,11 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from app.main import app
 from app.core.database import Base, get_db
 from app.core.config import settings
-from app.core.security import create_access_token
+from app.core.security import create_access_token, decode_access_token
 from app.services import question_prompt_service, question_service
 from app.models.material import Material, MaterialFormat, MaterialStatus, KnowledgeUnit
 from app.models.material_generation import MaterialGenerationRun, MaterialGenerationRunUnit
+from app.models.question import BloomLevel, Question, QuestionStatus, QuestionType
 from app.models.question_prompt_profile import QuestionPromptProfile
 from app.services.user_service import create_user, init_roles
 from app.agents.question_agent import generate_questions_via_llm, _template_fallback
@@ -435,6 +436,14 @@ async def setup_db():
     yield
 
 
+@pytest.fixture(autouse=True)
+def disable_material_auto_parse(monkeypatch):
+    async def _noop_trigger_parse(material_id):
+        return None
+
+    monkeypatch.setattr("app.api.v1.endpoints.materials.trigger_parse", _noop_trigger_parse)
+
+
 def get_client():
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
@@ -461,31 +470,39 @@ async def register_user(client, role="organizer"):
     return token
 
 
-async def upload_and_parse_material(client, token):
-    """Upload a markdown file, parse it, and return material_id and knowledge_unit_id."""
-    md_content = "# AI基础认知\n\n" + "人工智能是计算机科学的一个分支。" * 50
-    upload = await client.post(
-        "/api/v1/materials",
-        files={"file": ("ai_basics.md", md_content.encode(), "text/markdown")},
-        data={"title": "AI基础教材"},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    mid = upload.json()["id"]
+async def upload_and_parse_material(client, token, title="AI基础教材", filename="ai_basics.md"):
+    """Create a parsed material and one knowledge unit directly in the test DB."""
+    payload = decode_access_token(token)
+    user_id = uuid.UUID(payload["sub"])
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-    # Parse material
-    await client.post(
-        f"/api/v1/materials/{mid}/parse",
-        headers={"Authorization": f"Bearer {token}"},
-    )
+    async with session_factory() as session:
+        material = Material(
+            title=title,
+            format=MaterialFormat.MARKDOWN,
+            file_path=f"tests/{filename}",
+            file_size=1024,
+            status=MaterialStatus.PARSED,
+            uploaded_by=user_id,
+        )
+        session.add(material)
+        await session.flush()
 
-    # Get knowledge units
-    ku_resp = await client.get(
-        f"/api/v1/materials/{mid}/knowledge-units",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    ku_data = ku_resp.json()
-    ku_id = ku_data["units"][0]["id"]
-    return mid, ku_id
+        knowledge_unit = KnowledgeUnit(
+            material_id=material.id,
+            title=f"{title} - 片段 1",
+            content="# AI基础认知\n\n人工智能是计算机科学的一个分支。",
+            chunk_index=0,
+        )
+        session.add(knowledge_unit)
+        await session.commit()
+
+        material_id = str(material.id)
+        knowledge_unit_id = str(knowledge_unit.id)
+
+    await engine.dispose()
+    return material_id, knowledge_unit_id
 
 
 @pytest.mark.asyncio
@@ -1647,6 +1664,64 @@ async def test_list_questions_includes_source_titles():
     assert source_item["source_knowledge_unit_title"] == ku_title
     assert free_item["source_material_title"] is None
     assert free_item["source_knowledge_unit_title"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_questions_filters_by_source_material():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+        user_id = uuid.UUID(decode_access_token(token)["sub"])
+
+        mid1, ku_id1 = await upload_and_parse_material(client, token, title="筛选素材一", filename="material_one.md")
+        mid2, ku_id2 = await upload_and_parse_material(client, token, title="筛选素材二", filename="material_two.md")
+
+        engine = create_async_engine(settings.DATABASE_URL, echo=False)
+        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with session_factory() as session:
+            session.add_all([
+                Question(
+                    question_type=QuestionType.SINGLE_CHOICE,
+                    stem="素材一题目",
+                    correct_answer="A",
+                    options={"A": "1", "B": "2"},
+                    source_material_id=uuid.UUID(mid1),
+                    source_knowledge_unit_id=uuid.UUID(ku_id1),
+                    created_by=user_id,
+                    status=QuestionStatus.DRAFT,
+                ),
+                Question(
+                    question_type=QuestionType.SINGLE_CHOICE,
+                    stem="素材二题目",
+                    correct_answer="A",
+                    options={"A": "1", "B": "2"},
+                    source_material_id=uuid.UUID(mid2),
+                    source_knowledge_unit_id=uuid.UUID(ku_id2),
+                    created_by=user_id,
+                    status=QuestionStatus.DRAFT,
+                ),
+                Question(
+                    question_type=QuestionType.SINGLE_CHOICE,
+                    stem="自由题目",
+                    correct_answer="A",
+                    options={"A": "1", "B": "2"},
+                    created_by=user_id,
+                    status=QuestionStatus.DRAFT,
+                ),
+            ])
+            await session.commit()
+        await engine.dispose()
+
+        resp = await client.get(
+            f"/api/v1/questions?source_material_id={mid1}",
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 1
+    assert data["items"][0]["stem"] == "素材一题目"
+    assert data["items"][0]["source_material_id"] == mid1
 
 
 @pytest.mark.asyncio
@@ -3354,3 +3429,67 @@ async def test_question_stats():
     assert data["quality_metrics"]["missing_bloom_level_count"] == 1
     assert data["quality_metrics"]["missing_explanation_count"] == 1
     assert data["quality_metrics"]["source_linked_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_question_stats_filters_by_source_material():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+        user_id = uuid.UUID(decode_access_token(token)["sub"])
+
+        mid1, ku_id1 = await upload_and_parse_material(client, token, title="统计素材一", filename="stats_one.md")
+        mid2, ku_id2 = await upload_and_parse_material(client, token, title="统计素材二", filename="stats_two.md")
+
+        engine = create_async_engine(settings.DATABASE_URL, echo=False)
+        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with session_factory() as session:
+            session.add_all([
+                Question(
+                    question_type=QuestionType.SINGLE_CHOICE,
+                    stem="统计素材一题目",
+                    correct_answer="A",
+                    options={"A": "1", "B": "2"},
+                    dimension="AI基础",
+                    source_material_id=uuid.UUID(mid1),
+                    source_knowledge_unit_id=uuid.UUID(ku_id1),
+                    created_by=user_id,
+                    status=QuestionStatus.DRAFT,
+                ),
+                Question(
+                    question_type=QuestionType.SINGLE_CHOICE,
+                    stem="统计素材二题目",
+                    correct_answer="A",
+                    options={"A": "1", "B": "2"},
+                    dimension="AI伦理安全",
+                    source_material_id=uuid.UUID(mid2),
+                    source_knowledge_unit_id=uuid.UUID(ku_id2),
+                    bloom_level=BloomLevel.UNDERSTAND,
+                    explanation="用于过滤统计的解析。",
+                    created_by=user_id,
+                    status=QuestionStatus.DRAFT,
+                ),
+                Question(
+                    question_type=QuestionType.SINGLE_CHOICE,
+                    stem="统计自由题目",
+                    correct_answer="A",
+                    options={"A": "1", "B": "2"},
+                    dimension="AI批判思维",
+                    created_by=user_id,
+                    status=QuestionStatus.DRAFT,
+                ),
+            ])
+            await session.commit()
+        await engine.dispose()
+
+        resp = await client.get(
+            f"/api/v1/questions/stats?source_material_id={mid1}",
+            headers=headers,
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 1
+    assert data["by_type"]["single_choice"] == 1
+    assert data["quality_metrics"]["source_linked_count"] == 1
+    assert data["quality_metrics"]["source_unlinked_count"] == 0

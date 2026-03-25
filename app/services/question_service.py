@@ -1115,6 +1115,7 @@ async def list_questions(
     dimension: Optional[str] = None,
     difficulty: Optional[int] = None,
     keyword: Optional[str] = None,
+    source_material_id: Optional[uuid.UUID] = None,
     created_by: Optional[uuid.UUID] = None,
     exclude_ids: Optional[list[uuid.UUID]] = None,
 ) -> tuple[list[Question], int]:
@@ -1130,6 +1131,8 @@ async def list_questions(
         conditions.append(Question.difficulty == difficulty)
     if keyword:
         conditions.append(Question.stem.ilike(f"%{keyword}%"))
+    if source_material_id:
+        conditions.append(Question.source_material_id == source_material_id)
     if created_by:
         conditions.append(Question.created_by == created_by)
     if exclude_ids:
@@ -2252,6 +2255,7 @@ async def get_question_stats(
     question_type: Optional[str] = None,
     difficulty: Optional[int] = None,
     keyword: Optional[str] = None,
+    source_material_id: Optional[uuid.UUID] = None,
     created_by: Optional[uuid.UUID] = None,
 ) -> dict:
     """Get question bank statistics."""
@@ -2266,6 +2270,8 @@ async def get_question_stats(
         conditions.append(Question.difficulty == difficulty)
     if keyword:
         conditions.append(Question.stem.ilike(f"%{keyword}%"))
+    if source_material_id:
+        conditions.append(Question.source_material_id == source_material_id)
     if created_by:
         conditions.append(Question.created_by == created_by)
 

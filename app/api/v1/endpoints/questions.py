@@ -188,6 +188,7 @@ async def list_questions(
     dimension: Optional[str] = None,
     difficulty: Optional[int] = Query(None, ge=1, le=5),
     keyword: Optional[str] = None,
+    source_material_id: Optional[UUID] = None,
     only_mine: bool = Query(False),
     exclude_ids: Optional[list[UUID]] = Query(None),
     db: AsyncSession = Depends(get_db),
@@ -203,6 +204,7 @@ async def list_questions(
         dimension=dimension,
         difficulty=difficulty,
         keyword=keyword,
+        source_material_id=source_material_id,
         created_by=current_user.id if only_mine else None,
         exclude_ids=exclude_ids,
     )
@@ -216,6 +218,7 @@ async def question_stats(
     question_type: Optional[str] = None,
     difficulty: Optional[int] = Query(None, ge=1, le=5),
     keyword: Optional[str] = None,
+    source_material_id: Optional[UUID] = None,
     only_mine: bool = Query(False),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
@@ -228,6 +231,7 @@ async def question_stats(
         question_type=question_type,
         difficulty=difficulty,
         keyword=keyword,
+        source_material_id=source_material_id,
         created_by=current_user.id if only_mine else None,
     )
     return stats

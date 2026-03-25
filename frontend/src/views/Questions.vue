@@ -34,8 +34,8 @@
     <template v-if="activeTab === 'all'">
       <!-- Filter Bar -->
       <a-card class="filter-card" :bordered="false">
-        <a-row :gutter="16">
-          <a-col :span="5">
+        <a-row :gutter="[16, 16]">
+          <a-col :flex="'280px'">
             <a-input
               v-model:value="filters.keyword"
               placeholder="搜索题干关键词"
@@ -45,7 +45,7 @@
               <template #prefix><SearchOutlined /></template>
             </a-input>
           </a-col>
-          <a-col :span="4">
+          <a-col :flex="'140px'">
             <a-select v-model:value="filters.status" placeholder="状态" allow-clear style="width: 100%">
               <a-select-option value="draft">草稿</a-select-option>
               <a-select-option value="pending_review">待审核</a-select-option>
@@ -54,7 +54,7 @@
               <a-select-option value="archived">已归档</a-select-option>
             </a-select>
           </a-col>
-          <a-col :span="4">
+          <a-col :flex="'140px'">
             <a-select v-model:value="filters.question_type" placeholder="题型" allow-clear style="width: 100%">
               <a-select-option value="single_choice">单选题</a-select-option>
               <a-select-option value="multiple_choice">多选题</a-select-option>
@@ -63,7 +63,7 @@
               <a-select-option value="short_answer">简答题</a-select-option>
             </a-select>
           </a-col>
-          <a-col :span="3">
+          <a-col :flex="'140px'">
             <a-select v-model:value="filters.difficulty" placeholder="难度" allow-clear style="width: 100%">
               <a-select-option :value="1">1 - 入门</a-select-option>
               <a-select-option :value="2">2 - 简单</a-select-option>
@@ -72,7 +72,7 @@
               <a-select-option :value="5">5 - 专家</a-select-option>
             </a-select>
           </a-col>
-          <a-col :span="4">
+          <a-col :flex="'180px'">
             <a-select v-model:value="filters.dimension" placeholder="AI素养维度" allow-clear style="width: 100%">
               <a-select-option value="AI基础知识">AI基础知识</a-select-option>
               <a-select-option value="AI技术应用">AI技术应用</a-select-option>
@@ -81,12 +81,27 @@
               <a-select-option value="AI创新实践">AI创新实践</a-select-option>
             </a-select>
           </a-col>
-          <a-col :span="4">
-            <a-space>
-              <a-checkbox v-model:checked="filters.only_mine" @change="fetchQuestions">仅看自己</a-checkbox>
-              <a-button type="primary" @click="fetchQuestions">查询</a-button>
-              <a-button @click="resetFilters">重置</a-button>
-            </a-space>
+          <a-col :flex="'240px'">
+            <a-select
+              v-model:value="filters.source_material_id"
+              placeholder="素材"
+              allow-clear
+              show-search
+              :loading="filterMaterialsLoading"
+              :options="questionFilterMaterialOptions"
+              option-filter-prop="label"
+              style="width: 100%"
+              @dropdown-visible-change="handleMaterialFilterDropdownVisibleChange"
+            />
+          </a-col>
+          <a-col :flex="'auto'">
+            <div class="question-filter-actions">
+              <a-space wrap>
+                <a-checkbox v-model:checked="filters.only_mine" @change="fetchQuestions">仅看自己</a-checkbox>
+                <a-button type="primary" @click="fetchQuestions">查询</a-button>
+                <a-button @click="resetFilters">重置</a-button>
+              </a-space>
+            </div>
           </a-col>
         </a-row>
       </a-card>
@@ -136,6 +151,7 @@
           :data-source="questions"
           :loading="loading"
           :pagination="pagination"
+          :scroll="{ x: 1380 }"
           :row-selection="{ selectedRowKeys, onChange: onSelectChange }"
           row-key="id"
           @change="handleTableChange"
@@ -165,7 +181,7 @@
               {{ formatDate(record.created_at) }}
             </template>
             <template v-if="column.key === 'actions'">
-              <a-space>
+              <div class="table-action-group">
                 <a-button size="small" type="link" @click="showDetail(record)">详情</a-button>
                 <a-button
                   v-if="record.status === 'draft'"
@@ -192,7 +208,7 @@
                 >
                   <a-button size="small" type="link" danger>删除</a-button>
                 </a-popconfirm>
-              </a-space>
+              </div>
             </template>
           </template>
         </a-table>
@@ -270,6 +286,7 @@
           :data-source="filteredReviewQuestions"
           :loading="reviewLoading"
           :pagination="reviewPagination"
+          :scroll="{ x: 1420 }"
           :row-selection="{ selectedRowKeys: reviewSelectedKeys, onChange: onReviewSelectChange }"
           row-key="id"
           @change="handleReviewTableChange"
@@ -300,7 +317,7 @@
               {{ formatDate(record.created_at) }}
             </template>
             <template v-if="column.key === 'review_actions'">
-              <a-space>
+              <div class="table-action-group">
                 <a-button size="small" type="link" @click="showDetail(record)">
                   <template #icon><EyeOutlined /></template>
                   查看
@@ -317,7 +334,7 @@
                   <template #icon><CloseOutlined /></template>
                   拒绝
                 </a-button>
-              </a-space>
+              </div>
             </template>
           </template>
         </a-table>
@@ -1369,8 +1386,19 @@ const filters = reactive({
   question_type: undefined as string | undefined,
   difficulty: undefined as number | undefined,
   dimension: '',
+  source_material_id: undefined as string | undefined,
   only_mine: false,
 })
+
+const filterMaterialsLoading = ref(false)
+const filterMaterialsLoaded = ref(false)
+const filterMaterials = ref<any[]>([])
+const questionFilterMaterialOptions = computed(() =>
+  filterMaterials.value.map((item: any) => ({
+    label: item.title,
+    value: item.id,
+  }))
+)
 
 const pagination = reactive({
   current: 1,
@@ -1547,6 +1575,7 @@ async function fetchQuestions() {
     if (filters.question_type) params.question_type = filters.question_type
     if (filters.difficulty) params.difficulty = filters.difficulty
     if (filters.dimension) params.dimension = filters.dimension
+    if (filters.source_material_id) params.source_material_id = filters.source_material_id
     if (filters.only_mine) params.only_mine = true
 
     const [data, statsData]: any[] = await Promise.all([
@@ -1591,6 +1620,7 @@ function resetFilters() {
   filters.question_type = undefined
   filters.difficulty = undefined
   filters.dimension = ''
+  filters.source_material_id = undefined
   filters.only_mine = false
   pagination.current = 1
   fetchQuestions()
@@ -1972,6 +2002,7 @@ async function reloadAfterBatch(operatedCount: number) {
     if (filters.question_type) params.question_type = filters.question_type
     if (filters.difficulty) params.difficulty = filters.difficulty
     if (filters.dimension) params.dimension = filters.dimension
+    if (filters.source_material_id) params.source_material_id = filters.source_material_id
 
     const data: any = await request.get('/questions', { params })
     const remaining = data.items?.length || 0
@@ -1983,6 +2014,46 @@ async function reloadAfterBatch(operatedCount: number) {
     // else: stay on current page (items shifted in from next pages, or it's page 1)
   }
   await fetchQuestions()
+}
+
+async function loadFilterMaterials() {
+  if (filterMaterialsLoading.value || filterMaterialsLoaded.value) return
+
+  filterMaterialsLoading.value = true
+  try {
+    const items: any[] = []
+    const pageSize = 100
+    let skip = 0
+    let total = 0
+
+    while (true) {
+      const data: any = await request.get('/materials', {
+        params: { skip, limit: pageSize },
+      })
+      const pageItems = data.data || []
+      items.push(...pageItems)
+      total = data.total || items.length
+
+      if (pageItems.length === 0 || items.length >= total) break
+      skip += pageItems.length
+    }
+
+    filterMaterials.value = Array.from(
+      new Map(items.map((item: any) => [item.id, item])).values()
+    )
+    filterMaterialsLoaded.value = true
+  } catch {
+    filterMaterials.value = []
+    message.error('加载素材列表失败')
+  } finally {
+    filterMaterialsLoading.value = false
+  }
+}
+
+function handleMaterialFilterDropdownVisibleChange(open: boolean) {
+  if (open) {
+    loadFilterMaterials()
+  }
 }
 
 async function batchSubmit() {
@@ -3056,6 +3127,11 @@ onBeforeUnmount(() => {
 .filter-card {
   margin-bottom: 16px;
 }
+.question-filter-actions {
+  display: flex;
+  justify-content: flex-end;
+  min-height: 32px;
+}
 .main-tabs {
   margin-bottom: 16px;
 }
@@ -3088,6 +3164,19 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: #666;
+}
+
+.table-action-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  max-width: 100%;
+}
+
+.table-action-group :deep(.ant-btn-link) {
+  padding-inline: 0;
+  height: auto;
 }
 
 /* Generation progress - animated robot */
