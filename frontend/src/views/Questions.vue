@@ -106,27 +106,6 @@
         </a-row>
       </a-card>
 
-      <a-card :bordered="false" style="margin-bottom: 16px" :loading="questionStatsLoading">
-        <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap;">
-          <a-space :size="24" wrap>
-            <a-statistic title="题目总数" :value="questionStats?.total || 0" />
-            <a-statistic title="已通过" :value="questionStats?.by_status?.approved || 0" />
-            <a-statistic title="缺维度" :value="questionStats?.quality_metrics?.missing_dimension_count || 0" :value-style="{ color: '#d46b08' }" />
-            <a-statistic title="缺 Bloom" :value="questionStats?.quality_metrics?.missing_bloom_level_count || 0" :value-style="{ color: '#d46b08' }" />
-            <a-statistic title="缺解析" :value="questionStats?.quality_metrics?.missing_explanation_count || 0" :value-style="{ color: '#cf1322' }" />
-            <a-statistic title="已关联素材" :value="questionStats?.quality_metrics?.source_linked_count || 0" />
-          </a-space>
-          <div v-if="questionStats?.by_bloom_level && Object.keys(questionStats.by_bloom_level).length > 0" style="max-width: 420px;">
-            <div style="margin-bottom: 8px; color: #666; font-size: 13px;">认知层次分布</div>
-            <a-space wrap>
-              <a-tag v-for="(count, level) in questionStats.by_bloom_level" :key="level" color="geekblue">
-                {{ bloomSummaryLabel(String(level)) }} {{ count }}
-              </a-tag>
-            </a-space>
-          </div>
-        </div>
-      </a-card>
-
       <!-- Batch Actions -->
       <a-card v-if="selectedRowKeys.length > 0" :bordered="false" style="margin-bottom: 16px">
         <div style="display: flex; justify-content: space-between; align-items: center">
@@ -1502,7 +1481,6 @@ const scoreMap: Record<string, string> = {
 function typeLabel(t: string) { return typeMap[t] || t }
 function statusLabel(s: string) { return statusMap[s] || s }
 function bloomLabel(b: string) { return bloomMap[b] || b }
-function bloomSummaryLabel(b: string) { return b ? bloomLabel(b) : '未标注' }
 function scoreLabel(k: string) { return scoreMap[k] || k }
 function actionLabel(a: string) {
   return a === 'approve' ? '通过' : a === 'reject' ? '拒绝' : a === 'ai_check' ? 'AI检查' : a
