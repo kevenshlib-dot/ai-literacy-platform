@@ -222,7 +222,9 @@ def test_build_user_prompt_includes_question_plan_section():
     assert "考查目标" in prompt
     assert "出题模式" in prompt
     assert "轻场景导语" in prompt
-    assert "场景用途" in prompt
+    assert "禁止混淆" in prompt
+    assert "正确答案聚焦" not in prompt
+    assert "建议维度" not in prompt
 
 
 def test_build_user_prompt_free_generation_omits_material_only_rules():

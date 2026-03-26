@@ -566,7 +566,7 @@ def _build_type_rule_section(question_types: list[str]) -> str:
 def _build_plan_type_requirements(question_types: list[str]) -> str:
     lines: list[str] = []
     if any(qt in ("single_choice", "multiple_choice") for qt in question_types):
-        lines.append("7. 若题型为单选题或多选题，必须规划出可被素材直接支持的 fact_anchor，并确保干扰项围绕相邻误解而非离题选项；同时尽量避免“奠基/关键文献/提出者/起源/唯一归属”类高争议历史归属题；")
+        lines.append("7. 若题型为单选题或多选题，必须规划出可被素材直接支持的 fact_anchor，并补充必要的 forbidden_confusions；同时尽量避免“奠基/关键文献/提出者/起源/唯一归属”类高争议历史归属题；")
     if "true_false" in question_types:
         lines.append("8. 若题型为判断题，只规划能自然写成陈述句的知识点，不要规划成疑问句或选择题式表达；")
     if "fill_blank" in question_types:
@@ -746,6 +746,21 @@ def _build_forbidden_confusions(question_type: str, knowledge_tags: list[str], k
     return common_rules[:4]
 
 
+def _derive_plan_knowledge_tags(
+    knowledge_point: str,
+    fact_anchor: str,
+    evidence_span: str,
+) -> list[str]:
+    tags = _dedupe_text_items(
+        [
+            _summarize_knowledge_point(knowledge_point),
+            _summarize_knowledge_point(fact_anchor),
+            _summarize_knowledge_point(evidence_span),
+        ]
+    )
+    return tags[:3] or ["AI素养"]
+
+
 def _build_choice_answer_enums(min_answers: int = 1) -> list[str]:
     letters = ("A", "B", "C", "D")
     answers: list[str] = []
@@ -915,10 +930,6 @@ def build_question_plan(
     if not evidence_candidates:
         evidence_candidates = topic_candidates[:]
 
-    selected_styles = rng.sample(
-        QUESTION_STEM_STYLES,
-        min(max(count, 1), len(QUESTION_STEM_STYLES)),
-    )
     plan: list[dict] = []
     for index in range(max(count, 1)):
         question_type = question_types[index % len(question_types)] if question_types else "single_choice"
@@ -929,7 +940,6 @@ def build_question_plan(
         else:
             topic = topic_candidates[index % len(topic_candidates)]
         evidence = evidence_candidates[index % len(evidence_candidates)]
-        style = selected_styles[index % len(selected_styles)]
         base_tags = _dedupe_text_items(
             [topic]
             + keywords[:3]
@@ -950,16 +960,12 @@ def build_question_plan(
                 "evidence_span": evidence_span,
                 "question_goal": question_goal,
                 "question_type": question_type,
-                "stem_style": style["name"],
-                "scenario": "",
                 "scenario_mode": "direct",
-                "scenario_brief": "",
                 "scenario_intent": _infer_scenario_intent(question_type, question_goal),
-                "answer_focus": evidence[:80],
-                "distractor_focus": f"围绕“{_summarize_knowledge_point(topic)}”设计常见误解或边界条件",
                 "forbidden_confusions": _build_forbidden_confusions(question_type, knowledge_tags, knowledge_point),
                 "knowledge_tags": knowledge_tags,
                 "dimension": dimension,
+                "_source_mode": "material" if bool(content) else "free",
             }
         )
     return _apply_scenario_mix(
@@ -1033,7 +1039,6 @@ def _build_question_plan_section(question_plan: Optional[list[dict]]) -> str:
         "返回 JSON 数组时，题目顺序必须与以下规划顺序完全一致。",
     ]
     for index, item in enumerate(question_plan, start=1):
-        tags = "、".join(item.get("knowledge_tags") or [])
         lines.append(f"{index}. 知识点：{item.get('knowledge_point', '')}")
         lines.append(f"   - 核心事实锚点：{item.get('fact_anchor', item.get('knowledge_point', ''))}")
         lines.append(f"   - 证据摘录：{item.get('evidence_span', item.get('evidence', ''))}")
@@ -1042,15 +1047,10 @@ def _build_question_plan_section(question_plan: Optional[list[dict]]) -> str:
         scenario_brief = str(item.get("scenario_brief", "") or "").strip()
         if scenario_brief:
             lines.append(f"   - 轻场景导语：{scenario_brief}")
-        lines.append(f"   - 场景用途：{item.get('scenario_intent', '')}")
         lines.append(f"   - 题型：{TYPE_LABELS.get(item.get('question_type', ''), item.get('question_type', ''))}")
-        lines.append(f"   - 正确答案聚焦：{item.get('answer_focus', '')}")
-        lines.append(f"   - 干扰项设计：{item.get('distractor_focus', '')}")
         confusion_text = "；".join(item.get("forbidden_confusions") or [])
         if confusion_text:
             lines.append(f"   - 禁止混淆：{confusion_text}")
-        lines.append(f"   - 建议标签：{tags}")
-        lines.append(f"   - 建议维度：{item.get('dimension', '')}")
     lines.append("若出题模式为 contextual，只能使用一句贴题轻场景导语，不得扩写职业背景、剧情或素材外新事实；若为 direct，请直接提问。")
     lines.append("生成题目时不得直接复述上述字段名，也不得在题干、选项或解析中出现“素材/材料/本文/参考素材/槽位”等来源提示。")
     lines.append("正确答案必须能被“核心事实锚点/证据摘录”直接支撑；若素材不支持绝对化表述，不得使用“首位/公认/唯一/首要”等措辞。")
@@ -1082,21 +1082,13 @@ def _build_question_response_format(count: int, question_types: list[str]) -> di
 
 class _QuestionPlanItemModel(BaseModel):
     knowledge_point: str
-    evidence: str
     fact_anchor: Optional[str] = None
     evidence_span: Optional[str] = None
     question_goal: Optional[str] = None
     question_type: str
-    stem_style: str
-    scenario: str = ""
     scenario_mode: Optional[str] = None
-    scenario_brief: Optional[str] = None
     scenario_intent: Optional[str] = None
-    answer_focus: str
-    distractor_focus: str
     forbidden_confusions: Optional[list[str]] = None
-    knowledge_tags: list[str]
-    dimension: str
 
 
 class _QuestionPlanResponseModel(RootModel[list[_QuestionPlanItemModel]]):
@@ -1108,39 +1100,26 @@ def _build_question_plan_response_format(count: int) -> dict:
         "type": "object",
         "required": [
             "knowledge_point",
-            "evidence",
+            "fact_anchor",
+            "evidence_span",
+            "question_goal",
             "question_type",
-            "stem_style",
-            "scenario",
-            "answer_focus",
-            "distractor_focus",
-            "knowledge_tags",
-            "dimension",
+            "scenario_mode",
+            "scenario_intent",
         ],
         "additionalProperties": True,
         "properties": {
             "knowledge_point": {"type": "string"},
-            "evidence": {"type": "string"},
             "fact_anchor": {"type": "string"},
             "evidence_span": {"type": "string"},
             "question_goal": {"type": "string"},
             "question_type": {"type": "string", "enum": sorted(VALID_TYPES)},
-            "stem_style": {"type": "string"},
-            "scenario": {"type": "string"},
             "scenario_mode": {"type": "string", "enum": ["contextual", "direct"]},
-            "scenario_brief": {"type": "string"},
             "scenario_intent": {"type": "string", "enum": ["application", "comparison", "decision", "explanation"]},
-            "answer_focus": {"type": "string"},
-            "distractor_focus": {"type": "string"},
             "forbidden_confusions": {
                 "type": "array",
                 "items": {"type": "string"},
             },
-            "knowledge_tags": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
-            "dimension": {"type": "string", "enum": FIVE_DIMENSIONS},
         },
     }
     return {
@@ -1227,24 +1206,16 @@ def _normalize_question_plan_item(
 
     for field in (
         "knowledge_point",
-        "evidence",
         "fact_anchor",
         "evidence_span",
         "question_goal",
-        "stem_style",
-        "scenario",
         "scenario_mode",
-        "scenario_brief",
         "scenario_intent",
-        "answer_focus",
-        "distractor_focus",
     ):
         value = str(raw.get(field, "") or "").strip()
         if value:
             normalized[field] = value
 
-    if normalized.get("scenario") and not normalized.get("scenario_brief"):
-        normalized["scenario_brief"] = normalized["scenario"]
     if normalized.get("scenario_mode") not in {"contextual", "direct"}:
         normalized["scenario_mode"] = fallback_item.get("scenario_mode", "direct")
 
@@ -1268,20 +1239,6 @@ def _normalize_question_plan_item(
             str(item).strip() for item in forbidden_confusions if str(item).strip()
         ][:4] or normalized.get("forbidden_confusions", [])
 
-    dimension = raw.get("dimension")
-    if dimension in FIVE_DIMENSIONS:
-        normalized["dimension"] = dimension
-    else:
-        normalized["dimension"] = classify_dimension(
-            " ".join(
-                [
-                    normalized.get("knowledge_point", ""),
-                    normalized.get("evidence", ""),
-                ]
-            ),
-            normalized.get("knowledge_tags"),
-        )
-
     normalized.setdefault("fact_anchor", normalized.get("knowledge_point", ""))
     normalized.setdefault("evidence_span", normalized.get("evidence", ""))
     normalized.setdefault(
@@ -1303,8 +1260,43 @@ def _normalize_question_plan_item(
             normalized.get("knowledge_point", ""),
         ),
     )
-    normalized.setdefault("scenario_brief", "")
-    normalized.setdefault("scenario", normalized.get("scenario_brief", ""))
+    normalized.setdefault(
+        "knowledge_tags",
+        fallback_item.get("knowledge_tags") or _derive_plan_knowledge_tags(
+            normalized.get("knowledge_point", ""),
+            normalized.get("fact_anchor", ""),
+            normalized.get("evidence_span", ""),
+        ),
+    )
+    normalized.setdefault(
+        "dimension",
+        fallback_item.get("dimension")
+        or classify_dimension(
+            " ".join(
+                [
+                    normalized.get("knowledge_point", ""),
+                    normalized.get("fact_anchor", ""),
+                    normalized.get("evidence_span", ""),
+                ]
+            ),
+            normalized.get("knowledge_tags"),
+        ),
+    )
+    scenario_brief = str(
+        raw.get("scenario_brief", "")
+        or raw.get("scenario", "")
+        or fallback_item.get("scenario_brief", "")
+        or ""
+    ).strip()
+    if not scenario_brief and normalized.get("scenario_mode") == "contextual":
+        scenario_brief = _build_contextual_scenario_brief(
+            knowledge_point=normalized.get("knowledge_point", ""),
+            question_type=normalized.get("question_type", ""),
+            scenario_intent=normalized.get("scenario_intent", ""),
+            source_mode=str(fallback_item.get("_source_mode", "material") or "material"),
+        )
+    normalized["scenario_brief"] = scenario_brief
+    normalized["scenario"] = scenario_brief if scenario_brief else "直接问法"
 
     return normalized
 
@@ -1419,18 +1411,16 @@ def _build_question_plan_user_prompt(
         f"难度：{difficulty}/5\n"
         f"布鲁姆层级：{bloom_text}\n"
         "请围绕素材中最有价值、最适合考查的知识点，输出一个 JSON 数组，每个元素表示 1 道题的规划。\n"
-        "每条规划必须包含：knowledge_point、evidence、fact_anchor、evidence_span、question_goal、question_type、stem_style、scenario、scenario_mode、scenario_brief、scenario_intent、answer_focus、distractor_focus、knowledge_tags、dimension；如适用，请补充 forbidden_confusions。\n"
+        "每条规划必须包含：knowledge_point、fact_anchor、evidence_span、question_goal、question_type、scenario_mode、scenario_intent；如适用，请补充 forbidden_confusions。\n"
         "要求：\n"
         "1. 不得重复知识点；\n"
-        "2. evidence 必须是素材中的证据句或高保真摘要；\n"
+        "2. evidence_span 必须是素材中的证据句或高保真摘要；\n"
         "3. question_type 只能从允许题型中选择；\n"
-        "4. dimension 必须是五个 AI 素养维度之一；\n"
-        "5. knowledge_tags 必须是简洁的字符串数组；\n"
-        "6. 只有单选题、多选题、简答题可使用 scenario_mode=contextual；判断题和填空题必须使用 scenario_mode=direct；\n"
-        "7. 在允许情境化的规划中，仅约一半使用 scenario_mode=contextual；若知识点偏定义、术语、词源或事实判断，应优先使用 direct；\n"
-        "8. 若使用 contextual，scenario_brief 只能是一句贴题轻场景导语，不得引入素材外新事实，也不得扩写职业背景或剧情；\n"
-        "9. 最终题目中不得出现“素材/材料/本文/上文/下文/参考素材/槽位”等来源提示，也不得复述规划字段名；\n"
-        "10. 不要输出题干、选项和答案，只输出规划。\n"
+        "4. 只有单选题、多选题、简答题可使用 scenario_mode=contextual；判断题和填空题必须使用 scenario_mode=direct；\n"
+        "5. 在允许情境化的规划中，仅约一半使用 scenario_mode=contextual；若知识点偏定义、术语、词源或事实判断，应优先使用 direct；\n"
+        "6. 若使用 contextual，最终只允许一句贴题轻场景导语，不得引入素材外新事实，也不得扩写职业背景或剧情；\n"
+        "7. 最终题目中不得出现“素材/材料/本文/上文/下文/参考素材/槽位”等来源提示，也不得复述规划字段名；\n"
+        "8. 不要输出题干、选项和答案，只输出规划。\n"
         f"{_build_plan_type_requirements(question_types)}\n"
         f"{extra}\n\n"
         f"{content or '【出题范围】AI素养通识知识'}"
@@ -1460,17 +1450,17 @@ def _build_question_plan_batch_user_prompt(
         f"难度：{difficulty}/5\n"
         f"布鲁姆层级：{bloom_text}\n"
         "请为下列每个槽位各输出 1 条规划，最终输出必须是 JSON 数组，且数组长度必须与槽位数完全一致。\n"
-        "每个元素必须包含：slot_index、knowledge_point、evidence、fact_anchor、evidence_span、question_goal、question_type、stem_style、scenario、scenario_mode、scenario_brief、scenario_intent、answer_focus、distractor_focus、knowledge_tags、dimension；如适用，请补充 forbidden_confusions。\n"
+        "每个元素必须包含：slot_index、knowledge_point、fact_anchor、evidence_span、question_goal、question_type、scenario_mode、scenario_intent；如适用，请补充 forbidden_confusions。\n"
         "要求：\n"
         "1. 每个元素必须通过 slot_index 与对应槽位一一匹配，不得遗漏、重复或合并；\n"
         "2. question_type 必须与槽位指定题型一致；\n"
         "3. 只能基于对应槽位的知识片段规划，不得跨槽位引用其他片段；\n"
         "4. 不同槽位的 knowledge_point 必须在语义上明显不同，不能只是同一概念的改写；\n"
         "5. 不同槽位应尽量覆盖各自片段中最适合考查的不同知识点；\n"
-        "6. evidence 必须是该槽位片段中的证据句或高保真摘要；\n"
+        "6. evidence_span 必须是该槽位片段中的证据句或高保真摘要；\n"
         "7. 只有单选题、多选题、简答题可使用 scenario_mode=contextual；判断题和填空题必须使用 scenario_mode=direct；\n"
         "8. 在允许情境化的槽位中，仅约一半使用 scenario_mode=contextual；其余应直接问法；\n"
-        "9. 若使用 contextual，scenario_brief 只能是一句贴题轻场景导语，不得引入槽位外事实，也不得扩写职业背景或剧情；\n"
+        "9. 若使用 contextual，最终只允许一句贴题轻场景导语，不得引入槽位外事实，也不得扩写职业背景或剧情；\n"
         "10. 最终题目中不得出现“素材/材料/本文/上文/下文/参考素材/槽位”等来源提示，也不得复述规划字段名；\n"
         "11. 不要输出题干、选项和答案，只输出规划。\n"
         f"{extra}\n\n"
@@ -1691,43 +1681,30 @@ def _build_generated_question_parse_model(question_types: list[str]) -> type[Bas
 def _build_question_plan_batch_response_format(count: int) -> dict:
     plan_item_schema = {
         "type": "object",
-            "required": [
-                "slot_index",
-                "knowledge_point",
-                "evidence",
-                "question_type",
-            "stem_style",
-            "scenario",
-            "answer_focus",
-            "distractor_focus",
-            "knowledge_tags",
-            "dimension",
+        "required": [
+            "slot_index",
+            "knowledge_point",
+            "fact_anchor",
+            "evidence_span",
+            "question_goal",
+            "question_type",
+            "scenario_mode",
+            "scenario_intent",
         ],
         "additionalProperties": True,
         "properties": {
             "slot_index": {"type": "integer", "minimum": 1, "maximum": max(count, 1)},
-                "knowledge_point": {"type": "string"},
-                "evidence": {"type": "string"},
-                "fact_anchor": {"type": "string"},
-                "evidence_span": {"type": "string"},
-                "question_goal": {"type": "string"},
-                "question_type": {"type": "string", "enum": sorted(VALID_TYPES)},
-                "stem_style": {"type": "string"},
-                "scenario": {"type": "string"},
-                "scenario_mode": {"type": "string", "enum": ["contextual", "direct"]},
-                "scenario_brief": {"type": "string"},
-                "scenario_intent": {"type": "string", "enum": ["application", "comparison", "decision", "explanation"]},
-                "answer_focus": {"type": "string"},
-                "distractor_focus": {"type": "string"},
-                "forbidden_confusions": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "knowledge_tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-            "dimension": {"type": "string", "enum": FIVE_DIMENSIONS},
+            "knowledge_point": {"type": "string"},
+            "fact_anchor": {"type": "string"},
+            "evidence_span": {"type": "string"},
+            "question_goal": {"type": "string"},
+            "question_type": {"type": "string", "enum": sorted(VALID_TYPES)},
+            "scenario_mode": {"type": "string", "enum": ["contextual", "direct"]},
+            "scenario_intent": {"type": "string", "enum": ["application", "comparison", "decision", "explanation"]},
+            "forbidden_confusions": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
         },
     }
     return {
@@ -1990,6 +1967,7 @@ def build_question_prompt_context(
 【补充生成原则】
 - 先满足事实准确和题型格式，再考虑表达自然与少量变化。
 - 优先按照知识点规划中的事实锚点、证据摘录和禁止混淆生成，不要自行改写考查目标。
+- 单选题和多选题优先围绕“禁止混淆”设计干扰项，不要再额外发散出素材未支持的新结论。
 - 若规划指定 scenario_mode=contextual，只用一句贴题轻场景导入；若指定 direct，请直接问法。
 - 解析保持简洁，只说明正确答案为何成立与关键错误点。{type_rule_section}"""
 

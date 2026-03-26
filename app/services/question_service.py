@@ -145,9 +145,23 @@ def _build_knowledge_unit_planner_content(ku: KnowledgeUnit, body_limit: int = 3
     if keyword_text:
         parts.append(f"【知识关键词】\n{keyword_text}")
     body = (ku.content or "").strip()
-    if len(body) > body_limit:
-        body = f"{body[:body_limit].rstrip()}..."
-    parts.append(f"【知识单元正文】\n{body}")
+    excerpts: list[str] = []
+    if body:
+        sentence_candidates = [
+            segment.strip()
+            for segment in re.split(r"(?<=[。！？；.!?])\s+|\n+", body)
+            if segment and segment.strip()
+        ]
+        for segment in sentence_candidates:
+            if len(segment) < 8:
+                continue
+            excerpts.append(segment[:100].strip())
+            if len(excerpts) >= 2:
+                break
+        if not excerpts:
+            excerpts.append(body[:body_limit].strip())
+    if excerpts:
+        parts.append(f"【核心证据摘录】\n" + "\n".join(f"- {excerpt}" for excerpt in excerpts))
     return "\n\n".join(part for part in parts if part.strip())
 
 

@@ -104,7 +104,7 @@ def test_build_knowledge_unit_prompt_content_omits_generated_segment_title():
         title="人工智能伦理引论 (杜严勇) - 片段 20",
         summary="解释学科定位的分类差异。",
         keywords=["学科定位", "部门伦理学"],
-        content="正文内容",
+        content="第一句正文内容。第二句补充证据。第三句延伸讨论。",
     )
 
     content = question_service._build_knowledge_unit_prompt_content(ku)
@@ -114,6 +114,9 @@ def test_build_knowledge_unit_prompt_content_omits_generated_segment_title():
     assert "【知识单元标题】" not in planner_content
     assert "【知识单元摘要】" in content
     assert "【知识关键词】" in planner_content
+    assert "【知识单元正文】" not in planner_content
+    assert "【核心证据摘录】" in planner_content
+    assert "第一句正文内容" in planner_content
 
 
 def test_template_fallback_mixed_types():
