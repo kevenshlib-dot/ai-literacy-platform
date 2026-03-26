@@ -16,17 +16,15 @@ async def start_exam(
     db: AsyncSession,
     exam_id: uuid.UUID,
     user_id: uuid.UUID,
-) -> AnswerSheet:
+) -> tuple[AnswerSheet, bool]:
     """Start an exam session for a user."""
-    # Verify exam exists and is published
+    # Verify exam exists
     exam = await db.execute(select(Exam).where(Exam.id == exam_id))
     exam = exam.scalar_one_or_none()
     if not exam:
         raise ValueError("试卷不存在")
-    if exam.status != ExamStatus.PUBLISHED:
-        raise ValueError("试卷未发布，无法开始考试")
 
-    # Check if user already has an active session
+    # Existing in-progress sessions should be resumable even if the exam was closed later.
     existing = await db.execute(
         select(AnswerSheet).where(
             and_(
@@ -36,8 +34,12 @@ async def start_exam(
             )
         )
     )
-    if existing.scalar_one_or_none():
-        raise ValueError("您已有进行中的考试会话")
+    existing_sheet = existing.scalar_one_or_none()
+    if existing_sheet:
+        return existing_sheet, True
+
+    if exam.status != ExamStatus.PUBLISHED:
+        raise ValueError("试卷未发布，无法开始考试")
 
     sheet = AnswerSheet(
         exam_id=exam_id,
@@ -46,7 +48,7 @@ async def start_exam(
     )
     db.add(sheet)
     await db.flush()
-    return sheet
+    return sheet, False
 
 
 async def get_answer_sheet(
@@ -213,6 +215,7 @@ async def get_exam_session_data(
             "stem": q.stem,
             "options": q.options,
             "difficulty": q.difficulty,
+            "dimension": q.dimension,
         })
 
     # Build answers map

@@ -1,13 +1,14 @@
 """Tests for exam sessions and answering (T013+T014)."""
 import pytest
 from httpx import AsyncClient, ASGITransport
-from sqlalchemy import text
+from sqlalchemy import text, select
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from app.main import app
 from app.core.database import Base, get_db
 from app.core.config import settings
 from app.services.user_service import init_roles
+from app.models.user import User
 
 
 async def override_get_db():
@@ -60,7 +61,24 @@ async def register_user(client, role="organizer"):
         "password": "password123",
         "role": role,
     })
-    return resp.json()["access_token"]
+    data = resp.json()
+    if data.get("access_token"):
+        return data["access_token"]
+
+    user_id = data["user"]["id"]
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = (await session.execute(select(User).where(User.id == user_id))).scalar_one()
+        user.is_active = True
+        await session.commit()
+    await engine.dispose()
+
+    login_resp = await client.post("/api/v1/auth/login", json={
+        "username": f"user_{unique}",
+        "password": "password123",
+    })
+    return login_resp.json()["access_token"]
 
 
 async def setup_published_exam(client, org_token):
@@ -127,6 +145,7 @@ async def test_start_exam():
     assert data["exam_id"] == eid
     assert data["total_questions"] == 3
     assert "answer_sheet_id" in data
+    assert data["resumed"] is False
 
 
 @pytest.mark.asyncio
@@ -148,20 +167,43 @@ async def test_start_unpublished_exam_fails():
 
 
 @pytest.mark.asyncio
-async def test_cannot_start_duplicate_session():
+async def test_start_exam_resumes_existing_session():
     async with get_client() as client:
         org_token = await register_user(client, "organizer")
         ex_token = await register_user(client, "examinee")
 
         eid, _ = await setup_published_exam(client, org_token)
 
-        await client.post(f"/api/v1/sessions/start/{eid}",
-                         headers={"Authorization": f"Bearer {ex_token}"})
+        first = await client.post(f"/api/v1/sessions/start/{eid}",
+                                  headers={"Authorization": f"Bearer {ex_token}"})
 
         resp = await client.post(f"/api/v1/sessions/start/{eid}",
                                 headers={"Authorization": f"Bearer {ex_token}"})
-    assert resp.status_code == 400
-    assert "进行中" in resp.json()["detail"]
+    assert resp.status_code == 200
+    assert resp.json()["answer_sheet_id"] == first.json()["answer_sheet_id"]
+    assert resp.json()["resumed"] is True
+
+
+@pytest.mark.asyncio
+async def test_start_exam_resumes_existing_session_after_exam_closed():
+    async with get_client() as client:
+        org_token = await register_user(client, "organizer")
+        ex_token = await register_user(client, "examinee")
+
+        eid, _ = await setup_published_exam(client, org_token)
+        headers = {"Authorization": f"Bearer {ex_token}"}
+
+        first = await client.post(f"/api/v1/sessions/start/{eid}", headers=headers)
+        close_resp = await client.post(
+            f"/api/v1/exams/{eid}/close",
+            headers={"Authorization": f"Bearer {org_token}"},
+        )
+        assert close_resp.status_code == 200
+
+        resp = await client.post(f"/api/v1/sessions/start/{eid}", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["answer_sheet_id"] == first.json()["answer_sheet_id"]
+    assert resp.json()["resumed"] is True
 
 
 # ---- Get Session ----

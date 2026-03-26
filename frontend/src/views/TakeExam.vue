@@ -38,15 +38,21 @@
 
         <!-- Published Exams -->
         <a-card class="card-container" :bordered="false">
-          <a-list :loading="loadingExams" :data-source="availableExams" :locale="{ emptyText: '暂无可用考试' }">
+          <a-list :loading="loadingExams" :data-source="displayedExams" :locale="{ emptyText: '暂无可用考试' }">
             <template #renderItem="{ item }">
               <a-list-item>
                 <a-list-item-meta :title="item.title" :description="item.description || '暂无描述'" />
                 <template #actions>
+                  <a-tag v-if="activeSessionByExamId[item.id]" color="processing">进行中</a-tag>
                   <span v-if="item.time_limit_minutes">{{ item.time_limit_minutes }} 分钟</span>
-                  <span>总分 {{ item.total_score }}</span>
-                  <a-popconfirm title="确定开始考试？开始后将计时。" @confirm="startExam(item.id)">
-                    <a-button type="primary" size="small">开始考试</a-button>
+                  <span v-if="item.total_score !== undefined && item.total_score !== null">总分 {{ item.total_score }}</span>
+                  <a-popconfirm
+                    :title="activeSessionByExamId[item.id] ? '检测到未完成的考试会话，确定继续考试？' : '确定开始考试？开始后将计时。'"
+                    @confirm="startExam(item.id)"
+                  >
+                    <a-button type="primary" size="small">
+                      {{ activeSessionByExamId[item.id] ? '继续考试' : '开始考试' }}
+                    </a-button>
                   </a-popconfirm>
                 </template>
               </a-list-item>
@@ -141,12 +147,17 @@
           <!-- Question Content -->
           <div class="question-content" v-if="currentQuestion">
             <div class="question-header">
-              <span class="question-num">第 {{ currentIndex + 1 }} 题</span>
-              <a-tag>{{ typeLabel(currentQuestion.question_type) }}</a-tag>
-              <a-tag color="blue">{{ currentQuestion.score }} 分</a-tag>
-              <a-button size="small" :type="markedSet.has(currentQuestion.question_id) ? 'primary' : 'default'" @click="toggleMark">
-                {{ markedSet.has(currentQuestion.question_id) ? '取消标记' : '标记' }}
-              </a-button>
+              <div class="question-header-main">
+                <span class="question-num">第 {{ currentIndex + 1 }} 题</span>
+                <a-tag>{{ typeLabel(currentQuestion.question_type) }}</a-tag>
+                <a-tag color="blue">{{ currentQuestion.score }} 分</a-tag>
+              </div>
+              <div class="question-header-side">
+                <a-tag v-if="currentQuestion.dimension" color="geekblue">{{ currentQuestion.dimension }}</a-tag>
+                <a-button size="small" :type="markedSet.has(currentQuestion.question_id) ? 'primary' : 'default'" @click="toggleMark">
+                  {{ markedSet.has(currentQuestion.question_id) ? '取消标记' : '标记' }}
+                </a-button>
+              </div>
             </div>
 
             <div class="question-stem">{{ currentQuestion.stem }}</div>
@@ -206,6 +217,7 @@ import request from '@/utils/request'
 const router = useRouter()
 const loadingExams = ref(false)
 const availableExams = ref<any[]>([])
+const activeSessionByExamId = reactive<Record<string, string>>({})
 const session = ref<any>(null)
 const questions = ref<any[]>([])
 const answers = reactive<Record<string, string>>({})
@@ -224,8 +236,26 @@ const cleanupLoading = ref(false)
 
 const currentQuestion = computed(() => questions.value[currentIndex.value] || null)
 const answeredCount = computed(() => questions.value.filter(q => answers[q.question_id]).length)
+const displayedExams = computed(() => {
+  const published = [...availableExams.value]
+  const publishedIds = new Set(published.map(item => item.id))
+  const resumedOnly = Object.entries(activeSessionMetaByExamId).flatMap(([examId, meta]) => {
+    if (!meta || publishedIds.has(examId)) {
+      return []
+    }
+    return [{
+      id: examId,
+      title: meta.exam_title,
+      description: '未完成的考试会话',
+      total_score: null,
+      time_limit_minutes: meta.time_limit_minutes,
+    }]
+  })
+  return [...resumedOnly, ...published]
+})
 
 const multiAnswers = ref<string[]>([])
+const activeSessionMetaByExamId = reactive<Record<string, { id: string; exam_title: string; time_limit_minutes?: number | null }>>({})
 
 watch(currentIndex, () => {
   if (currentQuestion.value?.question_type === 'multiple_choice') {
@@ -254,15 +284,44 @@ function formatTime(seconds: number) {
 async function fetchAvailableExams() {
   loadingExams.value = true
   try {
-    const data: any = await request.get('/exams', { params: { status: 'published', skip: 0, limit: 50 } })
-    availableExams.value = (data.items || []).filter((e: any) => !e.title.startsWith('随机测试'))
+    const [examData, sessionData]: [any, any] = await Promise.all([
+      request.get('/exams', { params: { status: 'published', skip: 0, limit: 50 } }),
+      request.get('/sessions', { params: { skip: 0, limit: 100 } }),
+    ])
+    availableExams.value = (examData.items || []).filter((e: any) => !e.title.startsWith('随机测试'))
+    Object.keys(activeSessionByExamId).forEach(key => delete activeSessionByExamId[key])
+    Object.keys(activeSessionMetaByExamId).forEach(key => delete activeSessionMetaByExamId[key])
+    for (const item of sessionData || []) {
+      if (item?.status === 'in_progress' && item?.exam_id) {
+        activeSessionByExamId[item.exam_id] = item.id
+        activeSessionMetaByExamId[item.exam_id] = {
+          id: item.id,
+          exam_title: item.exam_title || '未完成考试',
+          time_limit_minutes: item.time_limit_minutes,
+        }
+      }
+    }
   } catch { /* handled */ } finally {
     loadingExams.value = false
   }
 }
 
+function resetSessionState() {
+  currentIndex.value = 0
+  remainingSeconds.value = null
+  if (timerInterval) {
+    clearInterval(timerInterval)
+    timerInterval = null
+  }
+  questions.value = []
+  Object.keys(answers).forEach(key => delete answers[key])
+  markedSet.value = new Set()
+  multiAnswers.value = []
+}
+
 async function startExam(examId: string) {
   try {
+    resetSessionState()
     const data: any = await request.post(`/sessions/start/${examId}`)
     session.value = data
 
@@ -282,7 +341,7 @@ async function startExam(examId: string) {
       remainingSeconds.value = Math.max(0, data.time_limit_minutes * 60 - elapsed)
       startTimer()
     }
-    message.success('考试开始')
+    message.success(data.resumed ? '已恢复未完成的考试' : '考试开始')
   } catch { /* handled */ }
 }
 
@@ -330,7 +389,10 @@ async function submitExam() {
   try {
     const sheetId = session.value.answer_sheet_id
     const data: any = await request.post(`/sessions/${sheetId}/submit`)
-    clearInterval(timerInterval)
+    if (timerInterval) {
+      clearInterval(timerInterval)
+      timerInterval = null
+    }
 
     if (isRandomTest.value) {
       // Fetch score and show inline — don't save to history
@@ -357,13 +419,17 @@ async function submitExam() {
         }
       }
       session.value = null
-      questions.value = []
-      Object.keys(answers).forEach(k => delete answers[k])
+      resetSessionState()
     } else {
       message.success(`交卷成功！已答 ${data.total_answered}/${data.total_questions} 题`)
       session.value = null
-      questions.value = []
-      Object.keys(answers).forEach(k => delete answers[k])
+      Object.keys(activeSessionByExamId).forEach(key => {
+        if (activeSessionByExamId[key] === sheetId) delete activeSessionByExamId[key]
+      })
+      Object.keys(activeSessionMetaByExamId).forEach(key => {
+        if (activeSessionMetaByExamId[key]?.id === sheetId) delete activeSessionMetaByExamId[key]
+      })
+      resetSessionState()
       router.push({ name: 'Scores' })
     }
   } catch { /* handled */ }
@@ -378,6 +444,7 @@ function showRandomTestModal() {
 async function startRandomTest() {
   randomTestLoading.value = true
   try {
+    resetSessionState()
     const data: any = await request.post('/sessions/random-test', {
       count: randomTestForm.count,
       difficulty_mode: randomTestForm.difficulty_mode,
@@ -454,7 +521,9 @@ onUnmounted(() => { if (timerInterval) clearInterval(timerInterval) })
 .dot-marked { border: 1px solid #faad14; background: transparent; }
 .dot-current { background: #1F4E79; }
 .question-content { flex: 1; padding: 24px; overflow-y: auto; }
-.question-header { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+.question-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+.question-header-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.question-header-side { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .question-num { font-size: 16px; font-weight: 600; }
 .question-stem { font-size: 15px; line-height: 1.8; margin-bottom: 20px; white-space: pre-wrap; }
 .question-options { margin-bottom: 24px; }
