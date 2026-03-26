@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -42,8 +42,33 @@ class AutoAssembleRequest(BaseModel):
         default=None,
         description="Knowledge dimensions to cover. None = any dimension.",
     )
+    dimension_weights: Optional[dict[str, int]] = Field(
+        default=None,
+        description="Five fixed knowledge dimensions mapped to ratio weights.",
+    )
     score_per_question: float = Field(default=5.0)
     exclude_question_ids: Optional[List[UUID]] = None
+    audience_type: Optional[Literal["all", "librarian", "researcher_teacher", "college_student"]] = Field(
+        default="all",
+        description="Target audience hint for assembly.",
+    )
+    library_types: Optional[List[Literal["public", "university", "research"]]] = Field(
+        default=None,
+        description="Optional library types when audience is librarian.",
+    )
+    job_type: Optional[Literal["general", "technical", "service"]] = Field(
+        default=None,
+        description="Optional job type when audience is librarian.",
+    )
+    requirements_prompt: Optional[str] = Field(
+        default=None,
+        max_length=500,
+        description="Free-form detailed requirements for paper generation.",
+    )
+    difficulty_preset: Optional[Literal["newbie", "backbone", "expert", "custom"]] = Field(
+        default=None,
+        description="Named difficulty preset shown in UI.",
+    )
 
 
 class ExamQuestionResponse(BaseModel):

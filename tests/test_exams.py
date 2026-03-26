@@ -1,13 +1,15 @@
 """Tests for exam assembly strategy engine (T012)."""
 import pytest
 from httpx import AsyncClient, ASGITransport
-from sqlalchemy import text
+from sqlalchemy import text, select
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from app.main import app
 from app.core.database import Base, get_db
 from app.core.config import settings
-from app.services.user_service import init_roles
+from app.core.security import create_access_token
+from app.services.user_service import init_roles, create_user
+from app.models.user import User
 
 
 async def override_get_db():
@@ -52,13 +54,46 @@ def get_client():
 async def register_user(client, role="organizer"):
     import uuid
     unique = uuid.uuid4().hex[:8]
+    if role == "admin":
+        engine = create_async_engine(settings.DATABASE_URL, echo=False)
+        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with session_factory() as session:
+            user = await create_user(
+                session,
+                username=f"user_{unique}",
+                email=f"{unique}@test.com",
+                password="password123",
+                role_name=role,
+                is_active=True,
+            )
+            await session.commit()
+        await engine.dispose()
+        return create_access_token(subject=str(user.id), extra_claims={"role": role})
+
     resp = await client.post("/api/v1/auth/register", json={
         "username": f"user_{unique}",
         "email": f"{unique}@test.com",
         "password": "password123",
         "role": role,
     })
-    return resp.json()["access_token"]
+    data = resp.json()
+    if data.get("access_token"):
+        return data["access_token"]
+
+    user_id = data["user"]["id"]
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = (await session.execute(select(User).where(User.id == user_id))).scalar_one()
+        user.is_active = True
+        await session.commit()
+    await engine.dispose()
+
+    login_resp = await client.post("/api/v1/auth/login", json={
+        "username": f"user_{unique}",
+        "password": "password123",
+    })
+    return login_resp.json()["access_token"]
 
 
 async def create_approved_questions(client, token, count=5, qtype="single_choice", dimension="AI基础"):
@@ -334,6 +369,88 @@ async def test_auto_assemble_with_dimension_filter():
         }, headers=headers)
     assert resp.status_code == 200
     assert resp.json()["total_questions"] == 2
+
+
+@pytest.mark.asyncio
+async def test_auto_assemble_persists_auxiliary_params():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        await create_approved_questions(client, token, count=5, dimension="AI基础知识")
+
+        create = await client.post("/api/v1/exams", json={"title": "辅助参数测试"}, headers=headers)
+        eid = create.json()["id"]
+
+        resp = await client.post(f"/api/v1/exams/{eid}/assemble/auto", json={
+            "type_distribution": {"single_choice": 3},
+            "difficulty_target": 3,
+            "difficulty_tolerance": 1,
+            "difficulty_preset": "backbone",
+            "audience_type": "librarian",
+            "library_types": ["public", "research"],
+            "job_type": "technical",
+            "requirements_prompt": "面向公共与研究图书馆技术岗位，重点考查AI伦理安全与工具应用。",
+            "dimension_weights": {
+                "AI基础知识": 20,
+                "AI技术应用": 20,
+                "AI伦理安全": 20,
+                "AI批判思维": 20,
+                "AI创新实践": 20,
+            },
+            "score_per_question": 5,
+        }, headers=headers)
+        assert resp.status_code == 200
+
+        detail = await client.get(f"/api/v1/exams/{eid}", headers=headers)
+    assert detail.status_code == 200
+    params = detail.json()["params"]
+    assert params["audience_type"] == "librarian"
+    assert params["library_types"] == ["public", "research"]
+    assert params["job_type"] == "technical"
+    assert params["difficulty_preset"] == "backbone"
+    assert params["requirements_prompt"].startswith("面向公共与研究图书馆")
+    assert params["dimension_weights"]["AI基础知识"] == 20
+    assert "AI基础知识" in params["dimensions"]
+
+
+@pytest.mark.asyncio
+async def test_auto_assemble_dimension_weights_fallback_to_other_selected_dimensions():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        await create_approved_questions(client, token, count=1, dimension="AI基础知识")
+        await create_approved_questions(client, token, count=3, dimension="AI伦理安全")
+
+        create = await client.post("/api/v1/exams", json={"title": "维度比例补位测试"}, headers=headers)
+        eid = create.json()["id"]
+
+        resp = await client.post(f"/api/v1/exams/{eid}/assemble/auto", json={
+            "type_distribution": {"single_choice": 4},
+            "difficulty_target": 3,
+            "difficulty_tolerance": 1,
+            "dimension_weights": {
+                "AI基础知识": 50,
+                "AI技术应用": 0,
+                "AI伦理安全": 50,
+                "AI批判思维": 0,
+                "AI创新实践": 0,
+            },
+            "score_per_question": 5,
+        }, headers=headers)
+        assert resp.status_code == 200
+        assert resp.json()["total_questions"] == 4
+
+        composition = await client.get(f"/api/v1/exams/{eid}/composition", headers=headers)
+    assert composition.status_code == 200
+    items = composition.json()["items"]
+    dimension_counts = {}
+    for item in items:
+        dimension = item["question"]["dimension"]
+        dimension_counts[dimension] = dimension_counts.get(dimension, 0) + 1
+    assert dimension_counts["AI基础知识"] == 1
+    assert dimension_counts["AI伦理安全"] == 3
 
 
 @pytest.mark.asyncio

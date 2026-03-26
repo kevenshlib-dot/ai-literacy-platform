@@ -390,8 +390,14 @@ async def auto_assemble(
             difficulty_target=body.difficulty_target,
             difficulty_tolerance=body.difficulty_tolerance,
             dimensions=body.dimensions,
+            dimension_weights=body.dimension_weights,
             score_per_question=body.score_per_question,
             exclude_question_ids=body.exclude_question_ids,
+            audience_type=body.audience_type,
+            library_types=body.library_types,
+            job_type=body.job_type,
+            requirements_prompt=body.requirements_prompt,
+            difficulty_preset=body.difficulty_preset,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

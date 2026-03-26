@@ -11,6 +11,14 @@ from sqlalchemy.orm import selectinload
 from app.models.exam import Exam, ExamQuestion, ExamStatus
 from app.models.question import Question, QuestionType, QuestionStatus
 
+FIVE_DIMENSIONS = [
+    "AI基础知识",
+    "AI技术应用",
+    "AI伦理安全",
+    "AI批判思维",
+    "AI创新实践",
+]
+
 
 async def _get_draft_exam(db: AsyncSession, exam_id: uuid.UUID) -> Exam:
     exam = await get_exam_by_id(db, exam_id)
@@ -91,6 +99,100 @@ async def _replace_exam_questions(
     exam.total_score = total_score
     await db.flush()
     return exam_questions
+
+
+def _normalize_dimension_weights(
+    dimension_weights: Optional[dict[str, int]],
+) -> Optional[dict[str, int]]:
+    if not dimension_weights:
+        return None
+
+    normalized: dict[str, int] = {}
+    for dimension in FIVE_DIMENSIONS:
+        raw = dimension_weights.get(dimension, 0)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 0
+        normalized[dimension] = max(0, value)
+
+    if sum(normalized.values()) <= 0:
+        return None
+    return normalized
+
+
+def _weights_to_dimensions(
+    dimension_weights: Optional[dict[str, int]],
+) -> Optional[list[str]]:
+    normalized = _normalize_dimension_weights(dimension_weights)
+    if not normalized:
+        return None
+    return [dimension for dimension in FIVE_DIMENSIONS if normalized[dimension] > 0]
+
+
+def _allocate_dimension_counts(
+    total: int,
+    dimension_weights: dict[str, int],
+) -> dict[str, int]:
+    active_dimensions = [dimension for dimension in FIVE_DIMENSIONS if dimension_weights.get(dimension, 0) > 0]
+    if total <= 0 or not active_dimensions:
+        return {}
+
+    weight_sum = sum(dimension_weights[dimension] for dimension in active_dimensions)
+    if weight_sum <= 0:
+        return {}
+
+    raw_counts = {
+        dimension: total * dimension_weights[dimension] / weight_sum
+        for dimension in active_dimensions
+    }
+    allocated = {
+        dimension: int(math.floor(raw_counts[dimension]))
+        for dimension in active_dimensions
+    }
+    remainder = total - sum(allocated.values())
+    ranked_dimensions = sorted(
+        active_dimensions,
+        key=lambda dimension: (raw_counts[dimension] - allocated[dimension], -FIVE_DIMENSIONS.index(dimension)),
+        reverse=True,
+    )
+    for dimension in ranked_dimensions[:remainder]:
+        allocated[dimension] += 1
+    return allocated
+
+
+async def _fetch_candidate_questions(
+    db: AsyncSession,
+    qtype: QuestionType,
+    diff_min: int,
+    diff_max: int,
+    count: int,
+    dimensions: Optional[list[str]] = None,
+    exclude_question_ids: Optional[list[uuid.UUID]] = None,
+) -> list[Question]:
+    if count <= 0:
+        return []
+
+    conditions = [
+        Question.status == QuestionStatus.APPROVED,
+        Question.question_type == qtype,
+        Question.difficulty >= diff_min,
+        Question.difficulty <= diff_max,
+    ]
+
+    if dimensions:
+        conditions.append(Question.dimension.in_(dimensions))
+
+    if exclude_question_ids:
+        conditions.append(Question.id.notin_(exclude_question_ids))
+
+    result = await db.execute(
+        select(Question)
+        .where(and_(*conditions))
+        .order_by(func.random())
+        .limit(count)
+    )
+    return list(result.scalars().all())
 
 
 async def create_exam(
@@ -239,8 +341,14 @@ async def auto_assemble(
     difficulty_target: int = 3,
     difficulty_tolerance: int = 1,
     dimensions: Optional[list[str]] = None,
+    dimension_weights: Optional[dict[str, int]] = None,
     score_per_question: float = 5.0,
     exclude_question_ids: Optional[list[uuid.UUID]] = None,
+    audience_type: Optional[str] = None,
+    library_types: Optional[list[str]] = None,
+    job_type: Optional[str] = None,
+    requirements_prompt: Optional[str] = None,
+    difficulty_preset: Optional[str] = None,
 ) -> list[ExamQuestion]:
     """Auto-assemble an exam based on strategy constraints.
 
@@ -259,38 +367,59 @@ async def auto_assemble(
 
     diff_min = max(1, difficulty_target - difficulty_tolerance)
     diff_max = min(5, difficulty_target + difficulty_tolerance)
+    normalized_weights = _normalize_dimension_weights(dimension_weights)
+    weighted_dimensions = _weights_to_dimensions(normalized_weights)
+    effective_dimensions = weighted_dimensions or dimensions
 
     selected_questions = []
     order = 1
 
     for qtype_str, count in type_distribution.items():
         qtype = QuestionType(qtype_str)
-
-        conditions = [
-            Question.status == QuestionStatus.APPROVED,
-            Question.question_type == qtype,
-            Question.difficulty >= diff_min,
-            Question.difficulty <= diff_max,
+        already_ids = [sq["question_id"] for sq in selected_questions]
+        blocked_ids = [
+            *(exclude_question_ids or []),
+            *already_ids,
         ]
 
-        if dimensions:
-            conditions.append(Question.dimension.in_(dimensions))
+        if normalized_weights:
+            per_dimension_targets = _allocate_dimension_counts(count, normalized_weights)
+            candidates: list[Question] = []
 
-        if exclude_question_ids:
-            conditions.append(Question.id.notin_(exclude_question_ids))
+            for dimension, dimension_count in per_dimension_targets.items():
+                chosen = await _fetch_candidate_questions(
+                    db=db,
+                    qtype=qtype,
+                    diff_min=diff_min,
+                    diff_max=diff_max,
+                    count=dimension_count,
+                    dimensions=[dimension],
+                    exclude_question_ids=blocked_ids + [candidate.id for candidate in candidates],
+                )
+                candidates.extend(chosen)
 
-        # Exclude already selected
-        already_ids = [sq["question_id"] for sq in selected_questions]
-        if already_ids:
-            conditions.append(Question.id.notin_(already_ids))
-
-        result = await db.execute(
-            select(Question)
-            .where(and_(*conditions))
-            .order_by(func.random())
-            .limit(count)
-        )
-        candidates = list(result.scalars().all())
+            shortage = count - len(candidates)
+            if shortage > 0 and weighted_dimensions:
+                fallback_candidates = await _fetch_candidate_questions(
+                    db=db,
+                    qtype=qtype,
+                    diff_min=diff_min,
+                    diff_max=diff_max,
+                    count=shortage,
+                    dimensions=weighted_dimensions,
+                    exclude_question_ids=blocked_ids + [candidate.id for candidate in candidates],
+                )
+                candidates.extend(fallback_candidates)
+        else:
+            candidates = await _fetch_candidate_questions(
+                db=db,
+                qtype=qtype,
+                diff_min=diff_min,
+                diff_max=diff_max,
+                count=count,
+                dimensions=effective_dimensions,
+                exclude_question_ids=blocked_ids,
+            )
 
         for q in candidates:
             selected_questions.append({
@@ -305,8 +434,14 @@ async def auto_assemble(
         "type_distribution": type_distribution,
         "difficulty_target": difficulty_target,
         "difficulty_tolerance": difficulty_tolerance,
-        "dimensions": dimensions,
+        "dimensions": effective_dimensions,
+        "dimension_weights": normalized_weights,
         "score_per_question": score_per_question,
+        "audience_type": audience_type,
+        "library_types": library_types if audience_type == "librarian" else None,
+        "job_type": job_type if audience_type == "librarian" else None,
+        "requirements_prompt": requirements_prompt,
+        "difficulty_preset": difficulty_preset,
     }
     await db.flush()
 

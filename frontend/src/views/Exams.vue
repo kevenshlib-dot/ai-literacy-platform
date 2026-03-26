@@ -128,7 +128,7 @@
     <a-modal
       v-model:open="assembleModal.visible"
       title="智能组卷"
-      width="640px"
+      width="760px"
       @ok="handleAssemble"
       :confirm-loading="assembleModal.loading"
     >
@@ -146,6 +146,31 @@
         style="margin-bottom: 16px"
       />
       <a-form layout="vertical">
+        <a-form-item label="面向人员类型">
+          <a-radio-group v-model:value="assembleModal.data.audience_type" @change="handleAudienceTypeChange">
+            <a-radio-button v-for="option in audienceOptions" :key="option.value" :value="option.value">
+              {{ option.label }}
+            </a-radio-button>
+          </a-radio-group>
+        </a-form-item>
+
+        <a-row v-if="assembleModal.data.audience_type === 'librarian'" :gutter="16">
+          <a-col :span="14">
+            <a-form-item label="图书馆类型">
+              <a-checkbox-group v-model:value="assembleModal.data.library_types" :options="libraryTypeOptions" />
+            </a-form-item>
+          </a-col>
+          <a-col :span="10">
+            <a-form-item label="岗位类型">
+              <a-radio-group v-model:value="assembleModal.data.job_type">
+                <a-radio-button v-for="option in jobTypeOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </a-radio-button>
+              </a-radio-group>
+            </a-form-item>
+          </a-col>
+        </a-row>
+
         <a-form-item label="题型分配">
           <a-row :gutter="[8, 8]">
             <a-col :span="8">
@@ -166,30 +191,60 @@
           </a-row>
         </a-form-item>
         <a-row :gutter="16">
-          <a-col :span="8">
+          <a-col :span="12">
             <a-form-item label="目标难度">
-              <a-slider v-model:value="assembleModal.data.difficulty_target" :min="1" :max="5" :marks="{1:'简单',3:'中等',5:'困难'}" />
+              <a-space direction="vertical" style="width: 100%">
+                <a-radio-group v-model:value="assembleModal.data.difficulty_preset" @change="handleDifficultyPresetChange">
+                  <a-radio-button v-for="option in difficultyPresetOptions" :key="option.value" :value="option.value">
+                    {{ option.label }}
+                  </a-radio-button>
+                </a-radio-group>
+                <a-input-number
+                  v-model:value="assembleModal.data.difficulty_target"
+                  :min="1"
+                  :max="5"
+                  style="width: 100%"
+                  addon-before="实际难度"
+                  @change="handleDifficultyTargetChange"
+                />
+              </a-space>
             </a-form-item>
           </a-col>
-          <a-col :span="8">
+          <a-col :span="6">
             <a-form-item label="难度容差">
               <a-input-number v-model:value="assembleModal.data.difficulty_tolerance" :min="0" :max="2" style="width: 100%" />
             </a-form-item>
           </a-col>
-          <a-col :span="8">
+          <a-col :span="6">
             <a-form-item label="每题分值">
               <a-input-number v-model:value="assembleModal.data.score_per_question" :min="1" :max="50" style="width: 100%" />
             </a-form-item>
           </a-col>
         </a-row>
-        <a-form-item label="知识维度（可选）">
-          <a-select v-model:value="assembleModal.data.dimensions" mode="multiple" placeholder="不限维度" style="width: 100%">
-            <a-select-option value="AI基础知识">AI基础知识</a-select-option>
-            <a-select-option value="AI技术应用">AI技术应用</a-select-option>
-            <a-select-option value="AI伦理安全">AI伦理安全</a-select-option>
-            <a-select-option value="AI批判思维">AI批判思维</a-select-option>
-            <a-select-option value="AI创新实践">AI创新实践</a-select-option>
-          </a-select>
+
+        <a-form-item label="试卷要求描述">
+          <a-textarea
+            v-model:value="assembleModal.data.requirements_prompt"
+            :rows="3"
+            :maxlength="500"
+            placeholder="您可输入具体面向对象描述，试卷知识点侧重点比例等详细要求"
+          />
+        </a-form-item>
+
+        <a-form-item :label="`知识维度占比（当前合计 ${dimensionWeightTotal()}%）`">
+          <div class="dimension-weight-list">
+            <div v-for="dimension in fiveDimensions" :key="dimension" class="dimension-weight-row">
+              <span class="dimension-weight-label">{{ dimension }}</span>
+              <a-input-number
+                :value="assembleModal.data.dimension_weights[dimension]"
+                :min="0"
+                :max="100"
+                addon-after="%"
+                style="width: 140px"
+                @change="handleDimensionWeightChange(dimension, $event)"
+              />
+            </div>
+          </div>
         </a-form-item>
       </a-form>
     </a-modal>
@@ -209,6 +264,21 @@
           <a-descriptions-item label="时长">{{ detailDrawer.exam.time_limit_minutes ? detailDrawer.exam.time_limit_minutes + ' 分钟' : '不限时' }}</a-descriptions-item>
           <a-descriptions-item label="使用次数">{{ detailDrawer.exam.usage_count }}</a-descriptions-item>
           <a-descriptions-item label="描述" :span="2">{{ detailDrawer.exam.description || '无' }}</a-descriptions-item>
+          <a-descriptions-item v-if="formatAudienceSummary(detailDrawer.exam.params)" label="面向对象">
+            {{ formatAudienceSummary(detailDrawer.exam.params) }}
+          </a-descriptions-item>
+          <a-descriptions-item v-if="formatLibrarySummary(detailDrawer.exam.params)" label="图书馆画像">
+            {{ formatLibrarySummary(detailDrawer.exam.params) }}
+          </a-descriptions-item>
+          <a-descriptions-item v-if="formatDifficultySummary(detailDrawer.exam.params)" label="目标难度">
+            {{ formatDifficultySummary(detailDrawer.exam.params) }}
+          </a-descriptions-item>
+          <a-descriptions-item v-if="detailDrawer.exam.params?.requirements_prompt" label="详细要求" :span="2">
+            {{ detailDrawer.exam.params.requirements_prompt }}
+          </a-descriptions-item>
+          <a-descriptions-item v-if="formatDimensionWeightSummary(detailDrawer.exam.params)" label="维度占比" :span="2">
+            {{ formatDimensionWeightSummary(detailDrawer.exam.params) }}
+          </a-descriptions-item>
         </a-descriptions>
 
         <a-divider>试题列表（{{ detailDrawer.questions.length }} 题）</a-divider>
@@ -246,6 +316,34 @@ const filters = reactive({ keyword: '', status: undefined as string | undefined 
 const pagination = reactive({ current: 1, pageSize: 20, total: 0 })
 
 const approvedCount = ref(0)
+const fiveDimensions = ['AI基础知识', 'AI技术应用', 'AI伦理安全', 'AI批判思维', 'AI创新实践']
+const audienceOptions = [
+  { label: '不限', value: 'all' },
+  { label: '图书馆员', value: 'librarian' },
+  { label: '社科研究员/教师', value: 'researcher_teacher' },
+  { label: '高校学生', value: 'college_student' },
+]
+const libraryTypeOptions = [
+  { label: '公共', value: 'public' },
+  { label: '高校', value: 'university' },
+  { label: '研究', value: 'research' },
+]
+const jobTypeOptions = [
+  { label: '综合', value: 'general' },
+  { label: '技术', value: 'technical' },
+  { label: '服务', value: 'service' },
+]
+const difficultyPresetOptions = [
+  { label: '新手', value: 'newbie' },
+  { label: '骨干', value: 'backbone' },
+  { label: '专家', value: 'expert' },
+  { label: '自定义', value: 'custom' },
+]
+const difficultyPresetValues: Record<string, number> = {
+  newbie: 1,
+  backbone: 3,
+  expert: 5,
+}
 
 const typeDist = reactive({
   single_choice: 10,
@@ -280,17 +378,60 @@ const formModal = reactive({
   data: { title: '', description: '', time_limit_minutes: null as number | null, total_score: 100 },
 })
 
+function createZeroDimensionWeights() {
+  return Object.fromEntries(fiveDimensions.map(dimension => [dimension, 0])) as Record<string, number>
+}
+
+function createDefaultDimensionWeights() {
+  return Object.fromEntries(fiveDimensions.map(dimension => [dimension, 20])) as Record<string, number>
+}
+
+function buildWeightsFromDimensions(dimensions: string[] = []) {
+  const weights = createZeroDimensionWeights()
+  const active = fiveDimensions.filter(dimension => dimensions.includes(dimension))
+  if (active.length === 0) return createDefaultDimensionWeights()
+  const base = Math.floor(100 / active.length)
+  let remainder = 100 - (base * active.length)
+  active.forEach((dimension) => {
+    weights[dimension] = base + (remainder > 0 ? 1 : 0)
+    if (remainder > 0) remainder -= 1
+  })
+  return weights
+}
+
+function normalizeDimensionWeights(raw: any) {
+  if (!raw || typeof raw !== 'object') return createDefaultDimensionWeights()
+  const normalized = createZeroDimensionWeights()
+  let total = 0
+  fiveDimensions.forEach((dimension) => {
+    const value = Number(raw[dimension])
+    const safeValue = Number.isFinite(value) ? Math.max(0, Math.min(100, Math.round(value))) : 0
+    normalized[dimension] = safeValue
+    total += safeValue
+  })
+  return total > 0 ? normalized : createDefaultDimensionWeights()
+}
+
+function createDefaultAssembleData() {
+  return {
+    audience_type: 'all',
+    library_types: [] as string[],
+    job_type: undefined as string | undefined,
+    difficulty_preset: 'backbone',
+    difficulty_target: 3,
+    difficulty_tolerance: 1,
+    score_per_question: 5,
+    requirements_prompt: '',
+    dimension_weights: createDefaultDimensionWeights(),
+  }
+}
+
 // Assemble modal
 const assembleModal = reactive({
   visible: false,
   loading: false,
   examId: null as string | null,
-  data: {
-    difficulty_target: 3,
-    difficulty_tolerance: 1,
-    score_per_question: 5,
-    dimensions: [] as string[],
-  },
+  data: createDefaultAssembleData(),
 })
 
 // Detail drawer
@@ -309,6 +450,72 @@ function statusLabel(s: string) {
 function formatDate(d: string) {
   if (!d) return ''
   return new Date(d).toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function dimensionWeightTotal() {
+  return fiveDimensions.reduce((sum, dimension) => sum + Number(assembleModal.data.dimension_weights[dimension] || 0), 0)
+}
+
+function audienceLabel(value?: string) {
+  return {
+    all: '不限',
+    librarian: '图书馆员',
+    researcher_teacher: '社科研究员/教师',
+    college_student: '高校学生',
+  }[value || ''] || ''
+}
+
+function libraryTypeLabel(value?: string) {
+  return {
+    public: '公共',
+    university: '高校',
+    research: '研究',
+  }[value || ''] || ''
+}
+
+function jobTypeLabel(value?: string) {
+  return {
+    general: '综合',
+    technical: '技术',
+    service: '服务',
+  }[value || ''] || ''
+}
+
+function difficultyPresetLabel(value?: string) {
+  return {
+    newbie: '新手',
+    backbone: '骨干',
+    expert: '专家',
+    custom: '自定义',
+  }[value || ''] || ''
+}
+
+function formatAudienceSummary(params?: any) {
+  return audienceLabel(params?.audience_type)
+}
+
+function formatLibrarySummary(params?: any) {
+  if (params?.audience_type !== 'librarian') return ''
+  const parts = []
+  const libraryTypes = Array.isArray(params?.library_types) ? params.library_types.map((value: string) => libraryTypeLabel(value)).filter(Boolean) : []
+  if (libraryTypes.length > 0) parts.push(`图书馆类型：${libraryTypes.join(' / ')}`)
+  const jobLabel = jobTypeLabel(params?.job_type)
+  if (jobLabel) parts.push(`岗位：${jobLabel}`)
+  return parts.join('；')
+}
+
+function formatDifficultySummary(params?: any) {
+  if (!params?.difficulty_target) return ''
+  const presetLabel = difficultyPresetLabel(params?.difficulty_preset)
+  return presetLabel ? `${presetLabel}（${params.difficulty_target}）` : String(params.difficulty_target)
+}
+
+function formatDimensionWeightSummary(params?: any) {
+  const weights = params?.dimension_weights
+  if (!weights || typeof weights !== 'object') return ''
+  return fiveDimensions
+    .map(dimension => `${dimension} ${Number(weights[dimension] || 0)}%`)
+    .join('；')
 }
 
 function parsePositiveInt(value: unknown, fallback: number) {
@@ -438,23 +645,62 @@ async function handleFormSubmit() {
 
 async function showAssembleModal(record: any) {
   assembleModal.examId = record.id
-  assembleModal.data = {
-    difficulty_target: 3,
-    difficulty_tolerance: 1,
-    score_per_question: 5,
-    dimensions: [],
-  }
-  typeDist.single_choice = 10
-  typeDist.multiple_choice = 0
-  typeDist.true_false = 5
-  typeDist.fill_blank = 0
-  typeDist.short_answer = 0
+  assembleModal.data = createDefaultAssembleData()
+  const params = record.params || {}
+  const storedTypeDistribution = params.type_distribution || {}
+  typeDist.single_choice = Number(storedTypeDistribution.single_choice || 10)
+  typeDist.multiple_choice = Number(storedTypeDistribution.multiple_choice || 0)
+  typeDist.true_false = Number(storedTypeDistribution.true_false || 5)
+  typeDist.fill_blank = Number(storedTypeDistribution.fill_blank || 0)
+  typeDist.short_answer = Number(storedTypeDistribution.short_answer || 0)
+  assembleModal.data.difficulty_target = Number(params.difficulty_target || 3)
+  assembleModal.data.difficulty_tolerance = Number(params.difficulty_tolerance ?? 1)
+  assembleModal.data.score_per_question = Number(params.score_per_question || 5)
+  assembleModal.data.audience_type = params.audience_type || 'all'
+  assembleModal.data.library_types = Array.isArray(params.library_types) ? [...params.library_types] : []
+  assembleModal.data.job_type = params.job_type || undefined
+  assembleModal.data.requirements_prompt = params.requirements_prompt || ''
+  assembleModal.data.difficulty_preset = params.difficulty_preset || 'backbone'
+  assembleModal.data.dimension_weights = params.dimension_weights
+    ? normalizeDimensionWeights(params.dimension_weights)
+    : buildWeightsFromDimensions(Array.isArray(params.dimensions) ? params.dimensions : [])
+  handleAudienceTypeChange()
+  handleDifficultyTargetChange(assembleModal.data.difficulty_target)
   assembleModal.visible = true
   // Fetch approved question count
   try {
     const data: any = await request.get('/questions', { params: { status: 'approved', skip: 0, limit: 1 } })
     approvedCount.value = data.total || 0
   } catch { approvedCount.value = 0 }
+}
+
+function handleAudienceTypeChange() {
+  if (assembleModal.data.audience_type !== 'librarian') {
+    assembleModal.data.library_types = []
+    assembleModal.data.job_type = undefined
+  }
+}
+
+function handleDifficultyPresetChange() {
+  const preset = assembleModal.data.difficulty_preset
+  if (preset && preset !== 'custom' && difficultyPresetValues[preset]) {
+    assembleModal.data.difficulty_target = difficultyPresetValues[preset]
+  }
+}
+
+function handleDifficultyTargetChange(value: number | string | null) {
+  const parsed = Number(value)
+  const safeValue = Number.isFinite(parsed) ? Math.max(1, Math.min(5, Math.round(parsed))) : 3
+  assembleModal.data.difficulty_target = safeValue
+  const matchedPreset = Object.entries(difficultyPresetValues).find(([, presetValue]) => presetValue === safeValue)?.[0]
+  assembleModal.data.difficulty_preset = matchedPreset || 'custom'
+}
+
+function handleDimensionWeightChange(dimension: string, value: number | string | null) {
+  const parsed = Number(value)
+  assembleModal.data.dimension_weights[dimension] = Number.isFinite(parsed)
+    ? Math.max(0, Math.min(100, Math.round(parsed)))
+    : 0
 }
 
 async function handleAssemble() {
@@ -466,6 +712,14 @@ async function handleAssemble() {
     message.warning('请至少设置一种题型的数量')
     return
   }
+  if (dimensionWeightTotal() !== 100) {
+    message.warning('知识维度占比之和必须为 100%')
+    return
+  }
+  if (assembleModal.data.audience_type === 'librarian' && !assembleModal.data.job_type) {
+    message.warning('请选择岗位类型')
+    return
+  }
   assembleModal.loading = true
   try {
     const payload: any = {
@@ -473,9 +727,16 @@ async function handleAssemble() {
       difficulty_target: assembleModal.data.difficulty_target,
       difficulty_tolerance: assembleModal.data.difficulty_tolerance,
       score_per_question: assembleModal.data.score_per_question,
+      difficulty_preset: assembleModal.data.difficulty_preset,
+      audience_type: assembleModal.data.audience_type,
+      dimension_weights: { ...assembleModal.data.dimension_weights },
     }
-    if (assembleModal.data.dimensions.length > 0) {
-      payload.dimensions = assembleModal.data.dimensions
+    if (assembleModal.data.requirements_prompt.trim()) {
+      payload.requirements_prompt = assembleModal.data.requirements_prompt.trim()
+    }
+    if (assembleModal.data.audience_type === 'librarian') {
+      if (assembleModal.data.library_types.length > 0) payload.library_types = assembleModal.data.library_types
+      payload.job_type = assembleModal.data.job_type
     }
     const data: any = await request.post(`/exams/${assembleModal.examId}/assemble/auto`, payload)
     if (data.total_questions === 0) {
@@ -539,4 +800,23 @@ onMounted(() => {
 
 <style scoped>
 .filter-card { margin-bottom: 16px; }
+.dimension-weight-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.dimension-weight-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 12px;
+  border: 1px solid #f0f0f0;
+  border-radius: 8px;
+  background: #fafafa;
+}
+.dimension-weight-label {
+  color: #262626;
+  font-weight: 500;
+}
 </style>
