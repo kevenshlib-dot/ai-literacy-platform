@@ -1781,6 +1781,8 @@ async def preview_question_bank_from_material(
     if mat_status not in ("parsed", "vectorized"):
         raise ValueError(f"素材尚未解析完成，当前状态: {mat_status}")
 
+    overall_start_time = time.time()
+    prepare_units_start = time.time()
     requested_total = _count_requested_questions(type_distribution)
     ku_result = await db.execute(
         select(KnowledgeUnit)
@@ -1810,61 +1812,81 @@ async def preview_question_bank_from_material(
         for ku in units
         if any(count > 0 for count in unit_type_plan.get(ku.id, {}).values())
     ]
+    generation_slots = _build_material_generation_slots(
+        units,
+        type_distribution,
+        unit_type_plan,
+    )
+    overall_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    timings = {
+        "prepare_units_seconds": round(max(0.0, time.time() - prepare_units_start), 4),
+        "planner_seconds": 0.0,
+        "generation_seconds": 0.0,
+        "duplicate_check_seconds": 0.0,
+        "calibration_seconds": 0.0,
+        "attempt_count": 0,
+    }
+    planner_start = time.time()
+    planner_result = generate_question_plan_batch_via_llm(
+        slot_requests=[
+            {
+                "slot_index": slot["slot_index"],
+                "question_type": slot["question_type"],
+                "content": slot["planner_content"],
+            }
+            for slot in generation_slots
+        ],
+        difficulty=difficulty,
+        bloom_level=bloom_level,
+        custom_prompt=custom_prompt,
+        model_config=model_config,
+        prompt_seed=prompt_seed,
+    )
+    timings["planner_seconds"] = round(max(0.0, time.time() - planner_start), 4)
+    planner_usage = planner_result.get("usage", {}) if isinstance(planner_result, dict) else {}
+    for key in overall_usage:
+        overall_usage[key] += planner_usage.get(key, 0)
+
+    planned_items = planner_result.get("question_plan", []) if isinstance(planner_result, dict) else []
+    planner_errors: list[str] = []
+    if planner_result.get("fallback_used") and planner_result.get("error"):
+        planner_errors.append(f"planner: {planner_result['error']}")
+
+    slots_by_index: dict[int, dict] = {}
+    for slot_index, slot in enumerate(generation_slots):
+        question_plan = [planned_items[slot_index]] if slot_index < len(planned_items) else None
+        slots_by_index[slot["slot_index"]] = {**slot, "question_plan": question_plan}
+
     last_result: dict | None = None
     last_reasons: list[str] = []
+    successful_questions: dict[int, dict] = {}
+    accumulated_errors: list[str] = list(planner_errors)
+    overall_fallback_count = 0
 
     for attempt in range(1, MATERIAL_GENERATION_MAX_ATTEMPTS + 1):
+        timings["attempt_count"] = attempt
         attempt_prompt = custom_prompt
         if last_reasons:
             attempt_prompt = _build_material_retry_prompt(custom_prompt, last_reasons, attempt)
 
-        all_preview: list[dict] = []
-        total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        type_counts: dict[str, int] = {
-            question_type: 0
-            for question_type, total_count in type_distribution.items()
-            if total_count > 0
-        }
-        errors: list[str] = []
+        attempt_errors: list[str] = []
         fallback_count = 0
-        start_time = time.time()
-        generation_slots = _build_material_generation_slots(
-            units,
-            type_distribution,
-            unit_type_plan,
-        )
-        planner_result = generate_question_plan_batch_via_llm(
-            slot_requests=[
-                {
-                    "slot_index": slot["slot_index"],
-                    "question_type": slot["question_type"],
-                    "content": slot["planner_content"],
-                }
-                for slot in generation_slots
-            ],
-            difficulty=difficulty,
-            bloom_level=bloom_level,
-            custom_prompt=attempt_prompt,
-            model_config=model_config,
-            prompt_seed=prompt_seed,
-        )
-        planner_usage = planner_result.get("usage", {}) if isinstance(planner_result, dict) else {}
-        for key in total_usage:
-            total_usage[key] += planner_usage.get(key, 0)
-
-        planned_items = planner_result.get("question_plan", []) if isinstance(planner_result, dict) else []
-        if planner_result.get("fallback_used") and planner_result.get("error"):
-            errors.append(f"planner: {planner_result['error']}")
+        pending_slots = [
+            slots_by_index[slot["slot_index"]]
+            for slot in generation_slots
+            if slot["slot_index"] not in successful_questions
+        ]
+        if not pending_slots:
+            break
         slots_by_type: dict[str, list[dict]] = {}
-        for slot_index, slot in enumerate(generation_slots):
-            question_plan = [planned_items[slot_index]] if slot_index < len(planned_items) else None
-            slot_with_plan = {**slot, "question_plan": question_plan}
-            slots_by_type.setdefault(slot["question_type"], []).append(slot_with_plan)
+        for slot in pending_slots:
+            slots_by_type.setdefault(slot["question_type"], []).append(slot)
 
         generation_batches: list[tuple[str, list[dict]]] = [
             (qtype, slots)
             for qtype, slots in slots_by_type.items()
         ]
+        generation_start = time.time()
         generation_results = await _run_generation_jobs(
             [
                 {
@@ -1887,6 +1909,10 @@ async def preview_question_bank_from_material(
                 for qtype, slots in generation_batches
             ]
         )
+        timings["generation_seconds"] = round(
+            timings["generation_seconds"] + max(0.0, time.time() - generation_start),
+            4,
+        )
 
         for (qtype, slots), llm_result in zip(generation_batches, generation_results):
             raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
@@ -1894,13 +1920,13 @@ async def preview_question_bank_from_material(
             if isinstance(llm_result, dict) and llm_result.get("fallback_used"):
                 fallback_count += 1
                 if llm_result.get("error"):
-                    errors.append(str(llm_result["error"]))
+                    attempt_errors.append(str(llm_result["error"]))
             if len(raw_questions) != len(slots):
-                errors.append(
+                attempt_errors.append(
                     f"{qtype}: 计划生成 {len(slots)} 道，实际返回 {len(raw_questions)} 道"
                 )
-            for key in total_usage:
-                total_usage[key] += usage.get(key, 0)
+            for key in overall_usage:
+                overall_usage[key] += usage.get(key, 0)
 
             for raw, slot in zip(raw_questions, slots):
                 ku = slot["knowledge_unit"]
@@ -1914,7 +1940,7 @@ async def preview_question_bank_from_material(
                 if not dim:
                     dim = classify_dimension(raw.get("stem", ""), tags)
 
-                all_preview.append({
+                successful_questions[slot["slot_index"]] = {
                     "question_type": raw.get("question_type", qtype),
                     "stem": raw.get("stem", ""),
                     "options": raw.get("options"),
@@ -1928,13 +1954,30 @@ async def preview_question_bank_from_material(
                     "source_knowledge_unit_id": str(ku.id),
                     "source_material_title": material.title,
                     "source_knowledge_unit_title": ku.title,
-                })
-                type_counts[qtype] = type_counts.get(qtype, 0) + 1
+                }
+
+        overall_fallback_count += fallback_count
+        accumulated_errors.extend(attempt_errors)
+        all_preview = [
+            successful_questions[slot["slot_index"]]
+            for slot in generation_slots
+            if slot["slot_index"] in successful_questions
+        ]
+        type_counts: dict[str, int] = {
+            question_type: 0
+            for question_type, total_count in type_distribution.items()
+            if total_count > 0
+        }
+        for preview_item in all_preview:
+            qtype = preview_item.get("question_type")
+            if qtype in type_counts:
+                type_counts[qtype] += 1
 
         validation = _validate_generated_question_set(
             all_preview,
             strict_material_rules=True,
         )
+        duplicate_check_start = time.time()
         existing_duplicates = await _collect_existing_duplicate_stems(db, all_preview)
         existing_duplicate_warnings = [
             f"题库中已存在同题干题目：{_truncate_text(stem, limit=36)}"
@@ -1942,21 +1985,30 @@ async def preview_question_bank_from_material(
         ]
         near_duplicate_warnings = _collect_near_duplicate_pairs(all_preview)
         existing_near_duplicate_warnings = await _collect_existing_near_duplicate_pairs(db, all_preview)
+        timings["duplicate_check_seconds"] = round(
+            timings["duplicate_check_seconds"] + max(0.0, time.time() - duplicate_check_start),
+            4,
+        )
+        calibration_start = time.time()
         calibration_summary = _review_preview_calibration(all_preview)
+        timings["calibration_seconds"] = round(
+            timings["calibration_seconds"] + max(0.0, time.time() - calibration_start),
+            4,
+        )
         generated_total = len(all_preview)
         quality_gate_failed = (
             bool(validation["reasons"])
             or bool(existing_duplicates)
             or bool(near_duplicate_warnings)
             or bool(existing_near_duplicate_warnings)
-            or fallback_count > 0
+            or overall_fallback_count > 0
             or generated_total < requested_total
         )
         save_blocked = False
         warnings: list[str] = []
         if generated_total < requested_total:
             warnings.append(f"实际仅生成 {generated_total} 道题，少于目标 {requested_total} 道")
-        if fallback_count > 0:
+        if overall_fallback_count > 0:
             warnings.append("本次生成触发了降级模板，请关注结果中的风险提示")
         if validation["reasons"]:
             warnings.extend(validation["reasons"])
@@ -1964,13 +2016,13 @@ async def preview_question_bank_from_material(
         warnings.extend(near_duplicate_warnings)
         warnings.extend(existing_near_duplicate_warnings)
         warnings.extend(calibration_summary["warnings"])
-        duration = round(time.time() - start_time, 2)
+        duration = round(time.time() - overall_start_time, 2)
         stats = {
-            **total_usage,
+            **overall_usage,
             "duration_seconds": duration,
             "type_counts": type_counts,
-            "fallback_count": fallback_count,
-            "errors": errors,
+            "fallback_count": overall_fallback_count,
+            "errors": list(dict.fromkeys(accumulated_errors)),
             "generation_attempts": attempt,
             "validation_reasons": validation["reasons"],
             "requested_total": requested_total,
@@ -1999,10 +2051,11 @@ async def preview_question_bank_from_material(
             "cooled_unit_count": selection_stats["cooled_unit_count"],
             "ai_review_pending": False,
             "ai_review_completed": False,
+            "timings": timings,
             "warnings": list(dict.fromkeys(warnings)),
         }
         last_result = {"questions": all_preview, "stats": stats}
-        if validation["passed"] and not quality_gate_failed:
+        if generated_total >= requested_total:
             if generated_total > 0 and planned_unit_ids:
                 await _record_material_generation_run(
                     db=db,
@@ -2013,7 +2066,12 @@ async def preview_question_bank_from_material(
                 )
             return last_result
 
-        last_reasons = validation["reasons"]
+        if attempt_errors:
+            last_reasons = attempt_errors
+        elif validation["reasons"]:
+            last_reasons = validation["reasons"]
+        else:
+            last_reasons = warnings or ["生成数量不足，请补齐缺失题目"]
         logger.warning(
             "Material %s question generation failed validation on attempt %s: %s",
             material_id,

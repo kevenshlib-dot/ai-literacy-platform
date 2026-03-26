@@ -1909,13 +1909,14 @@ async def test_preview_question_bank_includes_source_titles(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_preview_question_bank_uses_batch_planner_once_per_attempt(monkeypatch):
+async def test_preview_question_bank_reuses_batch_planner_and_only_retries_failed_slots(monkeypatch):
     engine = create_async_engine(settings.DATABASE_URL, echo=False)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     material_id = uuid.uuid4()
     planner_calls = {"count": 0}
     injected_plans: list[list[dict] | None] = []
     generator_calls: list[dict] = []
+    attempt_state = {"single_choice": 0, "true_false": 0}
 
     def fake_batch_planner(**kwargs):
         planner_calls["count"] += 1
@@ -1945,6 +1946,7 @@ async def test_preview_question_bank_uses_batch_planner_once_per_attempt(monkeyp
         injected_plans.append(question_plan)
         question_type = kwargs["question_types"][0]
         count = kwargs["count"]
+        attempt_state[question_type] += 1
         generator_calls.append({
             "question_type": question_type,
             "count": count,
@@ -1952,7 +1954,11 @@ async def test_preview_question_bank_uses_batch_planner_once_per_attempt(monkeyp
         })
 
         questions = []
-        for index in range(count):
+        effective_count = count
+        if question_type == "single_choice" and attempt_state[question_type] == 1:
+            effective_count = 1
+
+        for index in range(effective_count):
             plan_item = (question_plan or [{}])[index] if question_plan and index < len(question_plan) else {}
             if question_type == "true_false":
                 questions.append(
@@ -1982,7 +1988,7 @@ async def test_preview_question_bank_uses_batch_planner_once_per_attempt(monkeyp
             "questions": questions,
             "usage": {"prompt_tokens": 11, "completion_tokens": 6, "total_tokens": 17},
             "fallback_used": False,
-            "error": None,
+            "error": None if effective_count == count else "Only 1/2 questions passed validation",
         }
 
     monkeypatch.setattr(question_service, "generate_question_plan_batch_via_llm", fake_batch_planner)
@@ -2052,17 +2058,137 @@ async def test_preview_question_bank_uses_batch_planner_once_per_attempt(monkeyp
 
     assert planner_calls["count"] == 1
     assert len(result["questions"]) == 3
-    assert len(injected_plans) == 2
-    assert len(generator_calls) == 2
+    assert len(injected_plans) == 3
+    assert len(generator_calls) == 3
     assert generator_calls[0]["question_type"] == "single_choice"
     assert generator_calls[0]["count"] == 2
     assert len(generator_calls[0]["question_plan"]) == 2
     assert generator_calls[1]["question_type"] == "true_false"
     assert generator_calls[1]["count"] == 1
     assert len(generator_calls[1]["question_plan"]) == 1
+    assert generator_calls[2]["question_type"] == "single_choice"
+    assert generator_calls[2]["count"] == 1
+    assert len(generator_calls[2]["question_plan"]) == 1
     assert injected_plans[0][0]["knowledge_point"] == "规划知识点1"
     assert injected_plans[0][1]["knowledge_point"] == "规划知识点2"
     assert injected_plans[1][0]["knowledge_point"] == "规划知识点3"
+    assert injected_plans[2][0]["knowledge_point"] == "规划知识点2"
+    assert result["stats"]["generation_attempts"] == 2
+    assert result["stats"]["prompt_tokens"] == 5 + 11 * 3
+    assert result["stats"]["total_tokens"] == 8 + 17 * 3
+    assert result["stats"]["timings"]["attempt_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_preview_question_bank_does_not_retry_for_warning_only_risks(monkeypatch):
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    material_id = uuid.uuid4()
+    planner_calls = {"count": 0}
+    generator_calls = {"count": 0}
+
+    def fake_batch_planner(**kwargs):
+        planner_calls["count"] += 1
+        slot_requests = kwargs.get("slot_requests", [])
+        return {
+            "question_plan": [
+                {
+                    "knowledge_point": f"规划知识点{slot['slot_index']}",
+                    "evidence": f"证据{slot['slot_index']}",
+                    "question_type": slot["question_type"],
+                    "stem_style": "直接知识型",
+                    "scenario": "",
+                    "answer_focus": f"答案聚焦{slot['slot_index']}",
+                    "distractor_focus": f"干扰项{slot['slot_index']}",
+                    "knowledge_tags": [f"标签{slot['slot_index']}"],
+                    "dimension": "AI基础知识",
+                }
+                for slot in slot_requests
+            ],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            "fallback_used": False,
+            "error": None,
+        }
+
+    def fake_generate_questions_via_llm(**kwargs):
+        generator_calls["count"] += 1
+        qtype = kwargs["question_types"][0]
+        count = kwargs["count"]
+        questions = []
+        for index in range(count):
+            questions.append(
+                {
+                    "question_type": qtype,
+                    "stem": f"第{index + 1}题测试题干",
+                    "options": {"A": "选项A", "B": "选项B", "C": "选项C", "D": "选项D"} if qtype != "true_false" else {"A": "正确", "B": "错误"},
+                    "correct_answer": "A",
+                    "explanation": "解释",
+                    "knowledge_tags": [f"标签{index + 1}"],
+                    "dimension": "AI基础知识",
+                }
+            )
+        return {
+            "questions": questions,
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+            "fallback_used": True,
+            "error": "warning only",
+        }
+
+    monkeypatch.setattr(question_service, "generate_question_plan_batch_via_llm", fake_batch_planner)
+    monkeypatch.setattr(question_service, "generate_questions_via_llm", fake_generate_questions_via_llm)
+    monkeypatch.setattr(question_service, "_validate_generated_question_set", lambda *args, **kwargs: {
+        "passed": False,
+        "reasons": ["批次级提示"],
+    })
+    monkeypatch.setattr(question_service, "_collect_near_duplicate_pairs", lambda *args, **kwargs: [])
+
+    async def empty_existing_duplicates(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(question_service, "_collect_existing_duplicate_stems", empty_existing_duplicates)
+    monkeypatch.setattr(question_service, "_collect_existing_near_duplicate_pairs", empty_existing_duplicates)
+
+    async with session_factory() as session:
+        uploader = await create_user(
+            session,
+            username=f"warning_only_{uuid.uuid4().hex[:8]}",
+            email=f"{uuid.uuid4().hex[:8]}@test.com",
+            password="password123",
+            role_name="organizer",
+        )
+        session.add(
+            Material(
+                id=material_id,
+                title="warning only 素材",
+                format=MaterialFormat.MARKDOWN,
+                file_path="materials/test.md",
+                file_size=128,
+                status=MaterialStatus.PARSED,
+                uploaded_by=uploader.id,
+            )
+        )
+        session.add_all([
+            KnowledgeUnit(material_id=material_id, title="片段1", content="片段1", chunk_index=0),
+            KnowledgeUnit(material_id=material_id, title="片段2", content="片段2", chunk_index=1),
+        ])
+        await session.commit()
+
+        result = await question_service.preview_question_bank_from_material(
+            db=session,
+            material_id=material_id,
+            type_distribution={"single_choice": 2},
+            difficulty=3,
+            max_units=2,
+        )
+
+    await engine.dispose()
+
+    assert planner_calls["count"] == 1
+    assert generator_calls["count"] == 1
+    assert result["stats"]["generation_attempts"] == 1
+    assert result["stats"]["generated_total"] == 2
+    assert result["stats"]["quality_gate_failed"] is True
+    assert "批次级提示" in result["stats"]["validation_reasons"]
 
 
 @pytest.mark.asyncio

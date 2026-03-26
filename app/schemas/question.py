@@ -130,6 +130,7 @@ class GenerateStats(BaseModel):
     cooled_unit_count: int = 0
     ai_review_pending: bool = False
     ai_review_completed: bool = False
+    timings: dict = Field(default_factory=dict)
     warnings: List[str] = Field(default_factory=list)
 
 
