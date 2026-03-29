@@ -1,4 +1,5 @@
 from app.models.user import User, Role
+from app.models.auth_session import AuthSession
 from app.models.material import Material, KnowledgeUnit
 from app.models.material_generation import MaterialGenerationRun, MaterialGenerationRunUnit
 from app.models.question import Question, ReviewRecord
@@ -18,6 +19,7 @@ from app.models.question_prompt_profile import QuestionPromptProfile
 __all__ = [
     "User",
     "Role",
+    "AuthSession",
     "Material",
     "KnowledgeUnit",
     "MaterialGenerationRun",

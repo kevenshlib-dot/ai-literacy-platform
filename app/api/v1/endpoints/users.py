@@ -14,6 +14,7 @@ from app.core.security import verify_password, get_password_hash
 from app.api.deps import get_current_user, require_role
 from app.models.user import User, Role
 from app.schemas.user import UserCreate, UserResponse, PasswordReset
+from app.services.auth_service import invalidate_user_tokens, revoke_user_auth_sessions
 from app.services.user_service import (
     create_user, update_password, get_user_by_username, get_user_by_email, get_user_by_id,
     soft_delete_user, restore_user, list_deleted_users,
@@ -84,6 +85,8 @@ async def reset_password(
             detail="原密码错误",
         )
     await update_password(db, current_user, body.new_password)
+    invalidate_user_tokens(current_user)
+    await revoke_user_auth_sessions(db, current_user.id)
     return {"code": 200, "message": "密码修改成功"}
 
 
@@ -328,6 +331,9 @@ async def update_user(
     if body.is_active is not None:
         if body.is_active is False and user.id == current_user.id:
             raise HTTPException(status_code=400, detail="不能禁用自己的账号")
+        if body.is_active is False:
+            invalidate_user_tokens(user)
+            await revoke_user_auth_sessions(db, user.id)
         user.is_active = body.is_active
     if body.role is not None:
         from app.services.user_service import get_or_create_role
@@ -356,6 +362,8 @@ async def admin_reset_password(
         raise HTTPException(status_code=400, detail="密码长度不能少于6个字符")
 
     await update_password(db, user, body.new_password)
+    invalidate_user_tokens(user)
+    await revoke_user_auth_sessions(db, user.id)
     await db.commit()
     return {"message": "密码重置成功"}
 
@@ -377,6 +385,8 @@ async def delete_user(
     if target.role and target.role.name.value == "admin":
         raise HTTPException(status_code=400, detail="不能删除管理员账号")
 
+    invalidate_user_tokens(target)
+    await revoke_user_auth_sessions(db, target.id)
     result = await soft_delete_user(db, _uuid.UUID(user_id))
     if not result:
         raise HTTPException(status_code=400, detail="删除失败，用户可能已被删除")

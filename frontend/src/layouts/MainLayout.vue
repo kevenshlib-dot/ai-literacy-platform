@@ -73,6 +73,7 @@
 import { ref, computed, watch, type Component } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useUserStore } from '@/stores/user'
+import request from '@/utils/request'
 import {
   HomeOutlined,
   DashboardOutlined,
@@ -130,9 +131,15 @@ function onMenuClick({ key }: { key: string }) {
   router.push({ name: key })
 }
 
-function handleLogout() {
-  userStore.logout()
-  router.push({ name: 'Login' })
+async function handleLogout() {
+  try {
+    await request.post('/auth/logout')
+  } catch (_error) {
+    // Fall back to local logout even if the backend session is already invalid.
+  } finally {
+    userStore.logout()
+    router.push({ name: 'Login' })
+  }
 }
 </script>
 

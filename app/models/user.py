@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import String, Boolean, Enum, DateTime, ForeignKey, Index
+from sqlalchemy import String, Boolean, Enum, DateTime, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -66,5 +66,11 @@ class User(Base):
         DateTime(timezone=True), nullable=True
     )
     show_on_leaderboard: Mapped[bool] = mapped_column(Boolean, default=True)
+    token_invalid_before: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     role: Mapped["Role"] = relationship(back_populates="users")
+    auth_sessions: Mapped[list["AuthSession"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )

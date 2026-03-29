@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     SECRET_KEY: str = "change-this"
     API_V1_PREFIX: str = "/api/v1"
+    APP_TIMEZONE: str = "Asia/Shanghai"
 
     # PostgreSQL
     TESTING: bool = False
@@ -136,6 +137,14 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str = "change-this"
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    AUTH_REFRESH_COOKIE_NAME: str = "refresh_token"
+    AUTH_REFRESH_COOKIE_SECURE: bool = False
+    AUTH_REFRESH_COOKIE_SAMESITE: str = "lax"
+    CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
+
+    @property
+    def CORS_ORIGIN_LIST(self) -> list[str]:
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 

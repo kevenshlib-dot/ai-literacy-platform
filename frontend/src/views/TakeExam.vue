@@ -165,24 +165,48 @@
             <!-- Choice Questions -->
             <div v-if="currentQuestion.question_type === 'single_choice'" class="question-options">
               <a-radio-group v-model:value="answers[currentQuestion.question_id]" @change="saveAnswer">
-                <a-radio v-for="(val, key) in currentQuestion.options" :key="key" :value="key" class="option-item">
-                  {{ key }}. {{ val }}
-                </a-radio>
+                <div v-for="(val, key) in currentQuestion.options" :key="key" class="option-row">
+                  <a-radio :value="key" class="option-item">
+                    <span class="option-content">
+                      <span class="option-label">{{ key }}.</span>
+                      <span class="option-text">{{ val }}</span>
+                    </span>
+                  </a-radio>
+                </div>
               </a-radio-group>
             </div>
 
             <div v-else-if="currentQuestion.question_type === 'multiple_choice'" class="question-options">
               <a-checkbox-group v-model:value="multiAnswers" @change="onMultiChange">
-                <a-checkbox v-for="(val, key) in currentQuestion.options" :key="key" :value="key" class="option-item">
-                  {{ key }}. {{ val }}
-                </a-checkbox>
+                <div v-for="(val, key) in currentQuestion.options" :key="key" class="option-row">
+                  <a-checkbox :value="key" class="option-item">
+                    <span class="option-content">
+                      <span class="option-label">{{ key }}.</span>
+                      <span class="option-text">{{ val }}</span>
+                    </span>
+                  </a-checkbox>
+                </div>
               </a-checkbox-group>
             </div>
 
             <div v-else-if="currentQuestion.question_type === 'true_false'" class="question-options">
               <a-radio-group v-model:value="answers[currentQuestion.question_id]" @change="saveAnswer">
-                <a-radio value="A" class="option-item">A. 正确</a-radio>
-                <a-radio value="B" class="option-item">B. 错误</a-radio>
+                <div class="option-row">
+                  <a-radio value="A" class="option-item">
+                    <span class="option-content">
+                      <span class="option-label">A.</span>
+                      <span class="option-text">正确</span>
+                    </span>
+                  </a-radio>
+                </div>
+                <div class="option-row">
+                  <a-radio value="B" class="option-item">
+                    <span class="option-content">
+                      <span class="option-label">B.</span>
+                      <span class="option-text">错误</span>
+                    </span>
+                  </a-radio>
+                </div>
               </a-radio-group>
             </div>
 
@@ -527,6 +551,29 @@ onUnmounted(() => { if (timerInterval) clearInterval(timerInterval) })
 .question-num { font-size: 16px; font-weight: 600; }
 .question-stem { font-size: 15px; line-height: 1.8; margin-bottom: 20px; white-space: pre-wrap; }
 .question-options { margin-bottom: 24px; }
-.option-item { display: block; margin-bottom: 12px; font-size: 14px; line-height: 1.6; }
+.question-options :deep(.ant-radio-group),
+.question-options :deep(.ant-checkbox-group) { width: 100%; display: flex; flex-direction: column; gap: 12px; }
+.option-row { width: 100%; }
+.question-options :deep(.ant-radio-wrapper),
+.question-options :deep(.ant-checkbox-wrapper) {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  margin-inline-start: 0;
+  white-space: normal;
+}
+.question-options :deep(.ant-radio),
+.question-options :deep(.ant-checkbox) { margin-top: 0.35em; }
+.question-options :deep(.ant-radio + span),
+.question-options :deep(.ant-checkbox + span) {
+  flex: 1;
+  min-width: 0;
+  padding-inline-start: 8px;
+  white-space: normal;
+}
+.option-item { font-size: 14px; line-height: 1.6; }
+.option-content { display: flex; align-items: flex-start; gap: 4px; }
+.option-label { flex: 0 0 auto; }
+.option-text { flex: 1; min-width: 0; white-space: normal; word-break: break-word; }
 .question-actions { display: flex; gap: 12px; margin-top: 24px; }
 </style>
