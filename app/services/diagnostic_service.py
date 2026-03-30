@@ -1,6 +1,7 @@
 """Diagnostic report service - generates five-dimensional literacy analysis."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections import Counter, defaultdict
@@ -22,6 +23,7 @@ from app.services.report_storage import (
 from app.services.score_service import get_wrong_answer_details
 
 logger = logging.getLogger(__name__)
+DIAGNOSTIC_LLM_TIMEOUT_SECONDS = 20.0
 
 FIVE_DIMENSIONS = [
     "AI基础知识",
@@ -38,6 +40,10 @@ DIMENSION_DESCRIPTIONS = {
     "AI批判思维": "批判性评估AI输出、识别偏见和局限的能力",
     "AI创新实践": "利用AI进行创新解决问题的能力",
 }
+
+
+def _not_evaluated_dimension_text() -> str:
+    return "本次测评在该维度没有题目覆盖，暂不评估。"
 
 
 async def generate_diagnostic_report(
@@ -65,7 +71,13 @@ async def generate_diagnostic_report(
 
     llm_sections = None
     try:
-        llm_sections = generate_structured_diagnostic_sections(_llm_fact_pack(fact_pack))
+        llm_sections = await asyncio.wait_for(
+            asyncio.to_thread(
+                generate_structured_diagnostic_sections,
+                _llm_fact_pack(fact_pack),
+            ),
+            timeout=DIAGNOSTIC_LLM_TIMEOUT_SECONDS,
+        )
     except Exception as exc:
         logger.warning("Structured diagnostic generation failed, fallback applied: %s", exc)
 
@@ -127,10 +139,10 @@ async def _build_diagnostic_fact_pack(db: AsyncSession, score: Score) -> dict:
     )
     answers_map = {a.question_id: a for a in result.scalars().all()}
 
-    radar_data = _build_radar_data(score)
     percentile = await _calculate_percentile(db, score, sheet.exam_id)
     wrong_items = await get_wrong_answer_details(db, score.id)
     dimension_metrics = _build_dimension_metrics(score, questions_map, wrong_items)
+    radar_data = _build_radar_data(dimension_metrics)
     type_metrics = _build_type_metrics(score, questions_map)
     comparison = await _generate_comparison_data(db, score, sheet.exam_id, radar_data)
     error_pattern_counts = Counter()
@@ -139,8 +151,11 @@ async def _build_diagnostic_fact_pack(db: AsyncSession, score: Score) -> dict:
 
     target_dimensions = [
         item["dimension"]
-        for item in sorted(radar_data, key=lambda x: x["score"])
-        if item["score"] < 80
+        for item in sorted(
+            dimension_metrics.values(),
+            key=lambda x: x["score"] if x["score"] is not None else 101,
+        )
+        if item["evaluated"] and item["score"] is not None and item["score"] < 80
     ][:3]
     courses_by_dim = await get_courses_for_dimensions(db, target_dimensions, limit_per_dimension=2)
 
@@ -276,13 +291,13 @@ def _build_dimension_metrics(
                 max_score += data.get("max", 0.0)
                 count += data.get("count", 0)
 
-        if max_score > 0:
+        evaluated = count > 0 and max_score > 0
+        if evaluated:
             ratio = earned / max_score
             score_val = round(ratio * 100, 1)
         else:
-            overall_ratio = score.total_score / score.max_score if score.max_score > 0 else 0
-            ratio = overall_ratio
-            score_val = round(overall_ratio * 100, 1)
+            ratio = None
+            score_val = None
 
         dim_wrong_items = wrong_by_dim.get(dim, [])
         all_reasons = Counter()
@@ -296,14 +311,15 @@ def _build_dimension_metrics(
             "score": score_val,
             "earned": round(earned, 1),
             "max": round(max_score, 1),
-            "ratio": round(ratio, 2),
-            "level": _score_to_level(score_val),
+            "ratio": round(ratio, 2) if ratio is not None else None,
+            "level": _score_to_level(score_val) if score_val is not None else "未评估",
             "description": DIMENSION_DESCRIPTIONS.get(dim, ""),
             "question_count": count,
             "wrong_count": len(dim_wrong_items),
             "source_dimensions": matched_sources,
             "common_error_reasons": [reason for reason, _ in all_reasons.most_common(3)],
             "missed_points": list(dict.fromkeys(missed_points))[:4],
+            "evaluated": evaluated,
         }
     return metrics
 
@@ -317,31 +333,19 @@ def _match_framework_dimension(raw_dimension: str | None) -> str | None:
     return None
 
 
-def _build_radar_data(score: Score) -> list[dict]:
-    dim_scores = score.dimension_scores or {}
+def _build_radar_data(dimension_metrics: dict) -> list[dict]:
     radar_items = []
     for dim in FIVE_DIMENSIONS:
-        matched = None
-        for key, data in dim_scores.items():
-            if _match_framework_dimension(key) == dim:
-                matched = data
-                break
-
-        if matched:
-            earned = matched.get("earned", 0)
-            max_val = matched.get("max", 10)
-            ratio = earned / max_val if max_val > 0 else 0
-            score_val = round(ratio * 100, 1)
-        else:
-            overall_ratio = score.total_score / score.max_score if score.max_score > 0 else 0
-            score_val = round(overall_ratio * 100, 1)
+        metric = dimension_metrics[dim]
+        score_val = metric["score"]
 
         radar_items.append({
             "dimension": dim,
             "score": score_val,
             "max": 100,
             "description": DIMENSION_DESCRIPTIONS.get(dim, ""),
-            "level": _score_to_level(score_val),
+            "level": metric["level"],
+            "evaluated": metric["evaluated"],
         })
     return radar_items
 
@@ -393,24 +397,28 @@ async def _generate_comparison_data(
 
     averages = {dim: [] for dim in FIVE_DIMENSIONS}
     for cohort_score in cohort_scores:
-        for item in _build_radar_data(cohort_score):
-            averages[item["dimension"]].append(item["score"])
+        cohort_metrics = _build_dimension_metrics(cohort_score, {}, [])
+        for item in _build_radar_data(cohort_metrics):
+            if item["evaluated"] and item["score"] is not None:
+                averages[item["dimension"]].append(item["score"])
 
     comparison = []
     for item in radar_data:
         avg_score = averages.get(item["dimension"], [])
-        avg = round(sum(avg_score) / len(avg_score), 1) if avg_score else item["score"]
+        avg = round(sum(avg_score) / len(avg_score), 1) if avg_score else None
+        diff = round(item["score"] - avg, 1) if item["evaluated"] and item["score"] is not None and avg is not None else None
         comparison.append({
             "dimension": item["dimension"],
             "user_score": item["score"],
             "avg_score": avg,
-            "diff": round(item["score"] - avg, 1),
+            "diff": diff,
+            "evaluated": item["evaluated"],
         })
 
     return {
         "items": comparison,
-        "above_average_count": sum(1 for c in comparison if c["diff"] > 0),
-        "below_average_count": sum(1 for c in comparison if c["diff"] < 0),
+        "above_average_count": sum(1 for c in comparison if c["diff"] is not None and c["diff"] > 0),
+        "below_average_count": sum(1 for c in comparison if c["diff"] is not None and c["diff"] < 0),
     }
 
 
@@ -440,14 +448,26 @@ def _build_fallback_sections(fact_pack: dict) -> dict:
     dimension_analysis = {}
     for dim, metric in dimension_metrics.items():
         detail = _dimension_detail(dim, metric)
-        priority = "high" if metric["score"] < 60 else "medium" if metric["score"] < 80 else "low"
+        if not metric["evaluated"]:
+            priority = ""
+            evidence = []
+        else:
+            priority = "high" if metric["score"] < 60 else "medium" if metric["score"] < 80 else "low"
+            evidence = metric["missed_points"][:2] or metric["common_error_reasons"][:2]
         dimension_analysis[dim] = {
             "summary": detail,
-            "evidence": metric["missed_points"][:2] or metric["common_error_reasons"][:2],
+            "evidence": evidence,
             "priority": priority,
         }
 
-    weakest = [d for d in sorted(dimension_metrics.values(), key=lambda x: x["score"])[:3] if d["score"] < 80]
+    weakest = [
+        d
+        for d in sorted(
+            dimension_metrics.values(),
+            key=lambda x: x["score"] if x["score"] is not None else 101,
+        )
+        if d["evaluated"] and d["score"] is not None and d["score"] < 80
+    ][:3]
     actionable_suggestions = [
         {
             "dimension": metric["dimension"],
@@ -630,22 +650,31 @@ def _validate_llm_sections(sections: dict, fact_pack: dict) -> dict:
 def _build_dimension_analysis_payload(metrics: dict, llm_payload: dict) -> dict:
     analysis = {}
     for dim, metric in metrics.items():
-        llm_detail = llm_payload.get(dim, {})
+        llm_detail = llm_payload.get(dim, {}) if metric["evaluated"] else {}
+        if metric["evaluated"]:
+            fallback_evidence = metric["missed_points"][:2] or metric["common_error_reasons"][:2]
+            fallback_priority = "high" if metric["score"] < 60 else "medium" if metric["score"] < 80 else "low"
+        else:
+            fallback_evidence = []
+            fallback_priority = ""
         analysis[dim] = {
             "score": metric["score"],
             "level": metric["level"],
             "description": metric["description"],
             "detail": _dimension_detail(dim, metric),
             "summary": llm_detail.get("summary") or _dimension_detail(dim, metric),
-            "evidence": llm_detail.get("evidence") or metric["missed_points"][:2] or metric["common_error_reasons"][:2],
-            "priority": llm_detail.get("priority") or ("high" if metric["score"] < 60 else "medium" if metric["score"] < 80 else "low"),
+            "evidence": llm_detail.get("evidence") or fallback_evidence,
+            "priority": llm_detail.get("priority") or fallback_priority,
             "question_count": metric["question_count"],
             "wrong_count": metric["wrong_count"],
+            "evaluated": metric["evaluated"],
         }
     return analysis
 
 
 def _dimension_detail(dim: str, metric: dict) -> str:
+    if not metric["evaluated"]:
+        return _not_evaluated_dimension_text()
     score = metric["score"]
     if score >= 90:
         return f"{dim}维度表现优秀，相关题目掌握较为稳定。"
@@ -719,7 +748,8 @@ def _personalized_summary_text(fact_pack: dict, strengths: list[str], weaknesses
 
 
 def _identify_strengths(radar_data: list[dict]) -> list[dict]:
-    sorted_dims = sorted(radar_data, key=lambda x: x["score"], reverse=True)
+    evaluated_dims = [item for item in radar_data if item["evaluated"] and item["score"] is not None]
+    sorted_dims = sorted(evaluated_dims, key=lambda x: x["score"], reverse=True)
     strengths = []
     for item in sorted_dims[:2]:
         if item["score"] >= 60:
@@ -732,7 +762,8 @@ def _identify_strengths(radar_data: list[dict]) -> list[dict]:
 
 
 def _identify_weaknesses(radar_data: list[dict]) -> list[dict]:
-    sorted_dims = sorted(radar_data, key=lambda x: x["score"])
+    evaluated_dims = [item for item in radar_data if item["evaluated"] and item["score"] is not None]
+    sorted_dims = sorted(evaluated_dims, key=lambda x: x["score"])
     weaknesses = []
     for item in sorted_dims[:2]:
         if item["score"] < 80:

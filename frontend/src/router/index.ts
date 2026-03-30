@@ -68,6 +68,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '成绩管理', roles: ['admin', 'organizer', 'reviewer', 'examinee'] },
       },
       {
+        path: 'scores/:scoreId/diagnostic',
+        name: 'ScoreDiagnostic',
+        component: () => import('@/views/ScoreDiagnostic.vue'),
+        meta: { title: '诊断分析报告', roles: ['admin', 'organizer', 'reviewer', 'examinee'] },
+      },
+      {
         path: 'users',
         name: 'Users',
         component: () => import('@/views/Users.vue'),

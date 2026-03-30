@@ -311,7 +311,7 @@ async def get_wrong_answer_details(
     if not score:
         raise ValueError("成绩不存在")
 
-    wrong_details = [d for d in score.details if not d.is_correct]
+    wrong_details = [d for d in score.details if d.earned_score < d.max_score]
     if not wrong_details:
         return []
 

@@ -5,7 +5,7 @@
     </div>
 
     <!-- Leaderboard Card -->
-    <a-card class="leaderboard-card" :bordered="false" v-if="!selectedScore && !reviewMode" style="margin-bottom: 20px;">
+    <a-card class="leaderboard-card" :bordered="false" v-if="!reviewMode" style="margin-bottom: 20px;">
       <div class="leaderboard-header">
         <div class="leaderboard-title-row">
           <span class="leaderboard-title">🏆 英雄榜</span>
@@ -88,7 +88,7 @@
     </a-modal>
 
     <!-- Archived Scores (admin only) -->
-    <a-card :bordered="false" v-if="isAdmin && archiveMode && !selectedScore && !reviewMode">
+    <a-card :bordered="false" v-if="isAdmin && archiveMode && !reviewMode">
       <div style="display: flex; gap: 12px; margin-bottom: 16px; align-items: center;">
         <a-button @click="exitArchiveMode">
           <LeftOutlined /> 返回成绩管理
@@ -131,7 +131,7 @@
     </a-card>
 
     <!-- Manager Score List (admin/organizer) -->
-    <a-card :bordered="false" v-if="isManager && !archiveMode && !selectedScore && !reviewMode">
+    <a-card :bordered="false" v-if="isManager && !archiveMode && !reviewMode">
       <div style="display: flex; gap: 12px; margin-bottom: 16px; align-items: center;">
         <a-input
           v-model:value="managerKeyword"
@@ -155,6 +155,7 @@
         :data-source="allScores"
         :loading="allScoresLoading"
         :pagination="managerPagination"
+        :scroll="{ x: 1160 }"
         :row-selection="{ selectedRowKeys: managerSelectedKeys, onChange: onManagerSelectChange }"
         row-key="answer_sheet_id"
         @change="handleManagerTableChange"
@@ -200,8 +201,8 @@
             {{ record.submit_time ? new Date(record.submit_time).toLocaleString('zh-CN') : '-' }}
           </template>
           <template v-if="column.key === 'actions'">
-            <a-space>
-              <a-button type="link" size="small" @click="viewDiagnosticByScoreId(record)">诊断报告</a-button>
+            <a-space wrap size="small" class="score-table-actions">
+              <a-button type="link" size="small" @click="openDiagnosticPage(record)">诊断报告</a-button>
               <a-button type="link" size="small" :disabled="!canDownloadCertForRecord(record)" @click="downloadCertForRecord(record)">下载证书</a-button>
               <a-popconfirm title="确定删除该成绩？删除后将进入存档。" @confirm="deleteScoreBySheet(record)">
                 <a-button type="link" size="small" danger :disabled="record.user_id !== currentUserId">删除</a-button>
@@ -213,12 +214,13 @@
     </a-card>
 
     <!-- Personal Score List (examinee/reviewer) -->
-    <a-card :bordered="false" v-if="!isManager && !selectedScore && !reviewMode">
+    <a-card :bordered="false" v-if="!isManager && !reviewMode">
       <a-table
         :columns="columns"
         :data-source="scores"
         :loading="loading"
         :pagination="pagination"
+        :scroll="{ x: 1220 }"
         row-key="id"
         @change="handleTableChange"
         size="middle"
@@ -246,8 +248,8 @@
             <a-tag v-else color="default">进行中</a-tag>
           </template>
           <template v-if="column.key === 'actions'">
-            <a-space>
-              <a-button type="link" size="small" :disabled="!record.score_id" @click="viewDiagnostic(record)">诊断分析报告</a-button>
+            <a-space wrap size="small" class="score-table-actions">
+              <a-button type="link" size="small" :disabled="!record.score_id" @click="openDiagnosticPage(record)">诊断分析报告</a-button>
               <a-button type="link" size="small" :disabled="!record.score_id" @click="startReview(record)">复盘</a-button>
               <a-button v-if="record.status === 'submitted' && !record.score_id" type="link" size="small" :loading="gradingId === record.id" @click="manualGrade(record)">手动评分</a-button>
               <a-popconfirm title="确定删除该成绩？删除后将进入存档。" @confirm="deleteScore(record)">
@@ -258,252 +260,6 @@
         </template>
       </a-table>
     </a-card>
-
-    <!-- Diagnostic Report -->
-    <template v-if="selectedScore && diagnostic">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px">
-        <a-button @click="selectedScore = null">
-          <LeftOutlined /> 返回列表
-        </a-button>
-        <a-space>
-          <a-button type="primary" :loading="downloading" @click="downloadReport">
-            <DownloadOutlined /> 下载报告
-          </a-button>
-          <a-button :loading="downloadingCert" :disabled="!canDownloadCert" @click="downloadCert" :style="canDownloadCert ? { background: certLevel === '优秀' ? '#B8860B' : '#1F4E79', borderColor: certLevel === '优秀' ? '#B8860B' : '#1F4E79', color: '#fff' } : {}">
-            <SafetyCertificateOutlined /> 下载证书
-          </a-button>
-        </a-space>
-      </div>
-
-      <div ref="reportRef">
-      <h2 style="text-align: center; margin-bottom: 20px; font-size: 22px">
-        {{ diagnosticUserName }} AI素养评测诊断分析报告
-      </h2>
-      <!-- Overview -->
-      <a-row :gutter="16" style="margin-bottom: 16px">
-        <a-col :span="6">
-          <a-card :bordered="false">
-            <a-statistic title="总分" :value="diagnostic.total_score" :suffix="`/ ${diagnostic.max_score}`" />
-          </a-card>
-        </a-col>
-        <a-col :span="6">
-          <a-card :bordered="false">
-            <a-statistic title="得分率" :value="(diagnostic.ratio * 100).toFixed(0)" suffix="%" />
-          </a-card>
-        </a-col>
-        <a-col :span="6">
-          <a-card :bordered="false">
-            <a-statistic title="等级">
-              <template #formatter>
-                <a-tag :color="levelColor(diagnostic.level)" style="font-size: 20px; padding: 4px 16px">
-                  {{ diagnostic.level }}
-                </a-tag>
-              </template>
-            </a-statistic>
-          </a-card>
-        </a-col>
-        <a-col :span="6">
-          <a-card :bordered="false">
-            <a-statistic title="百分位排名" :value="diagnostic.percentile_rank != null ? `前${(100 - diagnostic.percentile_rank).toFixed(0)}%` : '-'" />
-          </a-card>
-        </a-col>
-      </a-row>
-
-      <!-- Radar Chart + Bar Chart -->
-      <a-row :gutter="16" style="margin-bottom: 16px">
-        <a-col :span="12">
-          <a-card title="五维素养雷达图" :bordered="false">
-            <div ref="radarChartRef" style="width: 100%; height: 360px"></div>
-          </a-card>
-        </a-col>
-        <a-col :span="12">
-          <a-card title="维度对比（个人 vs 平均）" :bordered="false">
-            <div ref="barChartRef" style="width: 100%; height: 360px"></div>
-          </a-card>
-        </a-col>
-      </a-row>
-
-      <!-- Wrong Answer Analysis -->
-      <a-card title="错题分析" :bordered="false" style="margin-bottom: 16px">
-        <a-alert
-          v-if="!(diagnostic.wrong_answer_summary?.items || []).length"
-          type="success"
-          message="本次测评没有失分题。"
-          show-icon
-        />
-        <template v-else>
-          <a-alert
-            type="info"
-            :message="diagnostic.wrong_answer_summary?.overview || '已根据失分题汇总主要问题。'"
-            show-icon
-            style="margin-bottom: 12px"
-          />
-          <div
-            v-for="item in (diagnostic.wrong_answer_summary?.items || [])"
-            :key="item.question_id"
-            style="padding: 16px; border: 1px solid #f0f0f0; border-radius: 8px; margin-bottom: 12px;"
-          >
-            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px;">
-              <a-tag color="orange">{{ item.dimension || '未分类' }}</a-tag>
-              <a-tag>{{ typeLabel(item.question_type) }}</a-tag>
-              <a-tag color="red">{{ item.earned_score }}/{{ item.max_score }}分</a-tag>
-            </div>
-            <div style="font-weight: 600; margin-bottom: 8px;">{{ item.stem }}</div>
-            <div style="margin-bottom: 6px;"><strong>你的答案：</strong>{{ item.user_answer || '(未作答)' }}</div>
-            <div style="margin-bottom: 6px;"><strong>参考答案：</strong>{{ item.reference_answer || item.correct_answer || '-' }}</div>
-            <div style="margin-bottom: 6px;" v-if="item.reason_summary"><strong>错误原因：</strong>{{ item.reason_summary }}</div>
-            <div style="margin-bottom: 6px;" v-if="item.improvement_tip"><strong>改进提示：</strong>{{ item.improvement_tip }}</div>
-            <div v-if="item.missed_points?.length" style="margin-bottom: 6px;">
-              <strong>遗漏要点：</strong>{{ item.missed_points.join('；') }}
-            </div>
-            <div style="color: #666;" v-if="item.explanation"><strong>题目解析：</strong>{{ item.explanation }}</div>
-          </div>
-          <a-alert
-            v-if="diagnostic.wrong_answer_summary?.patterns?.length"
-            type="warning"
-            show-icon
-          >
-            <template #message>
-              高频问题：{{ diagnostic.wrong_answer_summary.patterns.join('；') }}
-            </template>
-          </a-alert>
-        </template>
-      </a-card>
-
-      <!-- Dimension Analysis -->
-      <a-card title="维度分析" :bordered="false" style="margin-bottom: 16px">
-        <a-row :gutter="16">
-          <a-col :span="8" v-for="item in dimensionAnalysisList" :key="item.dimension">
-            <a-card size="small" :bordered="true" style="margin-bottom: 12px">
-              <template #title>
-                <a-tag :color="levelColor(item.level)">{{ item.level }}</a-tag>
-                {{ item.dimension }}
-              </template>
-              <div style="margin-bottom: 8px">
-                <a-progress :percent="item.score" :stroke-color="getProgressColor(item.score)" size="small" />
-              </div>
-              <p style="color: #666; font-size: 13px; margin: 0 0 8px 0">{{ item.description }}</p>
-              <p style="font-size: 13px; margin: 0 0 8px 0">{{ item.summary || item.detail }}</p>
-              <p v-if="item.evidence?.length" style="color: #999; font-size: 12px; margin: 0;">
-                依据：{{ item.evidence.join('；') }}
-              </p>
-            </a-card>
-          </a-col>
-        </a-row>
-      </a-card>
-
-      <!-- Personalized Summary -->
-      <a-card title="个性化总结" :bordered="false" style="margin-bottom: 16px">
-        <p style="margin-bottom: 12px; line-height: 1.8;">
-          {{ diagnostic.personalized_summary?.summary || '暂无个性化总结。' }}
-        </p>
-        <a-row :gutter="16">
-          <a-col :span="12">
-            <a-card size="small" title="表现亮点">
-              <a-list :data-source="diagnostic.personalized_summary?.highlights || []" size="small">
-                <template #renderItem="{ item }">
-                  <a-list-item>{{ item }}</a-list-item>
-                </template>
-              </a-list>
-            </a-card>
-          </a-col>
-          <a-col :span="12">
-            <a-card size="small" title="关注点">
-              <a-list :data-source="diagnostic.personalized_summary?.cautions || []" size="small">
-                <template #renderItem="{ item }">
-                  <a-list-item>{{ item }}</a-list-item>
-                </template>
-              </a-list>
-            </a-card>
-          </a-col>
-        </a-row>
-      </a-card>
-
-      <!-- Strengths & Weaknesses -->
-      <a-row :gutter="16" style="margin-bottom: 16px">
-        <a-col :span="12">
-          <a-card title="优势维度" :bordered="false">
-            <a-list :data-source="diagnostic.strengths || []" size="small">
-              <template #renderItem="{ item }">
-                <a-list-item>
-                  <a-tag color="green">{{ item.dimension }}</a-tag>
-                  <span>{{ item.comment }} ({{ item.score }}分)</span>
-                </a-list-item>
-              </template>
-              <template #header v-if="!(diagnostic.strengths || []).length">
-                <span style="color: #999">暂无数据</span>
-              </template>
-            </a-list>
-          </a-card>
-        </a-col>
-        <a-col :span="12">
-          <a-card title="提升方向" :bordered="false">
-            <a-list :data-source="diagnostic.improvement_priorities || []" size="small">
-              <template #renderItem="{ item }">
-                <a-list-item>
-                  <div style="width: 100%;">
-                    <div style="margin-bottom: 4px;">
-                      <a-tag color="orange">{{ item.dimension }}</a-tag>
-                      <strong>{{ item.reason }}</strong>
-                    </div>
-                    <div v-if="item.actions?.length" style="color: #666;">
-                      建议动作：{{ item.actions.join('；') }}
-                    </div>
-                  </div>
-                </a-list-item>
-              </template>
-              <template #header v-if="!(diagnostic.improvement_priorities || []).length">
-                <span style="color: #999">暂无数据</span>
-              </template>
-            </a-list>
-          </a-card>
-        </a-col>
-      </a-row>
-
-      <!-- Recommendations -->
-      <a-card title="个性化学习建议" :bordered="false">
-        <a-list :data-source="diagnostic.actionable_suggestions || []" size="small">
-          <template #renderItem="{ item }">
-            <a-list-item>
-              <div style="width: 100%;">
-                <div style="margin-bottom: 4px;">
-                  <a-tag color="blue">{{ item.dimension }}</a-tag>
-                  <strong>{{ item.title }}</strong>
-                </div>
-                <div>{{ item.suggestion }}</div>
-                <div v-if="item.actions?.length" style="color: #666; margin-top: 4px;">
-                  可执行动作：{{ item.actions.join('；') }}
-                </div>
-              </div>
-            </a-list-item>
-          </template>
-          <template #header v-if="!(diagnostic.actionable_suggestions || []).length">
-            <span style="color: #999">暂无建议</span>
-          </template>
-        </a-list>
-      </a-card>
-
-      <a-card title="推荐资源" :bordered="false" style="margin-top: 16px">
-        <a-list :data-source="diagnostic.recommended_resources || []" size="small">
-          <template #renderItem="{ item }">
-            <a-list-item>
-              <div style="width: 100%;">
-                <div style="margin-bottom: 4px;">
-                  <a-tag color="purple">{{ item.dimension }}</a-tag>
-                  <strong>{{ item.title }}</strong>
-                  <span style="color: #999; margin-left: 8px;">难度 {{ item.difficulty }}</span>
-                </div>
-                <div style="color: #666;">{{ item.match_reason }}</div>
-              </div>
-            </a-list-item>
-          </template>
-          <template #header v-if="!(diagnostic.recommended_resources || []).length">
-            <span style="color: #999">暂无匹配课程资源</span>
-          </template>
-        </a-list>
-      </a-card>
-      </div>
-    </template>
 
     <!-- Review Mode: Wrong Answer Review -->
     <template v-if="reviewMode && !trainingMode && !trainingSubmitted">
@@ -718,28 +474,13 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, nextTick, watch } from 'vue'
-import { LeftOutlined, DownloadOutlined, SafetyCertificateOutlined, ThunderboltOutlined, SearchOutlined, ExportOutlined, DatabaseOutlined } from '@ant-design/icons-vue'
+import { LeftOutlined, ThunderboltOutlined, SearchOutlined, ExportOutlined, DatabaseOutlined } from '@ant-design/icons-vue'
 import { useRouter } from 'vue-router'
 import { message, Empty } from 'ant-design-vue'
-import * as echarts from 'echarts/core'
-import { RadarChart, BarChart } from 'echarts/charts'
-import {
-  TitleComponent,
-  TooltipComponent,
-  LegendComponent,
-  RadarComponent,
-  GridComponent,
-} from 'echarts/components'
-import { CanvasRenderer } from 'echarts/renderers'
 import request from '@/utils/request'
 import { useUserStore } from '@/stores/user'
 import html2canvas from 'html2canvas'
 import { jsPDF } from 'jspdf'
-
-echarts.use([
-  RadarChart, BarChart, TitleComponent, TooltipComponent,
-  LegendComponent, RadarComponent, GridComponent, CanvasRenderer,
-])
 
 const userStore = useUserStore()
 const router = useRouter()
@@ -749,12 +490,7 @@ const simpleImage = Empty.PRESENTED_IMAGE_SIMPLE
 const loading = ref(false)
 const scores = ref<any[]>([])
 const selectedScore = ref<any>(null)
-const diagnostic = ref<any>(null)
-const radarChartRef = ref<HTMLElement | null>(null)
-const barChartRef = ref<HTMLElement | null>(null)
-const reportRef = ref<HTMLElement | null>(null)
 const certRef = ref<HTMLElement | null>(null)
-const downloading = ref(false)
 const downloadingCert = ref(false)
 
 // Leaderboard state
@@ -786,44 +522,16 @@ const trainingCorrectCount = computed(() =>
   trainingResults.value.filter(r => r.is_correct).length
 )
 
-const canDownloadCert = computed(() => {
-  const level = diagnostic.value?.level
-  return ['优秀', '良好', '合格'].includes(level)
-})
-
 // Overrides for downloading cert on behalf of other users (manager view)
 const certNameOverride = ref('')
 const certLevelOverride = ref('')
 
-const certLevel = computed(() => {
-  if (certLevelOverride.value) return certLevelOverride.value
-  const level = diagnostic.value?.level
-  return level === '优秀' ? '优秀' : '合格'
-})
-
-const diagnosticUserName = computed(() => {
-  // If viewing another user's score from manager view
-  if (isManager.value && selectedScore.value?.full_name) {
-    return selectedScore.value.full_name || selectedScore.value.username || '用户'
-  }
-  return userStore.userInfo?.full_name || userStore.userInfo?.username || '用户'
-})
-
-const dimensionAnalysisList = computed(() => {
-  const analysis = diagnostic.value?.dimension_analysis || {}
-  return Object.entries(analysis).map(([dimension, item]: [string, any]) => ({
-    dimension,
-    ...item,
-  }))
-})
+const certLevel = computed(() => certLevelOverride.value || '合格')
 
 const certDate = computed(() => {
   const now = new Date()
   return `${now.getFullYear()}年${now.getMonth() + 1}月`
 })
-
-let radarChart: echarts.ECharts | null = null
-let barChart: echarts.ECharts | null = null
 
 const pagination = reactive({
   current: 1,
@@ -925,7 +633,7 @@ const managerColumns = computed(() => [
     filteredValue: managerFilters.level ? managerFilters.level.split(',') : [],
   },
   { title: '提交时间', key: 'submit_time', width: 180, sorter: true, sortOrder: managerSorter.field === 'submit_time' ? managerSorter.order : null },
-  { title: '操作', key: 'actions', width: 180, fixed: 'right' as const },
+  { title: '操作', key: 'actions', width: 240, fixed: 'right' as const },
 ])
 
 const columns = [
@@ -935,7 +643,7 @@ const columns = [
   { title: '百分位', key: 'percentile_rank', width: 100 },
   { title: '状态', key: 'status', width: 100 },
   { title: '提交时间', key: 'submit_time', dataIndex: 'submit_time', width: 180 },
-  { title: '操作', key: 'actions', width: 320, fixed: 'right' as const },
+  { title: '操作', key: 'actions', width: 380, fixed: 'right' as const },
 ]
 
 const leaderboardColumns = [
@@ -959,13 +667,6 @@ function getScoreColor(score: number, max: number): string {
   if (ratio >= 0.9) return '#52c41a'
   if (ratio >= 0.8) return '#1890ff'
   if (ratio >= 0.6) return '#faad14'
-  return '#f5222d'
-}
-
-function getProgressColor(score: number): string {
-  if (score >= 90) return '#52c41a'
-  if (score >= 80) return '#1890ff'
-  if (score >= 60) return '#faad14'
   return '#f5222d'
 }
 
@@ -1180,18 +881,6 @@ async function restoreScore(record: any) {
   }
 }
 
-async function viewDiagnosticByScoreId(record: any) {
-  selectedScore.value = record
-  try {
-    diagnostic.value = await request.get(`/scores/${record.score_id}/diagnostic`)
-    await nextTick()
-    renderRadarChart()
-    renderBarChart()
-  } catch (e) {
-    message.error('获取诊断分析报告失败')
-  }
-}
-
 function canDownloadCertForRecord(record: any): boolean {
   return ['优秀', '良好', '合格'].includes(record.level)
 }
@@ -1246,20 +935,17 @@ async function downloadCertForRecord(record: any) {
   }
 }
 
-async function viewDiagnostic(record: any) {
+function openDiagnosticPage(record: any) {
   if (!record.score_id) {
     message.warning('该考试尚未评分，无法查看诊断分析报告')
     return
   }
-  selectedScore.value = record
-  try {
-    diagnostic.value = await request.get(`/scores/${record.score_id}/diagnostic`)
-    await nextTick()
-    renderRadarChart()
-    renderBarChart()
-  } catch (e) {
-    message.error('获取诊断分析报告失败')
+  const query: Record<string, string> = {}
+  const displayName = record.full_name || record.username
+  if (displayName) {
+    query.displayName = displayName
   }
+  router.push({ name: 'ScoreDiagnostic', params: { scoreId: record.score_id }, query })
 }
 
 async function manualGrade(record: any) {
@@ -1272,159 +958,6 @@ async function manualGrade(record: any) {
     message.error(e?.message || '评分失败')
   } finally {
     gradingId.value = null
-  }
-}
-
-function renderRadarChart() {
-  if (!radarChartRef.value || !diagnostic.value?.radar_data) return
-
-  if (radarChart) radarChart.dispose()
-  radarChart = echarts.init(radarChartRef.value)
-
-  const radarData = diagnostic.value.radar_data
-  const indicators = radarData.map((item: any) => ({
-    name: item.dimension,
-    max: 100,
-  }))
-  const values = radarData.map((item: any) => item.score)
-
-  radarChart.setOption({
-    tooltip: {},
-    radar: {
-      indicator: indicators,
-      shape: 'polygon',
-      splitNumber: 5,
-      axisName: { color: '#333', fontSize: 12 },
-    },
-    series: [{
-      type: 'radar',
-      data: [{
-        value: values,
-        name: '个人得分',
-        areaStyle: { opacity: 0.3 },
-        lineStyle: { width: 2 },
-      }],
-      symbol: 'circle',
-      symbolSize: 6,
-    }],
-  })
-}
-
-function renderBarChart() {
-  if (!barChartRef.value || !diagnostic.value?.comparison) return
-
-  if (barChart) barChart.dispose()
-  barChart = echarts.init(barChartRef.value)
-
-  const items = diagnostic.value.comparison.items || []
-  const dims = items.map((i: any) => i.dimension)
-  const userScores = items.map((i: any) => i.user_score)
-  const avgScores = items.map((i: any) => i.avg_score)
-
-  barChart.setOption({
-    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-    legend: { data: ['个人', '平均'] },
-    grid: { left: 20, right: 20, bottom: 20, top: 40, containLabel: true },
-    xAxis: {
-      type: 'category',
-      data: dims,
-      axisLabel: { interval: 0, fontSize: 11 },
-    },
-    yAxis: { type: 'value', max: 100 },
-    series: [
-      {
-        name: '个人',
-        type: 'bar',
-        data: userScores,
-        itemStyle: { color: '#1F4E79' },
-        barWidth: '30%',
-      },
-      {
-        name: '平均',
-        type: 'bar',
-        data: avgScores,
-        itemStyle: { color: '#bbb' },
-        barWidth: '30%',
-      },
-    ],
-  })
-}
-
-async function downloadReport() {
-  if (!reportRef.value) return
-  downloading.value = true
-  try {
-    const canvas = await html2canvas(reportRef.value, {
-      scale: 2,
-      useCORS: true,
-      backgroundColor: '#f0f2f5',
-    })
-    const imgData = canvas.toDataURL('image/png')
-    const imgWidth = 190 // A4 width minus margins (210 - 10*2)
-    const imgHeight = (canvas.height * imgWidth) / canvas.width
-    const pageHeight = 277 // A4 height minus margins (297 - 10*2)
-
-    const pdf = new jsPDF('p', 'mm', 'a4')
-    let heightLeft = imgHeight
-    let position = 10 // top margin
-
-    pdf.addImage(imgData, 'PNG', 10, position, imgWidth, imgHeight)
-    heightLeft -= pageHeight
-
-    while (heightLeft > 0) {
-      position = position - pageHeight
-      pdf.addPage()
-      pdf.addImage(imgData, 'PNG', 10, position, imgWidth, imgHeight)
-      heightLeft -= pageHeight
-    }
-
-    const displayName = userStore.userInfo?.full_name || userStore.userInfo?.username || '用户'
-    pdf.save(`${displayName}AI素养分析报告.pdf`)
-    message.success('报告下载成功')
-  } catch (e) {
-    message.error('报告下载失败，请重试')
-  } finally {
-    downloading.value = false
-  }
-}
-
-async function downloadCert() {
-  if (!certRef.value || !canDownloadCert.value) return
-  downloadingCert.value = true
-  try {
-    // Temporarily show the certificate for rendering
-    certRef.value.style.left = '0'
-    certRef.value.style.top = '0'
-    certRef.value.style.opacity = '1'
-    await nextTick()
-
-    const canvas = await html2canvas(certRef.value, {
-      scale: 2,
-      useCORS: true,
-      backgroundColor: null,
-      width: 800,
-      height: 566,
-    })
-
-    // Hide again
-    certRef.value.style.left = '-9999px'
-    certRef.value.style.opacity = '0'
-
-    const imgData = canvas.toDataURL('image/png')
-    const pdf = new jsPDF('l', 'mm', 'a4') // landscape
-    pdf.addImage(imgData, 'PNG', 0, 0, 297, 210)
-
-    const displayName = userStore.userInfo?.full_name || userStore.userInfo?.username || '用户'
-    pdf.save(`${displayName}AI素养评测证书.pdf`)
-    message.success('证书下载成功')
-  } catch (e) {
-    message.error('证书下载失败，请重试')
-  } finally {
-    if (certRef.value) {
-      certRef.value.style.left = '-9999px'
-      certRef.value.style.opacity = '0'
-    }
-    downloadingCert.value = false
   }
 }
 
@@ -1566,13 +1099,6 @@ onMounted(() => {
   loadLeaderboardStatus()
 })
 
-// Clean up charts on unmount
-watch(selectedScore, (val) => {
-  if (!val) {
-    if (radarChart) { radarChart.dispose(); radarChart = null }
-    if (barChart) { barChart.dispose(); barChart = null }
-  }
-})
 </script>
 
 <style scoped>
@@ -1611,6 +1137,13 @@ watch(selectedScore, (val) => {
 .leaderboard-actions {
   display: flex;
   align-items: center;
+}
+.score-table-actions {
+  max-width: 100%;
+}
+:deep(.score-table-actions.ant-space) {
+  flex-wrap: wrap;
+  row-gap: 4px;
 }
 .leaderboard-top3 {
   display: flex;

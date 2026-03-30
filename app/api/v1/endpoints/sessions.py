@@ -1,4 +1,5 @@
 """Exam session API endpoints - for examinees taking exams."""
+import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
@@ -164,6 +165,7 @@ async def mark_question(
 @router.post("/{sheet_id}/submit", response_model=SubmitExamResponse)
 async def submit_exam(
     sheet_id: UUID,
+    auto_score: bool = Query(True),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
@@ -185,18 +187,17 @@ async def submit_exam(
     # Persist the submitted sheet first so scoring failures don't undo the submission.
     await db.commit()
 
-    # Auto-score the submitted exam
-    import logging
     logger = logging.getLogger(__name__)
-    try:
-        from app.services import score_service
-        await score_service.score_answer_sheet(db, answer_sheet_id)
-        await db.commit()
-        response_status = AnswerSheetStatus.SCORED.value
-        logger.info(f"Auto-scored answer sheet {answer_sheet_id}")
-    except Exception as e:
-        await db.rollback()
-        logger.warning(f"Auto-scoring failed for sheet {answer_sheet_id}: {e}")
+    if auto_score:
+        try:
+            from app.services import score_service
+            await score_service.score_answer_sheet(db, answer_sheet_id)
+            await db.commit()
+            response_status = AnswerSheetStatus.SCORED.value
+            logger.info(f"Auto-scored answer sheet {answer_sheet_id}")
+        except Exception as e:
+            await db.rollback()
+            logger.warning(f"Auto-scoring failed for sheet {answer_sheet_id}: {e}")
 
     return SubmitExamResponse(
         answer_sheet_id=answer_sheet_id,

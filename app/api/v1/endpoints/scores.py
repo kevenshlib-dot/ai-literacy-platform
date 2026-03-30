@@ -1,4 +1,6 @@
 """Scoring and report API endpoints."""
+import asyncio
+import logging
 from io import BytesIO
 from uuid import UUID
 from datetime import datetime, timezone
@@ -11,7 +13,7 @@ from sqlalchemy import select, func, case, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.database import get_db
+from app.core.database import async_session, get_db
 from app.api.deps import get_current_active_user, require_role
 from app.models.user import User, Role
 from app.models.score import Score
@@ -21,9 +23,145 @@ from app.services import score_service
 from app.services import diagnostic_service
 from app.services import evaluation_service
 from app.agents.scoring_agent import multi_model_score
+from app.services.report_storage import DIAGNOSTIC_REPORT_KEY, get_report_namespace
 from app.services.score_service import serialize_score_detail
 
 router = APIRouter(prefix="/scores", tags=["评分管理"])
+logger = logging.getLogger(__name__)
+
+_processing_states: dict[str, dict] = {}
+_processing_tasks: dict[str, asyncio.Task] = {}
+
+
+def _processing_key(answer_sheet_id: UUID | str) -> str:
+    return str(answer_sheet_id)
+
+
+def _processing_payload(
+    answer_sheet_id: UUID | str,
+    *,
+    stage: str,
+    score_id: str | None = None,
+    diagnostic_ready: bool = False,
+    message: str = "",
+) -> dict:
+    return {
+        "answer_sheet_id": str(answer_sheet_id),
+        "stage": stage,
+        "score_id": score_id,
+        "diagnostic_ready": diagnostic_ready,
+        "message": message,
+    }
+
+
+def _set_processing_state(
+    answer_sheet_id: UUID | str,
+    *,
+    stage: str,
+    score_id: str | None = None,
+    diagnostic_ready: bool = False,
+    message: str = "",
+) -> dict:
+    payload = _processing_payload(
+        answer_sheet_id,
+        stage=stage,
+        score_id=score_id,
+        diagnostic_ready=diagnostic_ready,
+        message=message,
+    )
+    _processing_states[_processing_key(answer_sheet_id)] = payload
+    return payload
+
+
+def _get_processing_state(answer_sheet_id: UUID | str) -> dict | None:
+    return _processing_states.get(_processing_key(answer_sheet_id))
+
+
+async def _derive_processing_state_from_db(db: AsyncSession, answer_sheet_id: UUID) -> dict:
+    sheet = (
+        await db.execute(select(AnswerSheet).where(AnswerSheet.id == answer_sheet_id))
+    ).scalar_one_or_none()
+    if not sheet:
+        raise HTTPException(status_code=404, detail="答题卡不存在")
+
+    score = await score_service.get_score_by_sheet(db, answer_sheet_id)
+    if not score:
+        stage = (
+            "submitted"
+            if sheet.status == AnswerSheetStatus.SUBMITTED
+            else "completed" if sheet.status == AnswerSheetStatus.SCORED else "submitted"
+        )
+        message = "答卷已提交，等待开始处理。" if stage == "submitted" else "评分已完成。"
+        return _processing_payload(answer_sheet_id, stage=stage, message=message)
+
+    diagnostic_ready = bool(get_report_namespace(score, DIAGNOSTIC_REPORT_KEY))
+    if diagnostic_ready:
+        return _processing_payload(
+            answer_sheet_id,
+            stage="completed",
+            score_id=str(score.id),
+            diagnostic_ready=True,
+            message="诊断报告已生成。",
+        )
+
+    return _processing_payload(
+        answer_sheet_id,
+        stage="generating_diagnostic",
+        score_id=str(score.id),
+        diagnostic_ready=False,
+        message="成绩已生成，正在生成诊断报告。",
+    )
+
+
+async def _run_answer_sheet_processing(answer_sheet_id: UUID) -> None:
+    key = _processing_key(answer_sheet_id)
+    try:
+        async with async_session() as db:
+            score = await score_service.get_score_by_sheet(db, answer_sheet_id, load_details=True)
+            if score and get_report_namespace(score, DIAGNOSTIC_REPORT_KEY):
+                _set_processing_state(
+                    answer_sheet_id,
+                    stage="completed",
+                    score_id=str(score.id),
+                    diagnostic_ready=True,
+                    message="诊断报告已生成。",
+                )
+                await db.commit()
+                return
+
+            if not score:
+                _set_processing_state(
+                    answer_sheet_id,
+                    stage="scoring",
+                    message="正在评分，请稍候。",
+                )
+                score = await score_service.score_answer_sheet(db, answer_sheet_id)
+
+            _set_processing_state(
+                answer_sheet_id,
+                stage="generating_diagnostic",
+                score_id=str(score.id),
+                message="正在生成诊断报告。",
+            )
+            await score_service.generate_report(db, score.id, force_refresh=True)
+            await diagnostic_service.generate_diagnostic_report(db, score.id, force_refresh=True)
+            await db.commit()
+            _set_processing_state(
+                answer_sheet_id,
+                stage="completed",
+                score_id=str(score.id),
+                diagnostic_ready=True,
+                message="诊断报告已生成。",
+            )
+    except Exception as exc:
+        logger.exception("Answer sheet processing failed for %s", answer_sheet_id)
+        _set_processing_state(
+            answer_sheet_id,
+            stage="failed",
+            message=f"处理失败：{exc}",
+        )
+    finally:
+        _processing_tasks.pop(key, None)
 
 
 class PanelScoreRequest(BaseModel):
@@ -42,6 +180,61 @@ class TrainingGenerateRequest(BaseModel):
     wrong_questions: list[dict] = Field(description="Wrong question data with stem, dimension, etc.")
     count: int = Field(default=5, ge=1, le=10)
     difficulty: int = Field(default=3, ge=1, le=5)
+
+
+def _ensure_sheet_access(sheet: AnswerSheet | None, current_user: User) -> None:
+    if not sheet:
+        raise HTTPException(status_code=404, detail="答题卡不存在")
+    if sheet.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="只能处理自己的答题卡")
+
+
+@router.post("/process/{answer_sheet_id}")
+async def start_score_processing(
+    answer_sheet_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    sheet = (
+        await db.execute(select(AnswerSheet).where(AnswerSheet.id == answer_sheet_id))
+    ).scalar_one_or_none()
+    _ensure_sheet_access(sheet, current_user)
+
+    derived = await _derive_processing_state_from_db(db, answer_sheet_id)
+    if derived["stage"] == "completed":
+        return derived
+
+    existing = _processing_tasks.get(_processing_key(answer_sheet_id))
+    if existing and not existing.done():
+        return _get_processing_state(answer_sheet_id) or derived
+
+    state = _set_processing_state(
+        answer_sheet_id,
+        stage="submitted",
+        score_id=derived.get("score_id"),
+        message="答卷已提交，处理中。",
+    )
+    _processing_tasks[_processing_key(answer_sheet_id)] = asyncio.create_task(
+        _run_answer_sheet_processing(answer_sheet_id)
+    )
+    return state
+
+
+@router.get("/process/{answer_sheet_id}")
+async def get_score_processing_status(
+    answer_sheet_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    sheet = (
+        await db.execute(select(AnswerSheet).where(AnswerSheet.id == answer_sheet_id))
+    ).scalar_one_or_none()
+    _ensure_sheet_access(sheet, current_user)
+
+    state = _get_processing_state(answer_sheet_id)
+    if state:
+        return state
+    return await _derive_processing_state_from_db(db, answer_sheet_id)
 
 
 @router.get("/leaderboard")

@@ -1,4 +1,5 @@
 """Tests for scoring engine and report generation (T015-T017)."""
+import asyncio
 import pytest
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy import select
@@ -207,6 +208,66 @@ async def setup_exam_and_submit(client, org_token, ex_token, answers_map):
     return sid
 
 
+async def setup_exam_submit_only(client, org_token, ex_token, answers_map):
+    rev_token = await register_user(client, "reviewer")
+    org_headers = {"Authorization": f"Bearer {org_token}"}
+    ex_headers = {"Authorization": f"Bearer {ex_token}"}
+
+    qids = []
+    for i, (correct, _) in enumerate(answers_map):
+        resp = await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": f"流程题目{i+1}？",
+            "correct_answer": correct,
+            "options": {"A": "选项A", "B": "选项B", "C": "选项C", "D": "选项D"},
+            "difficulty": 3,
+            "dimension": f"维度{i % 2 + 1}",
+        }, headers=org_headers)
+        qid = resp.json()["id"]
+        await client.post(f"/api/v1/questions/{qid}/submit", headers=org_headers)
+        await client.post(
+            f"/api/v1/questions/{qid}/review",
+            json={"action": "approve"},
+            headers={"Authorization": f"Bearer {rev_token}"},
+        )
+        qids.append(qid)
+
+    exam_resp = await client.post("/api/v1/exams", json={"title": "提交后处理考试"}, headers=org_headers)
+    eid = exam_resp.json()["id"]
+
+    await client.post(
+        f"/api/v1/exams/{eid}/assemble/manual",
+        json={
+            "questions": [
+                {"question_id": qids[i], "order_num": i + 1, "score": 10}
+                for i in range(len(qids))
+            ]
+        },
+        headers=org_headers,
+    )
+    await client.post(f"/api/v1/exams/{eid}/publish", headers=org_headers)
+
+    start = await client.post(f"/api/v1/sessions/start/{eid}", headers=ex_headers)
+    sid = start.json()["answer_sheet_id"]
+
+    for i, (_, student_answer) in enumerate(answers_map):
+        if student_answer is not None:
+            await client.post(
+                f"/api/v1/sessions/{sid}/answer",
+                json={"question_id": qids[i], "answer_content": student_answer},
+                headers=ex_headers,
+            )
+
+    submit_resp = await client.post(
+        f"/api/v1/sessions/{sid}/submit",
+        params={"auto_score": "false"},
+        headers=ex_headers,
+    )
+    assert submit_resp.status_code == 200
+    assert submit_resp.json()["status"] == "submitted"
+    return sid
+
+
 async def get_score_by_sheet_payload(client, sheet_id, token):
     resp = await client.get(
         f"/api/v1/scores/sheet/{sheet_id}",
@@ -352,6 +413,43 @@ async def test_generate_report_and_diagnostic_do_not_override_each_other():
     assert diagnostic_resp.status_code == 200
     assert "total_questions" in score_report_resp.json()
     assert "radar_data" in diagnostic_resp.json()
+
+
+@pytest.mark.asyncio
+async def test_score_processing_endpoints_complete_and_reuse_cached_diagnostic():
+    async with get_client() as client:
+        org_token = await register_user(client, "organizer")
+        ex_token = await register_user(client, "examinee")
+        headers = {"Authorization": f"Bearer {ex_token}"}
+
+        sid = await setup_exam_submit_only(client, org_token, ex_token, [
+            ("A", "A"),
+            ("B", "C"),
+        ])
+
+        start_resp = await client.post(f"/api/v1/scores/process/{sid}", headers=headers)
+        assert start_resp.status_code == 200
+        assert start_resp.json()["stage"] == "submitted"
+
+        status_payload = None
+        for _ in range(30):
+            status_resp = await client.get(f"/api/v1/scores/process/{sid}", headers=headers)
+            assert status_resp.status_code == 200
+            status_payload = status_resp.json()
+            if status_payload["stage"] == "completed":
+                break
+            await asyncio.sleep(0.05)
+
+        assert status_payload is not None
+        assert status_payload["stage"] == "completed"
+        assert status_payload["score_id"]
+        assert status_payload["diagnostic_ready"] is True
+
+        repeat_resp = await client.post(f"/api/v1/scores/process/{sid}", headers=headers)
+        assert repeat_resp.status_code == 200
+        repeat_payload = repeat_resp.json()
+        assert repeat_payload["stage"] == "completed"
+        assert repeat_payload["score_id"] == status_payload["score_id"]
 
 
 @pytest.mark.asyncio

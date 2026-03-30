@@ -83,7 +83,27 @@
                   <span>{{ group.title }}</span>
                   <a-tag>{{ group.count }} 题</a-tag>
                 </div>
-                <div class="group-score">{{ group.subtotalScore }} 分</div>
+                <div class="group-header-actions">
+                  <a-space size="small">
+                    <a-button
+                      size="small"
+                      @click="moveGroupUp(group.questionType)"
+                      :disabled="!canMoveGroupUp(group.questionType)"
+                    >
+                      <template #icon><ArrowUpOutlined /></template>
+                      上移
+                    </a-button>
+                    <a-button
+                      size="small"
+                      @click="moveGroupDown(group.questionType)"
+                      :disabled="!canMoveGroupDown(group.questionType)"
+                    >
+                      <template #icon><ArrowDownOutlined /></template>
+                      下移
+                    </a-button>
+                  </a-space>
+                  <div class="group-score">{{ group.subtotalScore }} 分</div>
+                </div>
               </div>
 
               <div class="group-items">
@@ -226,6 +246,28 @@
 
           <div class="candidate-cards">
             <a-spin :spinning="candidateLoading">
+              <div v-if="candidates.length" class="candidate-batch-bar">
+                <div class="candidate-batch-info">
+                  已选 {{ selectedCandidateIds.length }} 题
+                </div>
+                <a-space>
+                  <a-button
+                    type="primary"
+                    size="small"
+                    :disabled="!selectedCandidateIds.length"
+                    @click="addSelectedCandidates"
+                  >
+                    批量加入试卷
+                  </a-button>
+                  <a-button
+                    size="small"
+                    :disabled="!selectedCandidateIds.length"
+                    @click="clearSelectedCandidates"
+                  >
+                    清空选择
+                  </a-button>
+                </a-space>
+              </div>
               <a-empty v-if="!candidates.length" description="没有符合条件的候选题" />
 
               <div v-else class="candidate-list">
@@ -237,7 +279,14 @@
                   @click="selectCandidate(candidate.id)"
                 >
                   <div class="card-topline">
-                    <div class="candidate-title-text">候选题</div>
+                    <div class="candidate-title-row">
+                      <a-checkbox
+                        :checked="isCandidateSelected(candidate.id)"
+                        @click.stop
+                        @change="() => toggleCandidateSelection(candidate)"
+                      />
+                      <div class="candidate-title-text">候选题</div>
+                    </div>
                     <div class="card-controls">
                       <a-button
                         size="small"
@@ -290,7 +339,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
-import { ArrowLeftOutlined, HolderOutlined } from '@ant-design/icons-vue'
+import { ArrowDownOutlined, ArrowLeftOutlined, ArrowUpOutlined, HolderOutlined } from '@ant-design/icons-vue'
 import request from '@/utils/request'
 
 interface CandidateQuestion {
@@ -321,7 +370,7 @@ interface CompositionGroup {
   subtotalScore: number
 }
 
-const QUESTION_TYPE_ORDER = [
+const DEFAULT_QUESTION_TYPE_ORDER = [
   'single_choice',
   'multiple_choice',
   'true_false',
@@ -344,6 +393,8 @@ const candidates = ref<CandidateQuestion[]>([])
 
 const activeCurrentKey = ref<string | null>(null)
 const activeCandidateId = ref<string | null>(null)
+const selectedCandidateIds = ref<string[]>([])
+const groupOrder = ref<string[]>([])
 const savedSignature = ref('[]')
 const candidatePagination = reactive({ current: 1, pageSize: 10, total: 0 })
 const candidateFilters = reactive({
@@ -399,7 +450,7 @@ function returnToPath() {
 
 function createBuckets(source: CompositionItem[]) {
   const buckets: Record<string, CompositionItem[]> = Object.fromEntries(
-    QUESTION_TYPE_ORDER.map(type => [type, [] as CompositionItem[]])
+    DEFAULT_QUESTION_TYPE_ORDER.map(type => [type, [] as CompositionItem[]])
   )
 
   source.forEach(item => {
@@ -413,8 +464,19 @@ function createBuckets(source: CompositionItem[]) {
   return buckets
 }
 
-function flattenBuckets(buckets: Record<string, CompositionItem[]>) {
-  return QUESTION_TYPE_ORDER
+function inferGroupOrder(source: CompositionItem[]) {
+  return Array.from(new Set(source.map(item => item.question.question_type)))
+}
+
+function normalizeGroupOrder(source: CompositionItem[], preferredOrder: string[]) {
+  const presentTypes = inferGroupOrder(source)
+  const ordered = preferredOrder.filter(type => presentTypes.includes(type))
+  const extras = presentTypes.filter(type => !ordered.includes(type))
+  return [...ordered, ...extras]
+}
+
+function flattenBuckets(buckets: Record<string, CompositionItem[]>, order: string[]) {
+  return order
     .flatMap(type => buckets[type] || [])
     .map((item, index) => ({
       ...item,
@@ -423,8 +485,10 @@ function flattenBuckets(buckets: Record<string, CompositionItem[]>) {
     }))
 }
 
-function applyItems(nextItems: CompositionItem[]) {
-  items.value = flattenBuckets(createBuckets(nextItems))
+function applyItems(nextItems: CompositionItem[], preferredOrder: string[] = groupOrder.value) {
+  const nextGroupOrder = normalizeGroupOrder(nextItems, preferredOrder)
+  groupOrder.value = nextGroupOrder
+  items.value = flattenBuckets(createBuckets(nextItems), nextGroupOrder)
   if (!items.value.find(item => item.local_key === activeCurrentKey.value)) {
     activeCurrentKey.value = items.value[0]?.local_key || null
   }
@@ -432,21 +496,20 @@ function applyItems(nextItems: CompositionItem[]) {
 
 function applyCompositionResponse(data: any) {
   exam.value = data.exam
-  applyItems(
-    (data.items || []).map((item: any) => ({
+  const nextItems = (data.items || []).map((item: any) => ({
       local_key: item.id || nextLocalKey(),
       question_id: item.question_id,
       order_num: item.order_num,
       score: Math.round(Number(item.score) || 1),
       question: item.question,
     }))
-  )
+  applyItems(nextItems, inferGroupOrder(nextItems))
   savedSignature.value = compositionSignature()
 }
 
 const groupedItems = computed<CompositionGroup[]>(() => {
   const buckets = createBuckets(items.value)
-  return QUESTION_TYPE_ORDER
+  return groupOrder.value
     .map(questionType => {
       const groupItems = buckets[questionType] || []
       if (!groupItems.length) return null
@@ -520,6 +583,7 @@ async function fetchCandidates() {
     const data: any = await request.get('/questions', { params: buildCandidateParams() })
     candidates.value = data.items || []
     candidatePagination.total = data.total || 0
+    selectedCandidateIds.value = selectedCandidateIds.value.filter(id => candidates.value.some(item => item.id === id))
     if (!candidates.value.find(item => item.id === activeCandidateId.value)) {
       activeCandidateId.value = candidates.value[0]?.id || null
     }
@@ -531,6 +595,14 @@ async function fetchCandidates() {
 function refreshCandidates() {
   candidatePagination.current = 1
   fetchCandidates()
+}
+
+async function refetchCandidatesKeepingPage() {
+  await fetchCandidates()
+  if (!candidates.value.length && candidatePagination.total > 0 && candidatePagination.current > 1) {
+    candidatePagination.current -= 1
+    await fetchCandidates()
+  }
 }
 
 function resetCandidateFilters() {
@@ -553,9 +625,25 @@ function selectCandidate(candidateId: string) {
   activeCandidateId.value = candidateId
 }
 
-function removeItem(localKey: string) {
+function clearSelectedCandidates() {
+  selectedCandidateIds.value = []
+}
+
+function isCandidateSelected(candidateId: string) {
+  return selectedCandidateIds.value.includes(candidateId)
+}
+
+function toggleCandidateSelection(candidate: CandidateQuestion) {
+  if (isCandidateSelected(candidate.id)) {
+    selectedCandidateIds.value = selectedCandidateIds.value.filter(id => id !== candidate.id)
+    return
+  }
+  selectedCandidateIds.value = [...selectedCandidateIds.value, candidate.id]
+}
+
+async function removeItem(localKey: string) {
   applyItems(items.value.filter(item => item.local_key !== localKey))
-  refreshCandidates()
+  await refetchCandidatesKeepingPage()
 }
 
 function handleScoreChange(localKey: string, value: string | number | null) {
@@ -570,26 +658,56 @@ function defaultScoreForType(questionType: string) {
   return lastItem ? lastItem.score : 5
 }
 
-function addCandidate(candidate: CandidateQuestion) {
-  if (items.value.some(item => item.question_id === candidate.id)) {
-    message.warning('这道题已经在当前试卷中')
-    return
+function appendGroupOrder(order: string[], questionType: string) {
+  if (order.includes(questionType)) return [...order]
+  return [...order, questionType]
+}
+
+function addCandidatesToComposition(candidateList: CandidateQuestion[]) {
+  const existingIds = new Set(items.value.map(item => item.question_id))
+  const freshCandidates = candidateList.filter(candidate => !existingIds.has(candidate.id))
+  const skippedCount = candidateList.length - freshCandidates.length
+
+  if (!freshCandidates.length) {
+    message.warning('所选题目都已在当前试卷中')
+    return []
   }
 
   const buckets = createBuckets(items.value)
-  const newItem: CompositionItem = {
-    local_key: nextLocalKey(),
-    question_id: candidate.id,
-    order_num: items.value.length + 1,
-    score: defaultScoreForType(candidate.question_type),
-    question: candidate,
+  let nextGroupOrder = [...groupOrder.value]
+  const insertedKeys: string[] = []
+
+  freshCandidates.forEach(candidate => {
+    nextGroupOrder = appendGroupOrder(nextGroupOrder, candidate.question_type)
+    const targetBucket = buckets[candidate.question_type] ?? []
+    const defaultScore = targetBucket[targetBucket.length - 1]?.score ?? defaultScoreForType(candidate.question_type)
+    const newItem: CompositionItem = {
+      local_key: nextLocalKey(),
+      question_id: candidate.id,
+      order_num: items.value.length + insertedKeys.length + 1,
+      score: defaultScore,
+      question: candidate,
+    }
+    targetBucket.push(newItem)
+    buckets[candidate.question_type] = targetBucket
+    insertedKeys.push(newItem.local_key)
+  })
+
+  applyItems(flattenBuckets(buckets, nextGroupOrder), nextGroupOrder)
+  if (insertedKeys.length) {
+    activeCurrentKey.value = insertedKeys[insertedKeys.length - 1] ?? null
   }
-  const targetBucket = buckets[candidate.question_type] ?? []
-  targetBucket.push(newItem)
-  buckets[candidate.question_type] = targetBucket
-  applyItems(flattenBuckets(buckets))
-  activeCurrentKey.value = newItem.local_key
-  refreshCandidates()
+  if (skippedCount > 0) {
+    message.info(`已加入 ${freshCandidates.length} 题，跳过 ${skippedCount} 题重复题目`)
+  }
+  return freshCandidates.map(candidate => candidate.id)
+}
+
+async function addCandidate(candidate: CandidateQuestion) {
+  const addedIds = addCandidatesToComposition([candidate])
+  if (!addedIds.length) return
+  selectedCandidateIds.value = selectedCandidateIds.value.filter(id => !addedIds.includes(id))
+  await refetchCandidatesKeepingPage()
 }
 
 function canReplaceSelected(candidate: CandidateQuestion) {
@@ -599,7 +717,7 @@ function canReplaceSelected(candidate: CandidateQuestion) {
   )
 }
 
-function replaceSelected(candidate: CandidateQuestion) {
+async function replaceSelected(candidate: CandidateQuestion) {
   if (!activeCurrentItem.value) {
     message.warning('请先在左侧选择要替换的题目')
     return
@@ -621,15 +739,28 @@ function replaceSelected(candidate: CandidateQuestion) {
       question: candidate,
     }
   }))
-  refreshCandidates()
+  selectedCandidateIds.value = selectedCandidateIds.value.filter(id => id !== candidate.id)
+  await refetchCandidatesKeepingPage()
 }
 
-function handlePrimaryCandidateAction(candidate: CandidateQuestion) {
+async function handlePrimaryCandidateAction(candidate: CandidateQuestion) {
   if (activeCurrentItem.value) {
-    replaceSelected(candidate)
+    await replaceSelected(candidate)
     return
   }
-  addCandidate(candidate)
+  await addCandidate(candidate)
+}
+
+async function addSelectedCandidates() {
+  const selectedCandidates = candidates.value.filter(candidate => selectedCandidateIds.value.includes(candidate.id))
+  if (!selectedCandidates.length) {
+    message.warning('请先选择要加入试卷的候选题')
+    return
+  }
+  const addedIds = addCandidatesToComposition(selectedCandidates)
+  if (!addedIds.length) return
+  selectedCandidateIds.value = selectedCandidateIds.value.filter(id => !addedIds.includes(id))
+  await refetchCandidatesKeepingPage()
 }
 
 function handleDragStart(event: DragEvent, localKey: string, groupType: string) {
@@ -671,7 +802,7 @@ function handleDrop(event: DragEvent, targetKey: string, groupType: string) {
   }
   groupItems.splice(targetIndex, 0, movedItem)
   buckets[groupType] = groupItems
-  applyItems(flattenBuckets(buckets))
+  applyItems(flattenBuckets(buckets, groupOrder.value), groupOrder.value)
   activeCurrentKey.value = movedItem.local_key
   handleDragEnd()
 }
@@ -705,7 +836,7 @@ function handleGroupDropToEnd(event: DragEvent, groupType: string) {
   }
   groupItems.push(movedItem)
   buckets[groupType] = groupItems
-  applyItems(flattenBuckets(buckets))
+  applyItems(flattenBuckets(buckets, groupOrder.value), groupOrder.value)
   activeCurrentKey.value = movedItem.local_key
   handleDragEnd()
 }
@@ -715,6 +846,39 @@ function handleDragEnd() {
   draggingGroupType.value = null
   dragOverKey.value = null
   dragOverGroupType.value = null
+}
+
+function canMoveGroupUp(questionType: string) {
+  return groupOrder.value.indexOf(questionType) > 0
+}
+
+function canMoveGroupDown(questionType: string) {
+  const index = groupOrder.value.indexOf(questionType)
+  return index > -1 && index < groupOrder.value.length - 1
+}
+
+function moveGroupUp(questionType: string) {
+  const index = groupOrder.value.indexOf(questionType)
+  if (index <= 0) return
+  const nextOrder = [...groupOrder.value]
+  const currentType = nextOrder[index]
+  const previousType = nextOrder[index - 1]
+  if (!currentType || !previousType) return
+  nextOrder[index - 1] = currentType
+  nextOrder[index] = previousType
+  applyItems(items.value, nextOrder)
+}
+
+function moveGroupDown(questionType: string) {
+  const index = groupOrder.value.indexOf(questionType)
+  if (index < 0 || index >= groupOrder.value.length - 1) return
+  const nextOrder = [...groupOrder.value]
+  const currentType = nextOrder[index]
+  const nextType = nextOrder[index + 1]
+  if (!currentType || !nextType) return
+  nextOrder[index] = nextType
+  nextOrder[index + 1] = currentType
+  applyItems(items.value, nextOrder)
 }
 
 async function saveComposition() {
@@ -915,6 +1079,12 @@ onBeforeUnmount(() => {
   margin-bottom: 14px;
 }
 
+.group-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 .group-title {
   display: flex;
   align-items: center;
@@ -970,6 +1140,29 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 8px;
   color: #7a8798;
+}
+
+.candidate-batch-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid #e6edf5;
+  border-radius: 14px;
+  background: #f8fafc;
+}
+
+.candidate-batch-info {
+  color: #4b5563;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.candidate-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .order-badge {
