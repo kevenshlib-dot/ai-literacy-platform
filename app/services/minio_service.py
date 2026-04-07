@@ -2,6 +2,7 @@
 import io
 import uuid
 from datetime import timedelta
+from typing import Optional
 
 from minio import Minio
 from minio.error import S3Error
@@ -131,7 +132,11 @@ async def upload_file(
     }
 
 
-def get_presigned_url(file_path: str, expires: int = 3600) -> str:
+def get_presigned_url(
+    file_path: str,
+    expires: int = 3600,
+    download_filename: Optional[str] = None,
+) -> str:
     """Generate a presigned URL for downloading a file."""
     parts = file_path.split("/", 1)
     if len(parts) != 2:
@@ -139,8 +144,16 @@ def get_presigned_url(file_path: str, expires: int = 3600) -> str:
 
     bucket, object_name = parts
     client = get_minio_client()
+    response_headers = None
+    if download_filename:
+        response_headers = {
+            "response-content-disposition": f'attachment; filename="{download_filename}"',
+        }
     return client.presigned_get_object(
-        bucket, object_name, expires=timedelta(seconds=expires)
+        bucket,
+        object_name,
+        expires=timedelta(seconds=expires),
+        response_headers=response_headers,
     )
 
 

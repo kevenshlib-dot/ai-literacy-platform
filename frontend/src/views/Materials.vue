@@ -444,7 +444,13 @@ async function handleBatchUpload() {
 async function downloadMaterial(record: Material) {
   try {
     const res: any = await request.get(`/materials/${record.id}/download`)
-    window.open(res.download_url, '_blank')
+    const link = document.createElement('a')
+    link.href = res.download_url
+    link.download = res.filename || record.title
+    link.rel = 'noopener'
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
   } catch {
     message.error('获取下载链接失败')
   }

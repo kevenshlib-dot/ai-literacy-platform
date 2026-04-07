@@ -1177,17 +1177,33 @@ async def update_question(
     question_id: uuid.UUID,
     **kwargs,
 ) -> Optional[Question]:
-    """Update a question's fields."""
+    """Update a question's editable fields without altering workflow state."""
     q = await get_question_by_id(db, question_id)
     if not q:
         return None
 
+    if q.status == QuestionStatus.ARCHIVED:
+        raise ValueError("已归档题目不允许编辑")
+
+    editable_fields = {
+        "stem",
+        "options",
+        "correct_answer",
+        "explanation",
+        "rubric",
+        "difficulty",
+        "dimension",
+        "knowledge_tags",
+        "bloom_level",
+    }
+
     for key, value in kwargs.items():
-        if value is not None and hasattr(q, key):
-            if key == "bloom_level":
-                setattr(q, key, BloomLevel(value))
-            else:
-                setattr(q, key, value)
+        if key not in editable_fields or value is None or not hasattr(q, key):
+            continue
+        if key == "bloom_level":
+            setattr(q, key, BloomLevel(value))
+        else:
+            setattr(q, key, value)
 
     await db.flush()
     return q
@@ -1777,6 +1793,7 @@ async def preview_question_bank_from_material(
     prompt_seed: Optional[int] = None,
     system_prompt: Optional[str] = None,
     user_prompt_template: Optional[str] = None,
+    record_generation_run: bool = True,
 ) -> dict:
     """Preview question bank generation WITHOUT saving to DB.
 
@@ -2070,7 +2087,7 @@ async def preview_question_bank_from_material(
         }
         last_result = {"questions": all_preview, "stats": stats}
         if generated_total >= requested_total:
-            if generated_total > 0 and planned_unit_ids:
+            if record_generation_run and generated_total > 0 and planned_unit_ids:
                 await _record_material_generation_run(
                     db=db,
                     material_id=material_id,
@@ -2093,7 +2110,12 @@ async def preview_question_bank_from_material(
             "; ".join(last_reasons),
         )
 
-    if last_result and last_result.get("questions") and planned_unit_ids:
+    if (
+        record_generation_run
+        and last_result
+        and last_result.get("questions")
+        and planned_unit_ids
+    ):
         await _record_material_generation_run(
             db=db,
             material_id=material_id,

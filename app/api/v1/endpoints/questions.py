@@ -752,11 +752,14 @@ async def update_question(
     current_user: User = Depends(require_role(["admin", "organizer"])),
 ):
     """Update a question."""
-    q = await question_service.update_question(
-        db=db,
-        question_id=question_id,
-        **body.model_dump(exclude_unset=True),
-    )
+    try:
+        q = await question_service.update_question(
+            db=db,
+            question_id=question_id,
+            **body.model_dump(exclude_unset=True),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if not q:
         raise HTTPException(status_code=404, detail="题目不存在")
     await db.commit()

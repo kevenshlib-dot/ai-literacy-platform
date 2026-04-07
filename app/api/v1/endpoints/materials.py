@@ -19,6 +19,7 @@ from app.services.material_service import (
     list_materials as list_materials_svc,
     delete_material,
     get_material_download_url,
+    build_material_download_filename,
 )
 from app.services.parse_worker import trigger_parse, parse_and_store, safe_reparse_material
 
@@ -192,12 +193,13 @@ async def download_material(
     if not material:
         raise HTTPException(status_code=404, detail="素材不存在")
 
+    filename = build_material_download_filename(material)
+
     try:
-        url = get_material_download_url(material.file_path)
+        url = get_material_download_url(material.file_path, download_filename=filename)
     except Exception:
         raise HTTPException(status_code=500, detail="无法生成下载链接")
 
-    filename = material.file_path.rsplit("/", 1)[-1] if "/" in material.file_path else material.title
     return MaterialDownloadResponse(download_url=url, filename=filename)
 
 

@@ -1,4 +1,5 @@
 """Material service - handles material upload, metadata persistence, and queries."""
+import re
 import uuid
 from typing import Optional
 
@@ -8,6 +9,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.material import Material, MaterialStatus, KnowledgeUnit
 from app.models.question import Question, QuestionStatus
 from app.services.minio_service import upload_file, delete_file, get_presigned_url
+
+
+DEFAULT_DOWNLOAD_EXTENSIONS = {
+    "pdf": ".pdf",
+    "word": ".docx",
+    "epub": ".epub",
+    "markdown": ".md",
+    "html": ".html",
+    "image": ".png",
+    "video": ".mp4",
+    "audio": ".mp3",
+    "csv": ".csv",
+    "json": ".json",
+}
 
 
 async def create_material(
@@ -160,6 +175,27 @@ async def delete_material(
     return True
 
 
-def get_material_download_url(file_path: str) -> str:
+def build_material_download_filename(material: Material) -> str:
+    """Build a user-facing download filename from title and stored suffix."""
+    title = (material.title or "素材").strip() or "素材"
+    safe_title = re.sub(r'[\\/:*?"<>|]+', '_', title)
+
+    object_name = material.file_path.rsplit("/", 1)[-1] if "/" in material.file_path else material.file_path
+    suffix = ""
+    if "." in object_name:
+        ext = object_name.rsplit(".", 1)[-1].strip().lower()
+        if ext:
+            suffix = f".{ext}"
+
+    if not suffix:
+        format_value = material.format.value if hasattr(material.format, "value") else str(material.format)
+        suffix = DEFAULT_DOWNLOAD_EXTENSIONS.get(format_value, "")
+
+    if suffix and safe_title.lower().endswith(suffix.lower()):
+        return safe_title
+    return f"{safe_title}{suffix}"
+
+
+def get_material_download_url(file_path: str, download_filename: Optional[str] = None) -> str:
     """Get a presigned download URL for a material file."""
-    return get_presigned_url(file_path)
+    return get_presigned_url(file_path, download_filename=download_filename)

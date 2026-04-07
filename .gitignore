@@ -48,3 +48,7 @@ alembic/versions/*.pyc
 # Claude Code
 .claude/
 .github/
+
+# Codex
+.codex
+.codex/

@@ -1262,6 +1262,83 @@ async def test_preview_question_bank_records_history_when_quality_gate_warns(mon
 
 
 @pytest.mark.asyncio
+async def test_preview_question_bank_skips_history_when_disabled(monkeypatch):
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    monkeypatch.setattr(question_service, "generate_questions_via_llm", lambda *args, **kwargs: {
+        "questions": [
+            {
+                "question_type": "single_choice",
+                "stem": "上线前哪项做法最能降低隐私风险？",
+                "options": {"A": "先做脱敏", "B": "扩大采集", "C": "跳过评估", "D": "关闭审计"},
+                "correct_answer": "A",
+                "explanation": "脱敏可以降低敏感信息误用风险。",
+                "knowledge_tags": ["脱敏"],
+                "dimension": "AI伦理安全",
+            }
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        "fallback_used": False,
+        "error": None,
+    })
+    monkeypatch.setattr(question_service, "_validate_generated_question_set", lambda *args, **kwargs: {
+        "passed": True,
+        "reasons": [],
+    })
+
+    async with session_factory() as session:
+        await init_roles(session)
+        uploader = await create_user(
+            session,
+            username=f"preview_no_history_{uuid.uuid4().hex[:8]}",
+            email=f"{uuid.uuid4().hex[:8]}@example.com",
+            password="password123",
+            role_name="organizer",
+            is_active=True,
+        )
+        material = Material(
+            title="仅导出不记历史素材",
+            format=MaterialFormat.MARKDOWN,
+            file_path="materials/no-history.md",
+            status=MaterialStatus.PARSED,
+            uploaded_by=uploader.id,
+        )
+        session.add(material)
+        await session.flush()
+        session.add(
+            KnowledgeUnit(
+                material_id=material.id,
+                title="片段1",
+                content="上线前需要完成数据脱敏和风险评估。",
+                chunk_index=0,
+                dimension="AI伦理安全",
+            )
+        )
+        await session.commit()
+
+        preview = await question_service.preview_question_bank_from_material(
+            db=session,
+            material_id=material.id,
+            type_distribution={"single_choice": 1},
+            difficulty=3,
+            created_by=uploader.id,
+            record_generation_run=False,
+        )
+
+        run_count = await session.scalar(
+            select(func.count()).select_from(MaterialGenerationRun).where(
+                MaterialGenerationRun.material_id == material.id
+            )
+        )
+
+    await engine.dispose()
+
+    assert len(preview["questions"]) == 1
+    assert run_count == 0
+
+
+@pytest.mark.asyncio
 async def test_prompt_preview_coverage_mode_matches_preview_selection(monkeypatch):
     engine = create_async_engine(settings.DATABASE_URL, echo=False)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -2963,6 +3040,117 @@ async def test_update_question():
     assert resp.status_code == 200
     assert resp.json()["stem"] == "更新后的题干"
     assert resp.json()["difficulty"] == 4
+
+
+@pytest.mark.asyncio
+async def test_update_approved_question_keeps_status_and_ignores_question_type_change():
+    async with get_client() as client:
+        org_token = await register_user(client, "organizer")
+        rev_token = await register_user(client, "reviewer")
+        org_headers = {"Authorization": f"Bearer {org_token}"}
+        rev_headers = {"Authorization": f"Bearer {rev_token}"}
+
+        create_resp = await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": "审核通过前的题干",
+            "correct_answer": "A",
+            "options": {"A": "1", "B": "2"},
+            "difficulty": 2,
+        }, headers=org_headers)
+        qid = create_resp.json()["id"]
+
+        submit_resp = await client.post(f"/api/v1/questions/{qid}/submit", headers=org_headers)
+        assert submit_resp.status_code == 200
+
+        review_resp = await client.post(
+            f"/api/v1/questions/{qid}/review",
+            json={"action": "approve", "comment": "通过"},
+            headers=rev_headers,
+        )
+        assert review_resp.status_code == 200
+        assert review_resp.json()["status"] == "approved"
+
+        update_resp = await client.put(f"/api/v1/questions/{qid}", json={
+            "stem": "审核通过后的新题干",
+            "difficulty": 4,
+            "question_type": "multiple_choice",
+        }, headers=org_headers)
+
+    assert update_resp.status_code == 200
+    data = update_resp.json()
+    assert data["stem"] == "审核通过后的新题干"
+    assert data["difficulty"] == 4
+    assert data["status"] == "approved"
+    assert data["question_type"] == "single_choice"
+
+
+@pytest.mark.asyncio
+async def test_update_rejected_question_keeps_status():
+    async with get_client() as client:
+        org_token = await register_user(client, "organizer")
+        rev_token = await register_user(client, "reviewer")
+        org_headers = {"Authorization": f"Bearer {org_token}"}
+        rev_headers = {"Authorization": f"Bearer {rev_token}"}
+
+        create_resp = await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": "待驳回题目",
+            "correct_answer": "A",
+            "options": {"A": "1", "B": "2"},
+        }, headers=org_headers)
+        qid = create_resp.json()["id"]
+
+        submit_resp = await client.post(f"/api/v1/questions/{qid}/submit", headers=org_headers)
+        assert submit_resp.status_code == 200
+
+        review_resp = await client.post(
+            f"/api/v1/questions/{qid}/review",
+            json={"action": "reject", "comment": "需修改"},
+            headers=rev_headers,
+        )
+        assert review_resp.status_code == 200
+        assert review_resp.json()["status"] == "rejected"
+
+        update_resp = await client.put(f"/api/v1/questions/{qid}", json={
+            "stem": "驳回后修改的题干",
+            "explanation": "补充解析",
+        }, headers=org_headers)
+
+    assert update_resp.status_code == 200
+    data = update_resp.json()
+    assert data["stem"] == "驳回后修改的题干"
+    assert data["explanation"] == "补充解析"
+    assert data["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_update_archived_question_is_rejected():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        create_resp = await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": "待归档题目",
+            "correct_answer": "A",
+            "options": {"A": "1", "B": "2"},
+        }, headers=headers)
+        qid = create_resp.json()["id"]
+
+        engine = create_async_engine(settings.DATABASE_URL, echo=False)
+        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with session_factory() as session:
+            question = await session.get(Question, uuid.UUID(qid))
+            question.status = QuestionStatus.ARCHIVED
+            await session.commit()
+        await engine.dispose()
+
+        update_resp = await client.put(f"/api/v1/questions/{qid}", json={
+            "stem": "归档后不应可改",
+        }, headers=headers)
+
+    assert update_resp.status_code == 400
+    assert update_resp.json()["detail"] == "已归档题目不允许编辑"
 
 
 @pytest.mark.asyncio

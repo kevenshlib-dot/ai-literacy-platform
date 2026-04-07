@@ -176,7 +176,7 @@
                   @click="quickApprove(record.id)"
                 >通过</a-button>
                 <a-button
-                  v-if="record.status === 'draft'"
+                  v-if="canEditQuestion(record)"
                   size="small"
                   type="link"
                   @click="editQuestion(record)"
@@ -485,7 +485,7 @@
             </a-space>
             <a-space>
               <a-button
-                v-if="detailQuestion.status === 'draft' || detailQuestion.status === 'pending_review'"
+                v-if="canEditQuestion(detailQuestion)"
                 @click="detailVisible = false; editQuestion(detailQuestion)"
               >
                 <template #icon><EditOutlined /></template>编辑
@@ -1482,6 +1482,9 @@ function typeLabel(t: string) { return typeMap[t] || t }
 function statusLabel(s: string) { return statusMap[s] || s }
 function bloomLabel(b: string) { return bloomMap[b] || b }
 function scoreLabel(k: string) { return scoreMap[k] || k }
+function canEditQuestion(question: any) {
+  return !!question && question.status !== 'archived'
+}
 function actionLabel(a: string) {
   return a === 'approve' ? '通过' : a === 'reject' ? '拒绝' : a === 'ai_check' ? 'AI检查' : a
 }

@@ -14,6 +14,7 @@ from app.agents.model_registry import (
     ModelConfig,
     get_compare_models,
 )
+from scripts import export_material_questions
 from scripts.compare_question_generation import (
     ComparisonRunConfig,
     ModelRunResult,
@@ -21,6 +22,12 @@ from scripts.compare_question_generation import (
     aggregate_question_counts_by_type,
     build_markdown_report,
     write_run_outputs,
+)
+from scripts.export_material_questions import (
+    ExportConfig,
+    MaterialCatalogItem,
+    MaterialExportResult,
+    write_export_outputs as write_material_export_outputs,
 )
 
 VALID_TEST_USER_PROMPT_TEMPLATE = (
@@ -1371,3 +1378,153 @@ def test_write_run_outputs_creates_json_and_markdown(tmp_path: Path):
     assert model_json.exists()
     payload = json.loads(model_json.read_text(encoding="utf-8"))
     assert payload["model"]["slug"] == "local_qwen"
+
+
+def test_write_material_export_outputs_creates_manifest_and_material_files(tmp_path: Path):
+    config = ExportConfig(
+        type_distribution={"single_choice": 8, "multiple_choice": 4, "true_false": 4, "fill_blank": 2, "short_answer": 2},
+        difficulty=3,
+        bloom_level=None,
+        max_units=10,
+        selection_mode="stable",
+        prompt_seed=42,
+        output_dir=tmp_path,
+    )
+    success_material = MaterialCatalogItem(
+        material_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+        title="成功素材",
+        status="parsed",
+        format="pdf",
+        category=None,
+        knowledge_unit_count=48,
+    )
+    failed_material = MaterialCatalogItem(
+        material_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
+        title="失败素材",
+        status="parsed",
+        format="epub",
+        category="伦理",
+        knowledge_unit_count=12,
+    )
+    results = [
+        MaterialExportResult(
+            material=success_material,
+            export_status="success",
+            question_count=20,
+            questions=[{"stem": "题目一", "question_type": "single_choice"}],
+            stats={"generated_total": 20},
+            errors=[],
+        ),
+        MaterialExportResult(
+            material=failed_material,
+            export_status="failed",
+            question_count=17,
+            questions=[],
+            stats={"generated_total": 17},
+            errors=["实际生成 17 道题，未达到目标 20 道"],
+        ),
+    ]
+
+    run_dir = write_material_export_outputs(config, results)
+
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    success_payload = json.loads(
+        (run_dir / "materials" / f"{success_material.material_id}.json").read_text(encoding="utf-8")
+    )
+    failed_payload = json.loads(
+        (run_dir / "materials" / f"{failed_material.material_id}.json").read_text(encoding="utf-8")
+    )
+
+    assert manifest["material_count"] == 2
+    assert manifest["success_count"] == 1
+    assert manifest["failed_count"] == 1
+    assert manifest["materials"][0]["file_path"].startswith("materials/")
+    assert success_payload["export_status"] == "success"
+    assert success_payload["generation_config"]["model_name"]
+    assert success_payload["questions"][0]["stem"] == "题目一"
+    assert failed_payload["export_status"] == "failed"
+    assert failed_payload["questions"] == []
+    assert failed_payload["errors"] == ["实际生成 17 道题，未达到目标 20 道"]
+
+
+@pytest.mark.asyncio
+async def test_export_all_materials_uses_preview_without_recording_history(monkeypatch):
+    config = ExportConfig(
+        type_distribution={"single_choice": 8, "multiple_choice": 4, "true_false": 4, "fill_blank": 2, "short_answer": 2},
+        difficulty=3,
+        bloom_level=None,
+        max_units=10,
+        selection_mode="stable",
+        prompt_seed=42,
+        output_dir=Path("artifacts/question-compare"),
+    )
+    materials = [
+        MaterialCatalogItem(
+            material_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+            title="成功素材",
+            status="parsed",
+            format="pdf",
+            category=None,
+            knowledge_unit_count=24,
+        ),
+        MaterialCatalogItem(
+            material_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
+            title="失败素材",
+            status="parsed",
+            format="pdf",
+            category=None,
+            knowledge_unit_count=18,
+        ),
+    ]
+    preview_calls = []
+
+    async def fake_list_exportable_materials():
+        return materials
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def fake_preview_question_bank_from_material(**kwargs):
+        preview_calls.append(kwargs)
+        if kwargs["material_id"] == materials[0].material_id:
+            return {
+                "questions": [
+                    {"stem": f"题目{i}", "question_type": "single_choice"}
+                    for i in range(20)
+                ],
+                "stats": {"generated_total": 20},
+            }
+        return {
+            "questions": [
+                {"stem": f"题目{i}", "question_type": "single_choice"}
+                for i in range(19)
+            ],
+            "stats": {
+                "generated_total": 19,
+                "warnings": ["实际仅生成 19 道题，少于目标 20 道"],
+            },
+        }
+
+    monkeypatch.setattr(export_material_questions, "list_exportable_materials", fake_list_exportable_materials)
+    monkeypatch.setattr(export_material_questions, "async_session", lambda: FakeSession())
+    monkeypatch.setattr(
+        export_material_questions.question_service,
+        "preview_question_bank_from_material",
+        fake_preview_question_bank_from_material,
+    )
+
+    results = await export_material_questions.export_all_materials(config)
+
+    assert len(results) == 2
+    assert [call["record_generation_run"] for call in preview_calls] == [False, False]
+    assert results[0].export_status == "success"
+    assert results[0].question_count == 20
+    assert len(results[0].questions) == 20
+    assert results[1].export_status == "failed"
+    assert results[1].question_count == 19
+    assert results[1].questions == []
+    assert results[1].errors == ["实际仅生成 19 道题，少于目标 20 道"]

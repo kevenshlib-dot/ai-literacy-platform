@@ -253,7 +253,7 @@
     <a-drawer
       v-model:open="detailDrawer.visible"
       :title="detailDrawer.exam?.title || '考试详情'"
-      width="720"
+      width="960"
     >
       <template v-if="detailDrawer.exam">
         <a-descriptions :column="2" bordered size="small">
@@ -291,8 +291,28 @@
           row-key="id"
         >
           <template #bodyCell="{ column, record, index }">
-            <template v-if="column.key === 'order'">{{ index + 1 }}</template>
-            <template v-if="column.key === 'score'">{{ record.score }} 分</template>
+            <template v-if="column.key === 'order'">{{ record.order_num || index + 1 }}</template>
+            <template v-else-if="column.key === 'score'">{{ record.score }} 分</template>
+            <template v-else-if="column.key === 'question_type'">{{ typeLabel(record.question?.question_type) }}</template>
+            <template v-else-if="column.key === 'dimension'">{{ record.question?.dimension || '未分类' }}</template>
+            <template v-else-if="column.key === 'difficulty'">{{ difficultyLabel(record.question?.difficulty) }}</template>
+            <template v-else-if="column.key === 'content'">
+              <div class="exam-question-content">
+                <div class="exam-question-stem">{{ record.question?.stem || '无题干' }}</div>
+                <div v-if="hasQuestionOptions(record.question)" class="exam-question-options">
+                  <div
+                    v-for="option in normalizeQuestionOptions(record.question?.options)"
+                    :key="option.key"
+                    class="exam-question-option"
+                  >
+                    <span class="exam-question-option-key">{{ option.key }}.</span>
+                    <span>{{ option.value }}</span>
+                  </div>
+                </div>
+                <div class="exam-question-answer">正确答案：{{ formatCorrectAnswer(record.question?.correct_answer, record.question?.options) }}</div>
+                <div class="exam-question-explanation">解析：{{ record.question?.explanation || '无解析' }}</div>
+              </div>
+            </template>
           </template>
         </a-table>
       </template>
@@ -306,6 +326,26 @@ import { useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { PlusOutlined, SearchOutlined, FolderOutlined, RollbackOutlined } from '@ant-design/icons-vue'
 import request from '@/utils/request'
+
+interface ExamQuestionSummary {
+  id: string
+  question_type: string
+  stem: string
+  options?: Record<string, string> | null
+  correct_answer: string
+  explanation?: string | null
+  difficulty: number
+  dimension?: string | null
+  status: string
+}
+
+interface ExamCompositionItem {
+  id: string
+  question_id: string
+  order_num: number
+  score: number
+  question: ExamQuestionSummary
+}
 
 const router = useRouter()
 const route = useRoute()
@@ -365,8 +405,11 @@ const columns = [
 
 const questionColumns = [
   { title: '序号', key: 'order', width: 60 },
-  { title: '题目ID', dataIndex: 'question_id', key: 'question_id', ellipsis: true },
   { title: '分值', key: 'score', width: 80 },
+  { title: '题型', key: 'question_type', width: 100 },
+  { title: '维度', key: 'dimension', width: 130, ellipsis: true },
+  { title: '难度', key: 'difficulty', width: 90 },
+  { title: '题目内容', key: 'content' },
 ]
 
 // Form modal
@@ -438,7 +481,7 @@ const assembleModal = reactive({
 const detailDrawer = reactive({
   visible: false,
   exam: null as any,
-  questions: [] as any[],
+  questions: [] as ExamCompositionItem[],
 })
 
 function statusColor(s: string) {
@@ -446,6 +489,34 @@ function statusColor(s: string) {
 }
 function statusLabel(s: string) {
   return { draft: '草稿', published: '已发布', closed: '已关闭' }[s] || s
+}
+function typeLabel(type?: string) {
+  return {
+    single_choice: '单选题',
+    multiple_choice: '多选题',
+    true_false: '判断题',
+    fill_blank: '填空题',
+    short_answer: '简答题',
+    essay: '论述题',
+    sjt: '情境判断题',
+  }[type || ''] || type || '-'
+}
+function difficultyLabel(value?: number) {
+  return typeof value === 'number' ? `${value} / 5` : '-'
+}
+function normalizeQuestionOptions(options?: Record<string, string> | null) {
+  return Object.entries(options || {})
+    .filter(([key, value]) => String(key).trim() && String(value).trim())
+    .map(([key, value]) => ({ key, value }))
+}
+function hasQuestionOptions(question?: ExamQuestionSummary | null) {
+  return normalizeQuestionOptions(question?.options).length > 0
+}
+function formatCorrectAnswer(answer?: string, options?: Record<string, string> | null) {
+  if (!answer) return '-'
+  const normalized = String(answer).trim()
+  if (!options || !/^[A-Z]+$/.test(normalized)) return normalized
+  return normalized.split('').join('、')
 }
 function formatDate(d: string) {
   if (!d) return ''
@@ -753,11 +824,18 @@ async function handleAssemble() {
 
 async function viewExam(record: any) {
   try {
-    const data: any = await request.get(`/exams/${record.id}`)
-    detailDrawer.exam = data
-    detailDrawer.questions = data.questions || []
+    const [examData, compositionData]: any[] = await Promise.all([
+      request.get(`/exams/${record.id}`),
+      request.get(`/exams/${record.id}/composition`),
+    ])
+    detailDrawer.exam = examData
+    detailDrawer.questions = compositionData.items || []
     detailDrawer.visible = true
-  } catch { /* handled */ }
+  } catch {
+    detailDrawer.exam = null
+    detailDrawer.questions = []
+    message.error('加载试卷详情失败')
+  }
 }
 
 async function publishExam(record: any) {
@@ -818,5 +896,39 @@ onMounted(() => {
 .dimension-weight-label {
   color: #262626;
   font-weight: 500;
+}
+.exam-question-content {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0;
+}
+.exam-question-stem {
+  color: #262626;
+  font-weight: 500;
+  line-height: 1.6;
+}
+.exam-question-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.exam-question-option {
+  display: flex;
+  gap: 6px;
+  color: #595959;
+  line-height: 1.5;
+}
+.exam-question-option-key {
+  min-width: 18px;
+  font-weight: 600;
+}
+.exam-question-answer {
+  color: #1f4e79;
+  font-weight: 500;
+}
+.exam-question-explanation {
+  color: #595959;
+  line-height: 1.6;
 }
 </style>

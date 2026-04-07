@@ -436,7 +436,9 @@ async def test_download_material():
             headers={"Authorization": f"Bearer {token}"},
         )
     assert resp.status_code == 200
-    assert "download_url" in resp.json()
+    data = resp.json()
+    assert "download_url" in data
+    assert data["filename"] == "下载测试.pdf"
 
 
 @pytest.mark.asyncio
