@@ -60,7 +60,7 @@
                         {{ item.status === 'published' ? '进行中' : item.status === 'draft' ? '草稿' : '已关闭' }}
                       </a-tag>
                       <span>总分 {{ item.total_score }}</span>
-                      <span v-if="item.usage_count">{{ item.usage_count }} 人参加</span>
+                      <span>{{ item.usage_count || 0 }} 人参加</span>
                     </a-space>
                   </template>
                 </a-list-item-meta>
@@ -157,6 +157,7 @@ const dimensions = ref([
   { name: 'AI伦理安全', coverage: 0 },
   { name: 'AI批判思维', coverage: 0 },
   { name: 'AI创新实践', coverage: 0 },
+  { name: '未分类', coverage: 0 },
 ])
 
 function typeLabel(t: string) {
@@ -211,9 +212,9 @@ async function loadDashboard() {
   const results = await Promise.allSettled([
     request.get('/materials', { params: { skip: 0, limit: 100 } }),
     request.get('/questions', { params: { skip: 0, limit: 5, status: 'pending_review' } }),
-    request.get('/questions/stats'),
-    request.get('/exams', { params: { skip: 0, limit: 5 } }),
-    request.get('/users', { params: { skip: 0, limit: 1 } }),
+    request.get('/questions/stats', { params: { status: 'approved' } }),
+    request.get('/exams', { params: { skip: 0, limit: 5, is_random_test: false } }),
+    request.get('/users/stats'),
   ])
 
   if (results[0].status === 'fulfilled') {

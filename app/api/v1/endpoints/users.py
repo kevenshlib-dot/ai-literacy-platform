@@ -147,6 +147,19 @@ async def list_users(
     }
 
 
+@router.get("/stats")
+async def user_stats(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer", "reviewer"])),
+):
+    total = (
+        await db.execute(
+            select(func.count(User.id)).where(User.is_deleted == False)
+        )
+    ).scalar() or 0
+    return {"total": total}
+
+
 @router.post("")
 async def create_user_admin(
     body: UserCreate,

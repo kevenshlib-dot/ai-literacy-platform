@@ -11,6 +11,7 @@ from app.core.database import Base, get_db
 from app.core.security import create_access_token
 from app.main import app
 from app.models.auth_session import AuthSession
+from app.models.user import User
 from app.services.auth_service import get_access_token_issue_time, utc_now
 from app.services.user_service import create_user, init_roles
 
@@ -148,6 +149,71 @@ async def test_register_admin_is_forbidden():
 
     assert resp.status_code == 400
     assert resp.json()["detail"] == "不允许注册管理员角色"
+
+
+@pytest.mark.asyncio
+async def test_user_stats_allows_admin_organizer_reviewer_and_excludes_deleted_users():
+    admin_user_id, admin_token = await create_direct_token(role="admin")
+    _organizer_user_id, organizer_token = await create_direct_token(role="organizer")
+    _reviewer_user_id, reviewer_token = await create_direct_token(role="reviewer")
+    _examinee_user_id, examinee_token = await create_direct_token(role="examinee")
+
+    engine = make_engine()
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    deleted_user_id: str | None = None
+    try:
+        async with session_factory() as session:
+            active_user = await create_user(
+                session,
+                username=f"active_{uuid.uuid4().hex[:8]}",
+                email=f"active_{uuid.uuid4().hex[:8]}@example.com",
+                password="password123",
+                role_name="examinee",
+                is_active=True,
+            )
+            deleted_user = await create_user(
+                session,
+                username=f"deleted_{uuid.uuid4().hex[:8]}",
+                email=f"deleted_{uuid.uuid4().hex[:8]}@example.com",
+                password="password123",
+                role_name="examinee",
+                is_active=True,
+            )
+            deleted_user.is_deleted = True
+            await session.commit()
+            await session.refresh(active_user)
+            await session.refresh(deleted_user)
+            deleted_user_id = str(deleted_user.id)
+    finally:
+        await engine.dispose()
+
+    async with get_client() as client:
+        for token in (admin_token, organizer_token, reviewer_token):
+            resp = await client.get(
+                "/api/v1/users/stats",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200
+            assert resp.json()["total"] == 5
+
+        forbidden_resp = await client.get(
+            "/api/v1/users/stats",
+            headers={"Authorization": f"Bearer {examinee_token}"},
+        )
+
+    assert forbidden_resp.status_code == 403
+
+    engine = make_engine()
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        async with session_factory() as session:
+            result = await session.get(User, uuid.UUID(admin_user_id))
+            assert result is not None
+            deleted_user = await session.get(User, uuid.UUID(deleted_user_id))
+            assert deleted_user is not None
+            assert deleted_user.is_deleted is True
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

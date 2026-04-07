@@ -3810,3 +3810,56 @@ async def test_question_stats_filters_by_source_material():
     assert data["by_type"]["single_choice"] == 1
     assert data["quality_metrics"]["source_linked_count"] == 1
     assert data["quality_metrics"]["source_unlinked_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_question_stats_approved_by_dimension_includes_uncategorized():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+        user_id = uuid.UUID(decode_access_token(token)["sub"])
+
+        engine = create_async_engine(settings.DATABASE_URL, echo=False)
+        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with session_factory() as session:
+            session.add_all([
+                Question(
+                    question_type=QuestionType.SINGLE_CHOICE,
+                    stem="已通过且已分类题目",
+                    correct_answer="A",
+                    options={"A": "1", "B": "2"},
+                    dimension="AI基础知识",
+                    created_by=user_id,
+                    status=QuestionStatus.APPROVED,
+                ),
+                Question(
+                    question_type=QuestionType.TRUE_FALSE,
+                    stem="已通过但未分类题目",
+                    correct_answer="A",
+                    options={"A": "正确", "B": "错误"},
+                    dimension=None,
+                    created_by=user_id,
+                    status=QuestionStatus.APPROVED,
+                ),
+                Question(
+                    question_type=QuestionType.SINGLE_CHOICE,
+                    stem="草稿题目不应计入已通过统计",
+                    correct_answer="A",
+                    options={"A": "1", "B": "2"},
+                    dimension="AI伦理安全",
+                    created_by=user_id,
+                    status=QuestionStatus.DRAFT,
+                ),
+            ])
+            await session.commit()
+        await engine.dispose()
+
+        resp = await client.get("/api/v1/questions/stats?status=approved", headers=headers)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 2
+    assert data["by_status"] == {"approved": 2}
+    assert data["by_dimension"]["AI基础知识"] == 1
+    assert data["by_dimension"]["未分类"] == 1
+    assert data["by_dimension"]["AI伦理安全"] == 0

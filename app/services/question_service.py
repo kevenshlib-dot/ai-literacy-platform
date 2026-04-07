@@ -53,6 +53,14 @@ BLOOM_LEVEL_LABELS = {
     "evaluate": "评价",
     "create": "创造",
 }
+WORKBENCH_DIMENSIONS = [
+    "AI基础知识",
+    "AI技术应用",
+    "AI伦理安全",
+    "AI批判思维",
+    "AI创新实践",
+]
+UNCATEGORIZED_DIMENSION_LABEL = "未分类"
 
 
 def _coerce_uuid(value: Optional[uuid.UUID | str]) -> Optional[uuid.UUID]:
@@ -2393,6 +2401,23 @@ async def get_question_stats(
     type_result = await db.execute(type_q)
     by_type = {row[0].value: row[1] for row in type_result.all()}
 
+    dimension_q = (
+        select(Question.dimension, func.count(Question.id))
+        .where(where_clause)
+        .group_by(Question.dimension)
+    )
+    dimension_result = await db.execute(dimension_q)
+    by_dimension = {
+        dim: 0
+        for dim in [*WORKBENCH_DIMENSIONS, UNCATEGORIZED_DIMENSION_LABEL]
+    }
+    for raw_dimension, count in dimension_result.all():
+        normalized_dimension = str(raw_dimension or "").strip()
+        if normalized_dimension in WORKBENCH_DIMENSIONS:
+            by_dimension[normalized_dimension] = count
+        else:
+            by_dimension[UNCATEGORIZED_DIMENSION_LABEL] += count
+
     # Count by difficulty
     diff_q = (
         select(Question.difficulty, func.count(Question.id))
@@ -2458,6 +2483,7 @@ async def get_question_stats(
         "total": total,
         "by_status": by_status,
         "by_type": by_type,
+        "by_dimension": by_dimension,
         "by_difficulty": by_difficulty,
         "by_bloom_level": by_bloom_level,
         "quality_metrics": {
