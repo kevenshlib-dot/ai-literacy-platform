@@ -14,7 +14,7 @@ from sqlalchemy.orm import selectinload
 from app.core.database import get_db
 from app.api.deps import get_current_active_user, require_role
 from app.models.user import User, Role
-from app.models.score import Score
+from app.models.score import Score, ScoreComplaint
 from app.models.answer import AnswerSheet, AnswerSheetStatus
 from app.models.exam import Exam
 from app.services import score_service
@@ -636,6 +636,66 @@ async def generate_training_questions(
     return {"questions": questions, "count": len(questions)}
 
 
+# ── Complaint endpoints (must be before /{score_id} parameterized routes) ──
+
+class ComplaintRequest(BaseModel):
+    score_detail_id: UUID
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class HandleComplaintRequest(BaseModel):
+    status: str  # "accepted" or "rejected"
+    reply: str = Field(default="", max_length=2000)
+
+
+@router.post("/complaints")
+async def submit_complaint(
+    body: ComplaintRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Submit a complaint/feedback on a specific question's score."""
+    try:
+        complaint = await score_service.create_complaint(
+            db, body.score_detail_id, current_user.id, body.reason
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    await db.commit()
+    return {"id": str(complaint.id), "message": "投诉已提交，我们会尽快处理"}
+
+
+@router.get("/complaints")
+async def list_complaints(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    status: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    """List all complaints (admin/organizer only)."""
+    items, total = await score_service.list_complaints(db, skip, limit, status)
+    return {"total": total, "items": items}
+
+
+@router.put("/complaints/{complaint_id}")
+async def handle_complaint(
+    complaint_id: UUID,
+    body: HandleComplaintRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    """Handle a complaint: accept or reject with reply."""
+    try:
+        complaint = await score_service.handle_complaint(
+            db, complaint_id, body.status, body.reply
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    await db.commit()
+    return {"id": str(complaint.id), "status": complaint.status.value, "message": "处理完成"}
+
+
 @router.get("/{score_id}/review")
 async def get_review_data(
     score_id: UUID,
@@ -648,6 +708,29 @@ async def get_review_data(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"score_id": str(score_id), "wrong_items": items, "total_wrong": len(items)}
+
+
+@router.get("/{score_id}/full-review")
+async def get_full_review_data(
+    score_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Get ALL answer details (correct and wrong) for full grading review."""
+    try:
+        items = await score_service.get_all_answer_details(db, score_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    correct_count = sum(1 for i in items if i.get("is_correct"))
+    wrong_count = sum(1 for i in items if i.get("is_correct") is False)
+    return {
+        "score_id": str(score_id),
+        "items": items,
+        "total": len(items),
+        "correct_count": correct_count,
+        "wrong_count": wrong_count,
+    }
 
 
 @router.get("/{score_id}")

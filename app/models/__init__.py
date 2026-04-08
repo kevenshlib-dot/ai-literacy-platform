@@ -4,7 +4,7 @@ from app.models.question import Question, ReviewRecord
 from app.models.paper import Paper, PaperSection, PaperQuestion
 from app.models.exam import Exam, ExamQuestion
 from app.models.answer import AnswerSheet, Answer
-from app.models.score import Score, ScoreDetail
+from app.models.score import Score, ScoreDetail, ScoreComplaint, ComplaintStatus
 from app.models.report import Report
 from app.models.interactive import InteractiveSession, InteractiveTurn
 from app.models.annotation import Annotation
@@ -28,6 +28,8 @@ __all__ = [
     "Answer",
     "Score",
     "ScoreDetail",
+    "ScoreComplaint",
+    "ComplaintStatus",
     "Report",
     "InteractiveSession",
     "InteractiveTurn",

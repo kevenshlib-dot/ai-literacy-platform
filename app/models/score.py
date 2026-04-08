@@ -1,11 +1,18 @@
+import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import String, Text, Integer, DateTime, ForeignKey, Float
+from sqlalchemy import String, Text, Integer, DateTime, ForeignKey, Float, Enum as SAEnum
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+
+
+class ComplaintStatus(str, enum.Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
 
 
 class Score(Base):
@@ -48,3 +55,32 @@ class ScoreDetail(Base):
     feedback: Mapped[str] = mapped_column(Text, nullable=True)
 
     score: Mapped["Score"] = relationship(back_populates="details")
+
+
+class ScoreComplaint(Base):
+    __tablename__ = "score_complaints"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    score_detail_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("score_details.id"), nullable=False, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[ComplaintStatus] = mapped_column(
+        SAEnum(ComplaintStatus, name="complaint_status"),
+        default=ComplaintStatus.PENDING,
+        nullable=False,
+        index=True,
+    )
+    reply: Mapped[str] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )

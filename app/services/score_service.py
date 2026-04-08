@@ -316,6 +316,209 @@ async def get_wrong_answer_details(
     return items
 
 
+async def get_all_answer_details(
+    db: AsyncSession,
+    score_id: uuid.UUID,
+) -> list[dict]:
+    """Get ALL answer details (correct and wrong) with full question data, ordered by exam question order."""
+    from app.models.exam import ExamQuestion
+
+    score = await get_score_by_id(db, score_id, load_details=True)
+    if not score:
+        raise ValueError("成绩不存在")
+
+    all_qids = [d.question_id for d in score.details]
+    if not all_qids:
+        return []
+
+    # Batch-fetch questions
+    result = await db.execute(
+        select(Question).where(Question.id.in_(all_qids))
+    )
+    questions_map = {q.id: q for q in result.scalars().all()}
+
+    # Batch-fetch user answers
+    result = await db.execute(
+        select(Answer).where(
+            and_(
+                Answer.answer_sheet_id == score.answer_sheet_id,
+                Answer.question_id.in_(all_qids),
+            )
+        )
+    )
+    answers_map = {a.question_id: a for a in result.scalars().all()}
+
+    # Get exam question ordering via answer_sheet -> exam_id
+    sheet = (await db.execute(
+        select(AnswerSheet).where(AnswerSheet.id == score.answer_sheet_id)
+    )).scalar_one()
+
+    eq_result = await db.execute(
+        select(ExamQuestion).where(ExamQuestion.exam_id == sheet.exam_id)
+    )
+    order_map = {}
+    override_map = {}
+    for eq in eq_result.scalars().all():
+        order_map[eq.question_id] = eq.order_num
+        if eq.question_type_override:
+            override_map[eq.question_id] = eq.question_type_override
+
+    items = []
+    for detail in score.details:
+        q = questions_map.get(detail.question_id)
+        a = answers_map.get(detail.question_id)
+        if not q:
+            continue
+        qtype = override_map.get(q.id) or (q.question_type.value if hasattr(q.question_type, 'value') else q.question_type)
+        items.append({
+            "score_detail_id": str(detail.id),
+            "question_id": str(q.id),
+            "question_type": qtype,
+            "stem": q.stem,
+            "options": q.options,
+            "correct_answer": q.correct_answer,
+            "explanation": q.explanation,
+            "dimension": q.dimension,
+            "difficulty": q.difficulty,
+            "knowledge_tags": q.knowledge_tags,
+            "user_answer": a.answer_content if a else "",
+            "earned_score": detail.earned_score,
+            "max_score": detail.max_score,
+            "is_correct": detail.is_correct,
+            "feedback": detail.feedback,
+            "order_num": order_map.get(q.id, 0),
+        })
+
+    items.sort(key=lambda x: x["order_num"])
+    return items
+
+
+async def create_complaint(
+    db: AsyncSession,
+    score_detail_id: uuid.UUID,
+    user_id: uuid.UUID,
+    reason: str,
+):
+    """Create a score complaint for a specific question."""
+    from app.models.score import ScoreComplaint, ComplaintStatus, ScoreDetail as SD
+
+    # Verify score_detail exists
+    detail = (await db.execute(
+        select(SD).where(SD.id == score_detail_id)
+    )).scalar_one_or_none()
+    if not detail:
+        raise ValueError("评分详情不存在")
+
+    # Check for duplicate pending complaint
+    existing = (await db.execute(
+        select(ScoreComplaint).where(
+            and_(
+                ScoreComplaint.score_detail_id == score_detail_id,
+                ScoreComplaint.user_id == user_id,
+                ScoreComplaint.status == ComplaintStatus.PENDING,
+            )
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise ValueError("您已对该题提交过投诉，请等待处理")
+
+    complaint = ScoreComplaint(
+        score_detail_id=score_detail_id,
+        user_id=user_id,
+        reason=reason,
+    )
+    db.add(complaint)
+    await db.flush()
+    return complaint
+
+
+async def list_complaints(
+    db: AsyncSession,
+    skip: int = 0,
+    limit: int = 50,
+    status_filter: Optional[str] = None,
+) -> tuple[list[dict], int]:
+    """List all complaints with context (admin view)."""
+    from app.models.score import ScoreComplaint, ScoreDetail as SD
+    from app.models.user import User
+
+    base = (
+        select(
+            ScoreComplaint,
+            SD.question_id,
+            SD.earned_score,
+            SD.max_score,
+            Question.stem,
+            Question.question_type,
+            User.username,
+            User.full_name,
+        )
+        .join(SD, ScoreComplaint.score_detail_id == SD.id)
+        .join(Question, SD.question_id == Question.id)
+        .join(User, ScoreComplaint.user_id == User.id)
+    )
+    count_base = (
+        select(func.count(ScoreComplaint.id))
+        .select_from(ScoreComplaint)
+    )
+
+    if status_filter:
+        base = base.where(ScoreComplaint.status == status_filter)
+        count_base = count_base.where(ScoreComplaint.status == status_filter)
+
+    total = (await db.execute(count_base)).scalar() or 0
+    result = await db.execute(
+        base.order_by(ScoreComplaint.created_at.desc()).offset(skip).limit(limit)
+    )
+
+    items = []
+    for row in result.all():
+        c = row[0]
+        items.append({
+            "id": str(c.id),
+            "score_detail_id": str(c.score_detail_id),
+            "user_id": str(c.user_id),
+            "username": row.username,
+            "full_name": row.full_name,
+            "question_stem": row.stem[:80] if row.stem else "",
+            "question_type": row.question_type.value if hasattr(row.question_type, 'value') else row.question_type,
+            "earned_score": row.earned_score,
+            "max_score": row.max_score,
+            "reason": c.reason,
+            "status": c.status.value if hasattr(c.status, 'value') else c.status,
+            "reply": c.reply,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+        })
+
+    return items, total
+
+
+async def handle_complaint(
+    db: AsyncSession,
+    complaint_id: uuid.UUID,
+    new_status: str,
+    reply: str = "",
+):
+    """Handle a complaint: accept or reject with reply."""
+    from app.models.score import ScoreComplaint, ComplaintStatus
+
+    complaint = (await db.execute(
+        select(ScoreComplaint).where(ScoreComplaint.id == complaint_id)
+    )).scalar_one_or_none()
+    if not complaint:
+        raise ValueError("投诉不存在")
+
+    try:
+        complaint.status = ComplaintStatus(new_status)
+    except ValueError:
+        raise ValueError(f"无效的状态: {new_status}")
+
+    complaint.reply = reply
+    await db.flush()
+    return complaint
+
+
 def _generate_recommendations(dim_analysis: dict, weak_dims: list) -> list[str]:
     """Generate learning recommendations based on performance."""
     recs = []
