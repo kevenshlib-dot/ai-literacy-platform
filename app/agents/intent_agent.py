@@ -11,6 +11,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
+from app.core.llm_config import get_llm_config_sync, make_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -72,14 +73,15 @@ SYSTEM_PROMPT = """你是一个智能组卷参数解析器。根据用户的自�
 
 def parse_intent_via_llm(description: str) -> dict:
     """Use LLM to parse natural language intent into structured parameters."""
-    if settings.LLM_API_KEY == "your-api-key":
+    _cfg = get_llm_config_sync("question_generation")
+    if _cfg.api_key == "your-api-key":
         logger.info("LLM API key not configured, using rule-based parsing")
         return _rule_based_parse(description)
 
     try:
-        client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
+        client = make_openai_client(_cfg)
         response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
+            model=_cfg.model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": description},

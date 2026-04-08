@@ -44,16 +44,28 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '题库管理', roles: ['admin', 'organizer', 'reviewer'] },
       },
       {
+        path: 'papers',
+        name: 'Papers',
+        component: () => import('@/views/Papers.vue'),
+        meta: { title: '试卷管理', roles: ['admin', 'organizer'] },
+      },
+      {
+        path: 'papers/archive',
+        name: 'PaperArchive',
+        component: () => import('@/views/PaperArchive.vue'),
+        meta: { title: '试卷归档', roles: ['admin', 'organizer'] },
+      },
+      {
+        path: 'papers/:id/edit',
+        name: 'PaperEditor',
+        component: () => import('@/views/PaperEditor.vue'),
+        meta: { title: '编辑试卷', roles: ['admin', 'organizer'] },
+      },
+      {
         path: 'exams',
         name: 'Exams',
         component: () => import('@/views/Exams.vue'),
-        meta: { title: '考试管理', roles: ['admin', 'organizer'] },
-      },
-      {
-        path: 'take-exam',
-        name: 'TakeExam',
-        component: () => import('@/views/TakeExam.vue'),
-        meta: { title: '在线考试', roles: ['admin', 'organizer', 'reviewer', 'examinee'] },
+        meta: { title: '考试管理', roles: ['admin', 'organizer', 'reviewer', 'examinee'] },
       },
       {
         path: 'scores',
@@ -66,6 +78,12 @@ const routes: RouteRecordRaw[] = [
         name: 'Users',
         component: () => import('@/views/Users.vue'),
         meta: { title: '用户管理', roles: ['admin'] },
+      },
+      {
+        path: 'system-config',
+        name: 'SystemConfig',
+        component: () => import('@/views/SystemConfig.vue'),
+        meta: { title: '系统管理', roles: ['admin'] },
       },
     ],
   },
@@ -99,7 +117,7 @@ router.beforeEach((to, _from, next) => {
     const userRole = savedUserInfo ? JSON.parse(savedUserInfo).role : null
     if (userRole && !roles.includes(userRole)) {
       // Redirect to default page for their role
-      const defaultRoute = userRole === 'examinee' ? 'TakeExam' : 'Dashboard'
+      const defaultRoute = userRole === 'examinee' ? 'Exams' : 'Dashboard'
       next({ name: defaultRoute })
       return
     }

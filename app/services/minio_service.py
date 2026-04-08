@@ -1,14 +1,19 @@
-"""MinIO object storage service for file upload and management."""
+"""Object storage service — MinIO with local filesystem fallback.
+
+When MinIO is available, files are stored in MinIO.
+When MinIO is unavailable (e.g. Docker not running), falls back to local
+filesystem at ./storage/ for development convenience.
+"""
 import io
+import os
 import uuid
 from datetime import timedelta
-
-from minio import Minio
-from minio.error import S3Error
+from pathlib import Path
 
 from app.core.config import settings
 
-# File format to extension mapping
+# ── Format / MIME / size constants ────────────────────────────────────────────
+
 FORMAT_EXTENSIONS = {
     "pdf": [".pdf"],
     "word": [".doc", ".docx"],
@@ -21,7 +26,6 @@ FORMAT_EXTENSIONS = {
     "json": [".json"],
 }
 
-# MIME type to format mapping
 MIME_TO_FORMAT = {
     "application/pdf": "pdf",
     "application/msword": "word",
@@ -47,21 +51,37 @@ MIME_TO_FORMAT = {
     "audio/aac": "audio",
 }
 
-# Max file size per format (in bytes)
 MAX_FILE_SIZES = {
-    "pdf": 100 * 1024 * 1024,      # 100MB
-    "word": 50 * 1024 * 1024,       # 50MB
-    "markdown": 10 * 1024 * 1024,   # 10MB
-    "html": 10 * 1024 * 1024,       # 10MB
-    "image": 20 * 1024 * 1024,      # 20MB
-    "video": 500 * 1024 * 1024,     # 500MB
-    "audio": 200 * 1024 * 1024,     # 200MB
-    "csv": 50 * 1024 * 1024,        # 50MB
-    "json": 50 * 1024 * 1024,       # 50MB
+    "pdf": 100 * 1024 * 1024,
+    "word": 50 * 1024 * 1024,
+    "markdown": 10 * 1024 * 1024,
+    "html": 10 * 1024 * 1024,
+    "image": 20 * 1024 * 1024,
+    "video": 500 * 1024 * 1024,
+    "audio": 200 * 1024 * 1024,
+    "csv": 50 * 1024 * 1024,
+    "json": 50 * 1024 * 1024,
 }
 
+# ── Local storage root (fallback when MinIO is unavailable) ───────────────────
+LOCAL_STORAGE_ROOT = Path(__file__).resolve().parent.parent.parent / "storage"
 
-def get_minio_client() -> Minio:
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _minio_available() -> bool:
+    """Quick check if MinIO is reachable."""
+    import socket
+    host, port = settings.MINIO_HOST, settings.MINIO_PORT
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def get_minio_client():
+    from minio import Minio
     return Minio(
         settings.MINIO_ENDPOINT,
         access_key=settings.MINIO_ACCESS_KEY,
@@ -70,7 +90,7 @@ def get_minio_client() -> Minio:
     )
 
 
-def ensure_bucket(client: Minio, bucket_name: str = None):
+def ensure_bucket(client, bucket_name: str = None):
     bucket = bucket_name or settings.MINIO_BUCKET
     if not client.bucket_exists(bucket):
         client.make_bucket(bucket)
@@ -78,10 +98,8 @@ def ensure_bucket(client: Minio, bucket_name: str = None):
 
 
 def detect_format(filename: str, content_type: str = None) -> str:
-    """Detect material format from filename extension or MIME type."""
     if content_type and content_type in MIME_TO_FORMAT:
         return MIME_TO_FORMAT[content_type]
-
     ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     for fmt, extensions in FORMAT_EXTENSIONS.items():
         if ext in extensions:
@@ -89,13 +107,15 @@ def detect_format(filename: str, content_type: str = None) -> str:
     raise ValueError(f"不支持的文件格式: {filename}")
 
 
+# ── Upload ────────────────────────────────────────────────────────────────────
+
 async def upload_file(
     file_data: bytes,
     filename: str,
     content_type: str,
     user_id: str,
 ) -> dict:
-    """Upload a file to MinIO and return storage metadata."""
+    """Upload a file — MinIO first, local fallback if MinIO is down."""
     fmt = detect_format(filename, content_type)
     file_size = len(file_data)
 
@@ -107,17 +127,21 @@ async def upload_file(
 
     ext = filename.rsplit(".", 1)[-1] if "." in filename else ""
     object_name = f"{user_id}/{fmt}/{uuid.uuid4().hex}.{ext}"
+    bucket = settings.MINIO_BUCKET
 
-    client = get_minio_client()
-    bucket = ensure_bucket(client)
-
-    client.put_object(
-        bucket,
-        object_name,
-        io.BytesIO(file_data),
-        length=file_size,
-        content_type=content_type or "application/octet-stream",
-    )
+    if _minio_available():
+        client = get_minio_client()
+        bucket = ensure_bucket(client)
+        client.put_object(
+            bucket, object_name, io.BytesIO(file_data),
+            length=file_size,
+            content_type=content_type or "application/octet-stream",
+        )
+    else:
+        # Local filesystem fallback
+        dest = LOCAL_STORAGE_ROOT / bucket / object_name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(file_data)
 
     return {
         "file_path": f"{bucket}/{object_name}",
@@ -128,25 +152,41 @@ async def upload_file(
     }
 
 
+# ── Download URL ──────────────────────────────────────────────────────────────
+
 def get_presigned_url(file_path: str, expires: int = 3600) -> str:
-    """Generate a presigned URL for downloading a file."""
     parts = file_path.split("/", 1)
     if len(parts) != 2:
         raise ValueError(f"无效的文件路径: {file_path}")
 
     bucket, object_name = parts
-    client = get_minio_client()
-    return client.presigned_get_object(
-        bucket, object_name, expires=timedelta(seconds=expires)
-    )
 
+    if _minio_available():
+        client = get_minio_client()
+        return client.presigned_get_object(
+            bucket, object_name, expires=timedelta(seconds=expires)
+        )
+
+    # Local fallback — serve via API route (handled elsewhere or static files)
+    local_path = LOCAL_STORAGE_ROOT / bucket / object_name
+    if local_path.exists():
+        return f"/api/v1/materials/files/{bucket}/{object_name}"
+    raise ValueError(f"文件不存在: {file_path}")
+
+
+# ── Delete ────────────────────────────────────────────────────────────────────
 
 def delete_file(file_path: str):
-    """Delete a file from MinIO."""
     parts = file_path.split("/", 1)
     if len(parts) != 2:
         raise ValueError(f"无效的文件路径: {file_path}")
 
     bucket, object_name = parts
-    client = get_minio_client()
-    client.remove_object(bucket, object_name)
+
+    if _minio_available():
+        client = get_minio_client()
+        client.remove_object(bucket, object_name)
+    else:
+        local_path = LOCAL_STORAGE_ROOT / bucket / object_name
+        if local_path.exists():
+            local_path.unlink()

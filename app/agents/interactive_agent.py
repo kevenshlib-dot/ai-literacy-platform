@@ -11,6 +11,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
+from app.core.llm_config import get_llm_config_sync, make_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -91,13 +92,14 @@ def generate_scenario_response(
     user_message: str,
 ) -> dict:
     """Generate next scenario turn using LLM or rule-based fallback."""
-    if settings.LLM_API_KEY == "your-api-key":
+    _cfg = get_llm_config_sync("interactive")
+    if _cfg.api_key == "your-api-key":
         return _rule_based_response(
             scenario, dimension, difficulty, conversation_history, user_message
         )
 
     try:
-        client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
+        client = make_openai_client(_cfg)
 
         system_msg = SCENARIO_SYSTEM_PROMPT.format(
             role_description=role_description or "AI评测教练",
@@ -115,7 +117,7 @@ def generate_scenario_response(
         messages.append({"role": "user", "content": user_message})
 
         response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
+            model=_cfg.model,
             messages=messages,
             temperature=0.7,
             max_tokens=800,
@@ -141,11 +143,12 @@ def generate_session_summary(
     turns: list[dict],
 ) -> dict:
     """Generate final evaluation summary for completed session."""
-    if settings.LLM_API_KEY == "your-api-key":
+    _cfg2 = get_llm_config_sync("interactive")
+    if _cfg2.api_key == "your-api-key":
         return _rule_based_summary(turns)
 
     try:
-        client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
+        client = make_openai_client(_cfg2)
 
         conversation = "\n".join(
             f"{'[AI]' if t['role'] == 'system' else '[考生]'}: {t['content']}"
@@ -153,7 +156,7 @@ def generate_session_summary(
         )
 
         response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
+            model=_cfg2.model,
             messages=[
                 {"role": "system", "content": "你是一个AI素养评测评估专家。"},
                 {"role": "user", "content": SUMMARY_PROMPT.format(

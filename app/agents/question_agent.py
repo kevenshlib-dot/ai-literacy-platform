@@ -9,6 +9,7 @@ from openai import OpenAI
 from httpx import Timeout
 
 from app.core.config import settings
+from app.core.llm_config import get_llm_config_sync, make_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -597,23 +598,21 @@ def generate_questions_via_llm(
 
     Returns list of validated question dicts. Falls back to templates on failure.
     """
-    if settings.LLM_API_KEY == "your-api-key":
+    _cfg = get_llm_config_sync("question_generation")
+    if _cfg.api_key == "your-api-key":
         logger.warning("LLM API key not configured, using template fallback")
         return _template_fallback(content, question_types, count, difficulty, bloom_level)
 
     try:
-        client = OpenAI(
-            api_key=settings.LLM_API_KEY,
-            base_url=settings.LLM_BASE_URL,
-            timeout=Timeout(60.0, connect=10.0),
-        )
+        client = make_openai_client(_cfg)
+
 
         user_prompt = _build_user_prompt(
             content, question_types, count, difficulty, bloom_level, custom_prompt
         )
 
         response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
+            model=_cfg.model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},

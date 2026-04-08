@@ -10,6 +10,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
+from app.core.llm_config import get_llm_config_sync, make_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +47,14 @@ def score_subjective_answer(
 
     Returns dict with earned_score, is_correct, and feedback.
     """
-    if settings.LLM_API_KEY == "your-api-key":
+    _cfg = get_llm_config_sync("scoring")
+    if _cfg.api_key == "your-api-key":
         return _rule_based_scoring(
             stem, correct_answer, student_answer, question_type, max_score
         )
 
     try:
-        client = OpenAI(
-            api_key=settings.LLM_API_KEY,
-            base_url=settings.LLM_BASE_URL,
-        )
+        client = make_openai_client(_cfg)
 
         rubric_text = ""
         if rubric:
@@ -69,7 +68,7 @@ def score_subjective_answer(
 请评分并给出反馈。"""
 
         response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
+            model=_cfg.model,
             messages=[
                 {"role": "system", "content": SCORING_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
@@ -220,9 +219,10 @@ def _single_evaluator_score(
 满分：{max_score}"""
 
     try:
-        client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
+        _cfg = get_llm_config_sync("scoring")
+        client = make_openai_client(_cfg)
         response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
+            model=_cfg.model,
             messages=[
                 {"role": "system", "content": PANEL_SYSTEM_PROMPT.format(
                     position_instruction=position_instruction
@@ -271,7 +271,7 @@ def multi_model_score(
             },
         }
 
-    if settings.LLM_API_KEY == "your-api-key":
+    if get_llm_config_sync("scoring").api_key == "your-api-key":
         return _rule_based_panel_scoring(
             stem, correct_answer, student_answer, question_type, max_score, num_evaluators
         )

@@ -174,7 +174,7 @@ async function handleRegister() {
         is_active: data.user.is_active,
       })
       message.success('注册成功')
-      router.push({ name: 'TakeExam' })
+      router.push({ name: 'Exams' })
     }
   } catch (err: any) {
     // Error already handled by response interceptor

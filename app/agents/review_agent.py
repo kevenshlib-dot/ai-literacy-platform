@@ -14,6 +14,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
+from app.core.llm_config import get_llm_config_sync, make_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -60,17 +61,15 @@ def ai_review_question(
 
     Returns a review dict with scores, recommendation, and comments.
     """
-    if settings.LLM_API_KEY == "your-api-key":
+    _cfg = get_llm_config_sync("review")
+    if _cfg.api_key == "your-api-key":
         logger.warning("LLM API key not configured, using rule-based review")
         return _rule_based_review(
             stem, options, correct_answer, explanation, question_type, difficulty, dimension
         )
 
     try:
-        client = OpenAI(
-            api_key=settings.LLM_API_KEY,
-            base_url=settings.LLM_BASE_URL,
-        )
+        client = make_openai_client(_cfg)
 
         question_text = f"""题型：{question_type}
 难度：{difficulty}/5
@@ -81,7 +80,7 @@ def ai_review_question(
 解析：{explanation or '无'}"""
 
         response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
+            model=_cfg.model,
             messages=[
                 {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
                 {"role": "user", "content": f"请审核以下题目：\n\n{question_text}"},

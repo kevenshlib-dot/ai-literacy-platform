@@ -10,6 +10,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
+from app.core.llm_config import get_llm_config_sync, make_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -35,15 +36,16 @@ ANNOTATION_PROMPT = """你是一个AI素养评测专家。请分析以下教学�
 
 def auto_annotate_content(content: str, title: Optional[str] = None) -> dict:
     """Auto-annotate material content using LLM or rule-based fallback."""
-    if settings.LLM_API_KEY == "your-api-key":
+    _cfg = get_llm_config_sync("annotation")
+    if _cfg.api_key == "your-api-key":
         return _rule_based_annotation(content, title)
 
     try:
-        client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
+        client = make_openai_client(_cfg)
         user_msg = f"标题：{title or '未命名'}\n\n内容：{content[:2000]}"
 
         response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
+            model=_cfg.model,
             messages=[
                 {"role": "system", "content": ANNOTATION_PROMPT},
                 {"role": "user", "content": user_msg},

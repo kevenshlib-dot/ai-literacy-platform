@@ -93,7 +93,7 @@ async function handleLogin() {
     })
     message.success('登录成功')
     // Examinees go straight to exam page, others to dashboard
-    const target = data.user.role === 'examinee' ? 'TakeExam' : 'Dashboard'
+    const target = data.user.role === 'examinee' ? 'Exams' : 'Dashboard'
     router.push({ name: target })
   } catch (err: any) {
     // Error already handled by response interceptor
