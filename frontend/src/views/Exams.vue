@@ -126,7 +126,7 @@
     <template v-else>
       <div class="page-container">
         <div class="page-header">
-          <h2>可用试卷</h2>
+          <h2>考试管理</h2>
           <a-space>
             <a-button size="small" style="background: #1f4e79; color: #fff; border-color: #1f4e79" @click="showRandomTestModal">
               <ThunderboltOutlined /> 测试一下？

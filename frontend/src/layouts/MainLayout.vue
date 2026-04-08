@@ -130,7 +130,7 @@ const allMenuItems: MenuItem[] = [
   { key: 'Materials', label: '素材管理', icon: FolderOutlined, roles: ['admin'] },
   { key: 'Questions', label: '题库管理', icon: FileTextOutlined, roles: ['admin', 'organizer', 'reviewer'] },
   { key: 'Papers', label: '试卷管理', icon: SnippetsOutlined, roles: ['admin', 'organizer'] },
-  { key: 'Exams', label: '可用试卷', icon: FormOutlined, roles: ['admin', 'organizer', 'reviewer', 'examinee'] },
+  { key: 'Exams', label: '考试管理', icon: FormOutlined, roles: ['admin', 'organizer', 'reviewer', 'examinee'] },
   { key: 'Scores', label: '成绩管理', icon: BarChartOutlined, roles: ['admin', 'organizer', 'reviewer', 'examinee'] },
   { key: 'Users', label: '用户管理', icon: TeamOutlined, roles: ['admin'] },
   { key: 'SystemConfig', label: '系统管理', icon: SettingOutlined, roles: ['admin'] },
