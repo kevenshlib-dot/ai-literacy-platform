@@ -1,7 +1,7 @@
 <template>
   <div class="page-container">
     <div class="page-header">
-      <h2>工作台</h2>
+      <h2>工作面板</h2>
     </div>
 
     <!-- Stats Cards -->

@@ -126,7 +126,7 @@ interface MenuItem {
 
 const allMenuItems: MenuItem[] = [
   { key: 'Home', label: '首页', icon: HomeOutlined, roles: ['admin', 'organizer', 'reviewer'] },
-  { key: 'Dashboard', label: '工作台', icon: DashboardOutlined, roles: ['admin', 'organizer', 'reviewer'] },
+  { key: 'Dashboard', label: '工作面板', icon: DashboardOutlined, roles: ['admin', 'organizer', 'reviewer'] },
   { key: 'Materials', label: '素材管理', icon: FolderOutlined, roles: ['admin'] },
   { key: 'Questions', label: '题库管理', icon: FileTextOutlined, roles: ['admin', 'organizer', 'reviewer'] },
   { key: 'Papers', label: '试卷管理', icon: SnippetsOutlined, roles: ['admin', 'organizer'] },
