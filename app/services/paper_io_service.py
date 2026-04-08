@@ -218,6 +218,14 @@ async def _resolve_or_create_question(
     )
     existing = result.scalar_one_or_none()
     if existing:
+        # Update correct_answer if it was missing and now available
+        new_answer = q_data.get("correct_answer", "")
+        if new_answer and (not existing.correct_answer or existing.correct_answer.strip() == ""):
+            existing.correct_answer = new_answer
+        # Also update explanation if missing
+        new_explanation = q_data.get("explanation")
+        if new_explanation and not existing.explanation:
+            existing.explanation = new_explanation
         return existing
 
     # Create new question in draft status

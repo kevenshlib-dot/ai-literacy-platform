@@ -23,6 +23,7 @@ from app.schemas.exam import (
     IntentAssembleResponse,
 )
 from app.services import exam_service
+from app.services import paper_service
 from app.agents.intent_agent import parse_intent_via_llm
 
 router = APIRouter(prefix="/exams", tags=["考试管理"])
@@ -220,13 +221,27 @@ async def delete_exam(
     await db.commit()
 
 
+@router.post("/{exam_id}/sync-overrides")
+async def sync_exam_overrides(
+    exam_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    """Sync question_type_override from source paper to this exam."""
+    updated = await paper_service.sync_exam_overrides(db, exam_id)
+    await db.commit()
+    return {"updated": updated}
+
+
 @router.post("/{exam_id}/publish", response_model=ExamResponse)
 async def publish_exam(
     exam_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "organizer"])),
 ):
-    """Publish an exam (must have questions)."""
+    """Publish an exam (must have questions). Auto-syncs overrides from source paper."""
+    # Auto-sync question_type_override from source paper before publishing
+    await paper_service.sync_exam_overrides(db, exam_id)
     try:
         exam = await exam_service.publish_exam(db, exam_id)
     except ValueError as e:

@@ -168,7 +168,7 @@
                   <template #bodyCell="{ column, record, index }">
                     <template v-if="column.key === 'order'">{{ index + 1 }}</template>
                     <template v-if="column.key === 'type'">
-                      <a-tag :color="typeColor(record.question?.question_type)">{{ typeLabel(record.question?.question_type) }}</a-tag>
+                      <a-tag :color="typeColor(record.question_type_override || record.question?.question_type)">{{ typeLabel(record.question_type_override || record.question?.question_type) }}</a-tag>
                     </template>
                     <template v-if="column.key === 'stem'">
                       <div class="stem-cell">
@@ -225,7 +225,7 @@
                 <template #bodyCell="{ column, record, index }">
                   <template v-if="column.key === 'order'">{{ index + 1 }}</template>
                   <template v-if="column.key === 'type'">
-                    <a-tag :color="typeColor(record.question?.question_type)">{{ typeLabel(record.question?.question_type) }}</a-tag>
+                    <a-tag :color="typeColor(record.question_type_override || record.question?.question_type)">{{ typeLabel(record.question_type_override || record.question?.question_type) }}</a-tag>
                   </template>
                   <template v-if="column.key === 'stem'">
                     <div class="stem-cell">
@@ -671,6 +671,11 @@ async function handleImport() {
     importModal.visible = false
     importModal.fileList = []
     await fetchPapers()
+    // Show warnings about missing answers
+    if (data?.warnings?.length) {
+      const warnCount = data.warnings.length
+      message.warning(`⚠️ 有 ${warnCount} 道客观题缺少正确答案，请在试卷编辑器中手动设置`, 8)
+    }
     // Auto-open the imported paper's detail
     if (data && data.id) {
       message.success(`导入成功：「${data.title || '试卷'}」，已打开详情`)

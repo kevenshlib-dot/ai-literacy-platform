@@ -1,7 +1,10 @@
 """Score service - handles scoring, grading, and report generation."""
+import logging
 import uuid
 from collections import defaultdict
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,12 +24,25 @@ def _score_objective(
     question: Question,
     answer_content: str,
     max_score: float,
+    effective_type: str = "",
+    correct_answer: str = "",
 ) -> dict:
     """Score an objective question by comparing answers."""
-    correct = question.correct_answer.strip().upper()
+    raw_correct = correct_answer or question.correct_answer or ""
+    correct = raw_correct.strip().upper()
     student = answer_content.strip().upper() if answer_content else ""
 
-    qtype = question.question_type.value if hasattr(question.question_type, 'value') else question.question_type
+    # Use effective_type (which includes override) if provided; fall back to original
+    qtype = effective_type or (question.question_type.value if hasattr(question.question_type, 'value') else question.question_type)
+
+    # If correct answer is missing, cannot auto-score — flag for manual review
+    if not correct:
+        logger.warning(f"Question {question.id} ({qtype}) has no correct_answer, cannot auto-score")
+        return {
+            "earned_score": 0.0,
+            "is_correct": None,
+            "feedback": f"⚠️ 该题缺少标准答案，无法自动评分。考生作答：{student or '（未作答）'}",
+        }
 
     if qtype == "multiple_choice":
         correct_set = set(correct)
@@ -96,14 +112,18 @@ async def score_answer_sheet(
         answer_content = ans.answer_content if ans else ""
         max_score = eq.score
 
-        qtype = question.question_type.value if hasattr(question.question_type, 'value') else question.question_type
+        orig_type = question.question_type.value if hasattr(question.question_type, 'value') else question.question_type
+        # Use question_type_override from exam_question if set
+        qtype = eq.question_type_override or orig_type
+        # Use correct_answer_override if set, otherwise fall back to original
+        effective_correct_answer = eq.correct_answer_override or question.correct_answer or ""
 
         if qtype in OBJECTIVE_TYPES:
-            result = _score_objective(question, answer_content, max_score)
+            result = _score_objective(question, answer_content, max_score, effective_type=qtype, correct_answer=effective_correct_answer)
         else:
             result = score_subjective_answer(
                 stem=question.stem,
-                correct_answer=question.correct_answer,
+                correct_answer=effective_correct_answer,
                 student_answer=answer_content,
                 question_type=qtype,
                 max_score=max_score,

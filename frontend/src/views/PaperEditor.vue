@@ -90,7 +90,16 @@
                   class="question-row"
                 >
                   <div class="question-order">{{ qi + 1 }}</div>
-                  <a-tag :color="typeColor(pq.question_type)">{{ typeLabel(pq.question_type) }}</a-tag>
+                  <a-select
+                    :value="effectiveType(pq)"
+                    size="small"
+                    style="width: 80px"
+                    @change="(val: string) => changeQuestionType(pq, val)"
+                  >
+                    <a-select-option v-for="opt in TYPE_OPTIONS" :key="opt.value" :value="opt.value">
+                      {{ opt.label }}
+                    </a-select-option>
+                  </a-select>
                   <div class="question-stem" @click="toggleExpand(pq.id)">
                     {{ truncate(pq.stem || pq.stem_override || '', 60) }}
                   </div>
@@ -128,7 +137,15 @@
                         <a-textarea v-model:value="pq.stem_override" :rows="2" placeholder="留空则使用原题干" @blur="updateQuestionOverride(pq)" />
                       </a-form-item>
                       <a-form-item label="选项覆盖 (options_override, JSON)">
-                        <a-textarea v-model:value="pq.options_override_str" :rows="2" placeholder='留空则使用原选项，例: ["A. xxx","B. xxx"]' @blur="updateQuestionOverride(pq)" />
+                        <a-textarea v-model:value="pq.options_override_str" :rows="2" placeholder='留空则使用原选项，例: {"A":"xxx","B":"xxx"}' @blur="updateQuestionOverride(pq)" />
+                      </a-form-item>
+                      <a-form-item v-if="needsAnswerOverride(pq)" label="正确答案">
+                        <a-radio-group v-if="effectiveType(pq) === 'true_false'" v-model:value="pq.correct_answer_override" @change="updateCorrectAnswerOverride(pq)">
+                          <a-radio value="A">A. 正确 (True)</a-radio>
+                          <a-radio value="B">B. 错误 (False)</a-radio>
+                        </a-radio-group>
+                        <a-input v-else v-model:value="pq.correct_answer_override" placeholder="如单选填 A，多选填 ACD" @blur="updateCorrectAnswerOverride(pq)" />
+                        <div class="answer-hint">原答案: {{ pq.correct_answer || '（无）' }}</div>
                       </a-form-item>
                     </a-form>
                   </div>
@@ -153,7 +170,16 @@
                 class="question-row"
               >
                 <div class="question-order">{{ qi + 1 }}</div>
-                <a-tag :color="typeColor(pq.question_type)">{{ typeLabel(pq.question_type) }}</a-tag>
+                <a-select
+                  :value="effectiveType(pq)"
+                  size="small"
+                  style="width: 80px"
+                  @change="(val: string) => changeQuestionType(pq, val)"
+                >
+                  <a-select-option v-for="opt in TYPE_OPTIONS" :key="opt.value" :value="opt.value">
+                    {{ opt.label }}
+                  </a-select-option>
+                </a-select>
                 <div class="question-stem" @click="toggleExpand(pq.id)">
                   {{ truncate(pq.stem || pq.stem_override || '', 60) }}
                 </div>
@@ -190,7 +216,15 @@
                       <a-textarea v-model:value="pq.stem_override" :rows="2" placeholder="留空则使用原题干" @blur="updateQuestionOverride(pq)" />
                     </a-form-item>
                     <a-form-item label="选项覆盖 (options_override, JSON)">
-                      <a-textarea v-model:value="pq.options_override_str" :rows="2" placeholder='留空则使用原选项，例: ["A. xxx","B. xxx"]' @blur="updateQuestionOverride(pq)" />
+                      <a-textarea v-model:value="pq.options_override_str" :rows="2" placeholder='留空则使用原选项，例: {"A":"xxx","B":"xxx"}' @blur="updateQuestionOverride(pq)" />
+                    </a-form-item>
+                    <a-form-item v-if="needsAnswerOverride(pq)" label="正确答案">
+                      <a-radio-group v-if="effectiveType(pq) === 'true_false'" v-model:value="pq.correct_answer_override" @change="updateCorrectAnswerOverride(pq)">
+                        <a-radio value="A">A. 正确 (True)</a-radio>
+                        <a-radio value="B">B. 错误 (False)</a-radio>
+                      </a-radio-group>
+                      <a-input v-else v-model:value="pq.correct_answer_override" placeholder="如单选填 A，多选填 ACD" @blur="updateCorrectAnswerOverride(pq)" />
+                      <div class="answer-hint">原答案: {{ pq.correct_answer || '（无）' }}</div>
                     </a-form-item>
                   </a-form>
                 </div>
@@ -389,6 +423,9 @@ interface PaperQuestion {
   score: number
   order_num: number
   question_type: string
+  question_type_override: string | null
+  correct_answer: string
+  correct_answer_override: string | null
   stem: string
   stem_override: string | null
   options_override: any | null
@@ -416,8 +453,11 @@ const TYPE_MAP: Record<string, { label: string; color: string }> = {
   essay:           { label: '论述', color: 'red' },
 }
 
+const TYPE_OPTIONS = Object.entries(TYPE_MAP).map(([value, { label }]) => ({ value, label }))
+
 function typeLabel(t: string) { return TYPE_MAP[t]?.label ?? t }
 function typeColor(t: string) { return TYPE_MAP[t]?.color ?? 'default' }
+function effectiveType(pq: PaperQuestion) { return pq.question_type_override || pq.question_type }
 function truncate(s: string, len: number) {
   if (!s) return ''
   return s.length > len ? s.slice(0, len) + '...' : s
@@ -488,6 +528,9 @@ async function loadPaper() {
       score: q.score ?? 0,
       order_num: q.order_num ?? 0,
       question_type: q.question?.question_type || '',
+      question_type_override: q.question_type_override || null,
+      correct_answer: q.question?.correct_answer || '',
+      correct_answer_override: q.correct_answer_override || null,
       stem: q.question?.stem || '',
       stem_override: q.stem_override || null,
       options_override: q.options_override || null,
@@ -567,6 +610,53 @@ async function updateQuestionScore(pq: PaperQuestion) {
     await request.put(`/papers/questions/${pq.id}`, {
       score: pq.score,
     })
+  } catch { /* handled */ }
+}
+
+const OBJECTIVE_TYPES = new Set(['single_choice', 'multiple_choice', 'true_false'])
+
+function needsAnswerOverride(pq: PaperQuestion): boolean {
+  // Show answer override input when type is changed to an objective type
+  const etype = effectiveType(pq)
+  return OBJECTIVE_TYPES.has(etype) && (pq.question_type_override !== null || !pq.correct_answer)
+}
+
+async function changeQuestionType(pq: PaperQuestion, newType: string) {
+  const override = newType === pq.question_type ? null : newType
+  pq.question_type_override = override
+  // If changing to true_false, try to auto-detect correct answer from stem
+  if (override === 'true_false' && !pq.correct_answer_override) {
+    const stem = (pq.stem || '').trim()
+    // Simple heuristic: if stem contains clear true/false indicator, auto-fill
+    if (stem.endsWith('（×）') || stem.endsWith('(×)') || stem.endsWith('（错）') || stem.endsWith('(F)')) {
+      pq.correct_answer_override = 'B'
+    } else if (stem.endsWith('（√）') || stem.endsWith('(√)') || stem.endsWith('（对）') || stem.endsWith('(T)')) {
+      pq.correct_answer_override = 'A'
+    }
+  }
+  // If reverting to original type, clear the answer override too
+  if (!override) {
+    pq.correct_answer_override = null
+  }
+  try {
+    await request.put(`/papers/questions/${pq.id}`, {
+      question_type_override: override,
+      correct_answer_override: pq.correct_answer_override,
+    })
+    message.success('题型已修改')
+    // Auto-expand to show answer setting
+    if (override && OBJECTIVE_TYPES.has(override)) {
+      expandedQuestion.value = pq.id
+    }
+  } catch { /* handled */ }
+}
+
+async function updateCorrectAnswerOverride(pq: PaperQuestion) {
+  try {
+    await request.put(`/papers/questions/${pq.id}`, {
+      correct_answer_override: pq.correct_answer_override || null,
+    })
+    message.success('正确答案已保存')
   } catch { /* handled */ }
 }
 
@@ -892,6 +982,12 @@ onMounted(() => {
   width: 100%;
   padding: 12px 0 4px;
   border-top: 1px dashed #e8e8e8;
+  margin-top: 4px;
+}
+
+.answer-hint {
+  font-size: 12px;
+  color: #999;
   margin-top: 4px;
 }
 

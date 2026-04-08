@@ -377,6 +377,8 @@ async def update_paper_question_endpoint(
         section_id=body.section_id,
         options_override=body.options_override,
         stem_override=body.stem_override,
+        question_type_override=body.question_type_override,
+        correct_answer_override=body.correct_answer_override,
     )
     if not pq:
         raise HTTPException(status_code=404, detail="试卷题目不存在")
@@ -493,10 +495,17 @@ async def import_paper_from_file(
         else:
             raise ValueError(f"不支持的文件格式: .{ext}，仅支持 .docx 和 .json")
 
+        # Extract warnings before import (they are not part of the paper format)
+        warnings = parsed.pop("warnings", [])
+
         paper = await import_paper(db, parsed, current_user.id)
         await db.commit()
         await db.refresh(paper)
-        return PaperResponse.model_validate(paper)
+
+        response = PaperResponse.model_validate(paper).model_dump()
+        if warnings:
+            response["warnings"] = warnings
+        return response
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

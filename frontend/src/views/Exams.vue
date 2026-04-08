@@ -126,7 +126,7 @@
     <template v-else>
       <div class="page-container">
         <div class="page-header">
-          <h2>考试管理</h2>
+          <h2>可用试卷</h2>
           <a-space>
             <a-button size="small" style="background: #1f4e79; color: #fff; border-color: #1f4e79" @click="showRandomTestModal">
               <ThunderboltOutlined /> 测试一下？
@@ -179,7 +179,7 @@
                   <a-popconfirm title="确定重新开放此考试？" @confirm="reactivateExam(record)" v-if="record.status === 'closed'">
                     <a style="color: #52c41a">重���开放</a>
                   </a-popconfirm>
-                  <a-popconfirm title="确定删除此考试？" @confirm="deleteExam(record)" v-if="record.status === 'closed'">
+                  <a-popconfirm title="确定删除此考试？" @confirm="deleteExam(record)" v-if="record.status === 'closed' || record.status === 'published' || record.status === 'draft'">
                     <a style="color: #ff4d4f">删除</a>
                   </a-popconfirm>
                 </a-space>

@@ -205,11 +205,14 @@ async def get_exam_session_data(
 
     questions = []
     for eq, q in eq_result.all():
+        # Use question_type_override from exam_question if set, otherwise fall back to original
+        orig_type = q.question_type.value if hasattr(q.question_type, 'value') else q.question_type
+        effective_type = eq.question_type_override or orig_type
         questions.append({
             "question_id": str(q.id),
             "order_num": eq.order_num,
             "score": eq.score,
-            "question_type": q.question_type.value if hasattr(q.question_type, 'value') else q.question_type,
+            "question_type": effective_type,
             "stem": q.stem,
             "options": q.options,
             "difficulty": q.difficulty,

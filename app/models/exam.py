@@ -64,5 +64,7 @@ class ExamQuestion(Base):
     )
     order_num: Mapped[int] = mapped_column(Integer, nullable=False)
     score: Mapped[float] = mapped_column(Float, default=5.0)
+    question_type_override: Mapped[str] = mapped_column(String(50), nullable=True)
+    correct_answer_override: Mapped[str] = mapped_column(Text, nullable=True)
 
     exam: Mapped["Exam"] = relationship(back_populates="questions")

@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select, func, and_, update
+from sqlalchemy import select, func, and_, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -132,6 +132,12 @@ async def delete_paper(db: AsyncSession, paper_id: uuid.UUID) -> bool:
         return False
     if paper.status not in (PaperStatus.DRAFT, PaperStatus.ARCHIVED):
         raise ValueError("只能删除草稿或已归档的试卷")
+
+    # Detach related exams (set paper_id to NULL) to avoid FK constraint error
+    await db.execute(
+        update(Exam).where(Exam.paper_id == paper_id).values(paper_id=None)
+    )
+
     await db.delete(paper)
     await db.flush()
     return True
@@ -517,8 +523,15 @@ async def update_paper_question(
     pq = result.scalar_one_or_none()
     if not pq:
         return None
+    # Fields that can be explicitly set to None (cleared)
+    nullable_fields = {"stem_override", "options_override", "question_type_override", "correct_answer_override"}
     for key, value in kwargs.items():
-        if value is not None and hasattr(pq, key):
+        if not hasattr(pq, key):
+            continue
+        if key in nullable_fields:
+            # Always apply (even None) if the key was explicitly passed
+            setattr(pq, key, value)
+        elif value is not None:
             setattr(pq, key, value)
     await db.flush()
 
@@ -587,6 +600,7 @@ async def materialize_to_exam(
         time_limit_minutes=paper.time_limit_minutes,
         created_by=created_by or paper.created_by,
         status=ExamStatus.DRAFT,
+        paper_id=paper_id,
         params={"paper_id": str(paper_id)},
     )
     db.add(exam)
@@ -599,6 +613,8 @@ async def materialize_to_exam(
             question_id=pq.question_id,
             order_num=pq.order_num,
             score=pq.score,
+            question_type_override=pq.question_type_override,
+            correct_answer_override=pq.correct_answer_override,
         )
         db.add(eq)
 
@@ -607,6 +623,60 @@ async def materialize_to_exam(
 
     await db.flush()
     return exam
+
+
+async def sync_exam_overrides(db: AsyncSession, exam_id: uuid.UUID) -> int:
+    """Sync question_type_override and correct_answer_override from paper_questions to exam_questions.
+
+    Returns the number of updated records.
+    """
+    exam = await db.execute(select(Exam).where(Exam.id == exam_id))
+    exam_obj = exam.scalar_one_or_none()
+    if not exam_obj or not exam_obj.paper_id:
+        return 0
+
+    # Fetch paper_questions with any overrides
+    pq_result = await db.execute(
+        select(
+            PaperQuestion.question_id,
+            PaperQuestion.question_type_override,
+            PaperQuestion.correct_answer_override,
+        )
+        .where(PaperQuestion.paper_id == exam_obj.paper_id)
+        .where(
+            or_(
+                PaperQuestion.question_type_override.isnot(None),
+                PaperQuestion.correct_answer_override.isnot(None),
+            )
+        )
+    )
+    override_map = {row[0]: (row[1], row[2]) for row in pq_result.all()}
+
+    if not override_map:
+        return 0
+
+    # Update exam_questions
+    updated = 0
+    eq_result = await db.execute(
+        select(ExamQuestion).where(ExamQuestion.exam_id == exam_id)
+    )
+    for eq in eq_result.scalars().all():
+        overrides = override_map.get(eq.question_id)
+        if not overrides:
+            continue
+        type_ov, answer_ov = overrides
+        changed = False
+        if type_ov and eq.question_type_override != type_ov:
+            eq.question_type_override = type_ov
+            changed = True
+        if answer_ov is not None and eq.correct_answer_override != answer_ov:
+            eq.correct_answer_override = answer_ov
+            changed = True
+        if changed:
+            updated += 1
+
+    await db.flush()
+    return updated
 
 
 # ──────────────────────────────────────────────
@@ -653,6 +723,8 @@ async def get_paper_detail(db: AsyncSession, paper_id: uuid.UUID) -> Optional[di
             "score": pq.score,
             "stem_override": pq.stem_override,
             "options_override": pq.options_override,
+            "question_type_override": pq.question_type_override,
+            "correct_answer_override": pq.correct_answer_override,
             "question": _serialize_question(q) if q else None,
         }
 

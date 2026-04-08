@@ -89,6 +89,8 @@ class PaperQuestion(Base):
     score: Mapped[float] = mapped_column(Float, default=5.0)
     options_override: Mapped[dict] = mapped_column(JSONB, nullable=True)
     stem_override: Mapped[str] = mapped_column(Text, nullable=True)
+    question_type_override: Mapped[str] = mapped_column(String(50), nullable=True)
+    correct_answer_override: Mapped[str] = mapped_column(Text, nullable=True)
 
     paper: Mapped["Paper"] = relationship(back_populates="questions")
     section: Mapped["PaperSection"] = relationship(back_populates="questions")

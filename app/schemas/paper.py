@@ -42,6 +42,8 @@ class PaperQuestionAdd(BaseModel):
     order_num: Optional[int] = None
     options_override: Optional[dict] = None
     stem_override: Optional[str] = None
+    question_type_override: Optional[str] = None
+    correct_answer_override: Optional[str] = None
 
 
 class PaperQuestionUpdate(BaseModel):
@@ -50,6 +52,8 @@ class PaperQuestionUpdate(BaseModel):
     section_id: Optional[UUID] = None
     options_override: Optional[dict] = None
     stem_override: Optional[str] = None
+    question_type_override: Optional[str] = None
+    correct_answer_override: Optional[str] = None
 
 
 # --------------- Reorder / Auto-assemble ---------------
@@ -93,6 +97,8 @@ class PaperQuestionResponse(BaseModel):
     score: float
     options_override: Optional[dict] = None
     stem_override: Optional[str] = None
+    question_type_override: Optional[str] = None
+    correct_answer_override: Optional[str] = None
     # Inline question details
     question_type: Optional[str] = None
     stem: Optional[str] = None

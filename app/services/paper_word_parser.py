@@ -35,6 +35,8 @@ SECTION_PATTERNS = [
 QUESTION_TYPE_MAP = {
     "判断题": "true_false",
     "判断": "true_false",
+    "是非题": "true_false",
+    "是非": "true_false",
     "单选题": "single_choice",
     "单选": "single_choice",
     "多选题": "multiple_choice",
@@ -77,6 +79,7 @@ ANSWER_SECTION_PATTERNS = [
     re.compile(r"^评分标准"),
     re.compile(r"^答案[：:\s]"),
     re.compile(r"^【答案】"),
+    re.compile(r"^【.*答案.*】"),  # e.g., 【第一部分：是非题答案】
 ]
 
 TF_ANSWER_PATTERN = re.compile(
@@ -129,7 +132,7 @@ def _is_standalone_type_header(text: str) -> Optional[str]:
     # The text must contain "X题" pattern (e.g., 判断题, 单选题, 简答题)
     # to distinguish from titles like "AI素养综合测试" that happen to contain "综合"
     type_header_pattern = re.compile(
-        r"(?:判断|单选|多选|选择|填空|简答|论述|开放|主观|问答|综合|分析|计算|案例)题"
+        r"(?:判断|是非|单选|多选|选择|填空|简答|论述|开放|主观|问答|综合|分析|计算|案例)题"
     )
     if not type_header_pattern.search(text):
         return None
@@ -292,6 +295,191 @@ def _extract_title(paragraphs: list[str]) -> tuple[str, str, int]:
     return (title, description, content_start)
 
 
+def _extract_answers_from_tables(doc) -> dict[str, dict[int, str]]:
+    """Extract answers from Word document tables.
+
+    Many Chinese exam papers store answer keys in structured tables with columns:
+    ['题号', '正确答案', '解析要点'] or similar.
+
+    This function:
+    1. Finds the "参考答案" header table to identify where answer tables start
+    2. Parses subsequent answer tables, auto-detecting question type from answer format
+    3. Returns answers in the same format as paragraph-based answer parsing
+
+    Returns:
+        dict: section_type -> {question_num: "answer" or "answer|explanation"}
+    """
+    answers: dict[str, dict[int, str]] = {}
+
+    if not doc.tables:
+        return answers
+
+    # Find the answer section start: a table containing "参考答案" or "标准答案"
+    answer_section_start = None
+    for i, table in enumerate(doc.tables):
+        if len(table.rows) == 1:
+            cell_text = table.rows[0].cells[0].text.strip()
+            if any(kw in cell_text for kw in ("参考答案", "标准答案", "答案与解析")):
+                answer_section_start = i
+                break
+
+    if answer_section_start is None:
+        # No answer section header found; try to detect answer tables directly
+        # by looking for tables with '题号' + '正确答案' header
+        for i, table in enumerate(doc.tables):
+            if len(table.rows) >= 2:
+                header_cells = [c.text.strip() for c in table.rows[0].cells]
+                if "题号" in header_cells and any(
+                    kw in " ".join(header_cells) for kw in ("正确答案", "答案")
+                ):
+                    if answer_section_start is None:
+                        answer_section_start = i - 1  # assume previous is header
+
+    if answer_section_start is None:
+        return answers
+
+    # Also try to determine section types from header tables before the answer section
+    # e.g., Table 3: "第一部分：是非题" → first answer table = true_false
+    section_type_order = []
+    for i in range(answer_section_start):
+        table = doc.tables[i]
+        if len(table.rows) == 1:
+            cell_text = table.rows[0].cells[0].text.strip()
+            detected = _detect_question_type(cell_text)
+            if detected:
+                section_type_order.append(detected)
+
+    # Parse answer tables (those after the answer section header with '题号' header)
+    answer_table_idx = 0
+    for i in range(answer_section_start + 1, len(doc.tables)):
+        table = doc.tables[i]
+        if len(table.rows) < 2:
+            continue
+
+        header_cells = [c.text.strip() for c in table.rows[0].cells]
+        if "题号" not in header_cells:
+            continue
+
+        # Find column indices
+        num_col = header_cells.index("题号")
+        ans_col = None
+        exp_col = None
+        for ci, h in enumerate(header_cells):
+            if "答案" in h and ans_col is None:
+                ans_col = ci
+            if "解析" in h and exp_col is None:
+                exp_col = ci
+
+        if ans_col is None:
+            continue
+
+        # Parse data rows
+        table_answers: dict[int, str] = {}
+        detected_type = None
+
+        for row in table.rows[1:]:
+            cells = [c.text.strip() for c in row.cells]
+            if len(cells) <= max(num_col, ans_col):
+                continue
+
+            qnum_str = cells[num_col]
+            if not qnum_str.isdigit():
+                continue
+            qnum = int(qnum_str)
+
+            raw_answer = cells[ans_col]
+            explanation = cells[exp_col] if exp_col is not None and len(cells) > exp_col else ""
+
+            # Detect question type from answer format
+            if raw_answer in ("√", "✓", "对", "T", "Y"):
+                if detected_type is None:
+                    detected_type = "true_false"
+                answer = "A"  # A = 正确
+            elif raw_answer in ("×", "✗", "错", "F", "X", "N"):
+                if detected_type is None:
+                    detected_type = "true_false"
+                answer = "B"  # B = 错误
+            elif "、" in raw_answer or "," in raw_answer:
+                # Multiple choice: "A、C、D" or "A,C,D"
+                if detected_type is None:
+                    detected_type = "multiple_choice"
+                # Extract just the letters
+                answer = re.sub(r"[^A-Fa-f]", "", raw_answer).upper()
+            else:
+                # Single letter or short answer
+                clean = raw_answer.strip().upper()
+                if re.match(r"^[A-F]$", clean):
+                    if detected_type is None:
+                        detected_type = "single_choice"
+                    answer = clean
+                else:
+                    answer = raw_answer
+
+            entry = answer
+            if explanation:
+                entry = answer + "|" + explanation
+
+            table_answers[qnum] = entry
+
+        # Determine final section type
+        if detected_type is None and answer_table_idx < len(section_type_order):
+            detected_type = section_type_order[answer_table_idx]
+
+        if detected_type and table_answers:
+            if detected_type not in answers:
+                answers[detected_type] = {}
+            answers[detected_type].update(table_answers)
+            logger.info(
+                f"Extracted {len(table_answers)} answers from table {i} "
+                f"(type={detected_type})"
+            )
+
+        answer_table_idx += 1
+
+    return answers
+
+
+def _extract_ordered_text(doc) -> list[str]:
+    """Extract all text from the document in document order, including both
+    paragraphs and single-row table cells (which are often used as section headers).
+
+    This ensures section headers stored in tables are not missed by the parser.
+    """
+    from docx.oxml.ns import qn
+
+    texts = []
+    body = doc.element.body
+    for child in body:
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if tag == "p":
+            # Regular paragraph
+            text = child.text or ""
+            # Also get text from runs
+            for r in child.iter(qn("w:t")):
+                pass  # child.text already handled by python-docx
+            # Use python-docx paragraph text extraction
+            from docx.text.paragraph import Paragraph
+            para = Paragraph(child, doc)
+            text = para.text.strip()
+            if text:
+                texts.append(text)
+        elif tag == "tbl":
+            # Table: include small tables (≤3 rows) which are typically
+            # title blocks, section headers, or instruction lines.
+            # Multi-row answer tables (with '题号' header) are handled by
+            # _extract_answers_from_tables separately.
+            from docx.table import Table
+            table = Table(child, doc)
+            num_rows = len(table.rows)
+            if num_rows <= 3:
+                # Small table — extract first cell text from each row
+                for row in table.rows:
+                    cell_text = row.cells[0].text.strip()
+                    if cell_text:
+                        texts.append(cell_text)
+    return texts
+
+
 def parse_word_paper(file_data: bytes, filename: str = "paper.docx") -> dict:
     """Parse a Word document into our standard paper JSON format.
 
@@ -310,11 +498,8 @@ def parse_word_paper(file_data: bytes, filename: str = "paper.docx") -> dict:
     import io
     doc = Document(io.BytesIO(file_data))
 
-    paragraphs = []
-    for p in doc.paragraphs:
-        text = p.text.strip()
-        if text:
-            paragraphs.append(text)
+    # Extract text in document order, including single-row table cells
+    paragraphs = _extract_ordered_text(doc)
 
     if not paragraphs:
         raise ValueError("Word文档内容为空")
@@ -389,6 +574,25 @@ def parse_word_paper(file_data: bytes, filename: str = "paper.docx") -> dict:
                         existing = answers[current_answer_section_type][qnum]
                         if "|" not in existing:
                             answers[current_answer_section_type][qnum] = existing + "|" + exp_match.group(2)
+
+    # 3b. Extract answers from Word document tables (many papers store answers in tables)
+    table_answers = _extract_answers_from_tables(doc)
+    if table_answers:
+        logger.info(f"Found answers in tables: {', '.join(f'{k}={len(v)}' for k, v in table_answers.items())}")
+        # Merge table answers into paragraph answers; table answers take priority
+        # (they tend to be more structured and reliable)
+        for section_type, qnum_map in table_answers.items():
+            if section_type not in answers:
+                answers[section_type] = {}
+            for qnum, ans_entry in qnum_map.items():
+                # Only override if paragraph parsing didn't find an answer for this question
+                if qnum not in answers[section_type] or not answers[section_type][qnum]:
+                    answers[section_type][qnum] = ans_entry
+                else:
+                    # If paragraph had answer without explanation but table has explanation, merge
+                    existing = answers[section_type][qnum]
+                    if "|" not in existing and "|" in ans_entry:
+                        answers[section_type][qnum] = ans_entry
 
     # 4. Parse question sections (before answer section)
     question_paragraphs = paragraphs[:answer_start_idx] if answer_start_idx else paragraphs
@@ -650,4 +854,29 @@ def parse_word_paper(file_data: bytes, filename: str = "paper.docx") -> dict:
             f"Question paragraphs scanned: {len(question_paragraphs) - start_idx}"
         )
 
+    # 9. Check for missing answers and generate warnings
+    warnings = []
+    objective_types = {"single_choice", "multiple_choice", "true_false"}
+    all_questions_list = []
+    for sec in sections:
+        all_questions_list.extend(sec.get("questions", []))
+    all_questions_list.extend(unsectioned_questions)
+
+    missing_answer_count = 0
+    for q_item in all_questions_list:
+        qq = q_item.get("question", {})
+        qtype = qq.get("question_type", "")
+        answer = qq.get("correct_answer", "")
+        if qtype in objective_types and not answer.strip():
+            missing_answer_count += 1
+            warnings.append(
+                f"第{q_item.get('order_num', '?')}题（{qtype}）缺少正确答案，请在导入后手动设置"
+            )
+
+    if missing_answer_count > 0:
+        logger.warning(
+            f"Word paper has {missing_answer_count}/{total_questions} objective questions without correct answers"
+        )
+
+    result["warnings"] = warnings
     return result
