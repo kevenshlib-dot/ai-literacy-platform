@@ -203,11 +203,24 @@ async def test_provider(
         resp = client.chat.completions.create(
             model=payload.model,
             messages=[{"role": "user", "content": "hi"}],
-            max_tokens=5,
+            max_tokens=20,
         )
-        return {"success": True, "model": resp.model}
+        # Qwen3 thinking models may return content=None with reasoning field — still a success
+        content = None
+        if resp.choices:
+            msg = resp.choices[0].message
+            content = getattr(msg, "content", None) or getattr(msg, "reasoning", None)
+        return {"success": True, "model": resp.model, "reply": content}
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"连接失败：{e}")
+        err = str(e)
+        hint = ""
+        if "Connection refused" in err or "connect" in err.lower():
+            hint = " — 请确认服务地址和端口是否正确，服务是否已启动"
+        elif "404" in err or "Not Found" in err:
+            hint = " — 路径不存在，请确认 base_url 末尾包含 /v1"
+        elif "model" in err.lower() and ("not found" in err.lower() or "does not exist" in err.lower()):
+            hint = " — 模型名称与服务端不匹配，请用「获取模型列表」确认名称"
+        raise HTTPException(status_code=502, detail=f"连接失败：{err}{hint}")
 
 
 class ModelsPayload(BaseModel):

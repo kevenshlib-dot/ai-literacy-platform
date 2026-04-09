@@ -83,7 +83,7 @@ ANSWER_SECTION_PATTERNS = [
 ]
 
 TF_ANSWER_PATTERN = re.compile(
-    r"(\d+)[.、．\s]*[：:]?\s*([√×✓✗对错TFXY])",
+    r"(?:第\s*)?(\d+)(?:\s*题)?\s*[.、．]*[：:]?\s*([√×✓✗对错TFXY]|正确|错误)",
 )
 
 MC_ANSWER_PATTERN = re.compile(
@@ -227,13 +227,13 @@ def _is_score_info_line(text: str) -> bool:
 
 
 def _normalize_tf_answer(ans: str) -> str:
-    """Normalize true/false answer to standard format."""
-    ans = ans.strip().upper()
-    if ans in ("√", "✓", "对", "T", "Y"):
-        return "正确"
-    elif ans in ("×", "✗", "错", "F", "X", "N"):
-        return "错误"
-    return ans
+    """Normalize true/false answer to standard T/F format."""
+    a = ans.strip()
+    if a in ("√", "✓", "对", "T", "Y", "正确", "t", "y"):
+        return "T"
+    elif a in ("×", "✗", "错", "F", "X", "N", "错误", "f", "x", "n"):
+        return "F"
+    return a
 
 
 def _extract_title(paragraphs: list[str]) -> tuple[str, str, int]:
@@ -391,14 +391,14 @@ def _extract_answers_from_tables(doc) -> dict[str, dict[int, str]]:
             explanation = cells[exp_col] if exp_col is not None and len(cells) > exp_col else ""
 
             # Detect question type from answer format
-            if raw_answer in ("√", "✓", "对", "T", "Y"):
+            if raw_answer in ("√", "✓", "对", "T", "Y", "正确"):
                 if detected_type is None:
                     detected_type = "true_false"
-                answer = "A"  # A = 正确
-            elif raw_answer in ("×", "✗", "错", "F", "X", "N"):
+                answer = "T"  # T = 正确
+            elif raw_answer in ("×", "✗", "错", "F", "X", "N", "错误"):
                 if detected_type is None:
                     detected_type = "true_false"
-                answer = "B"  # B = 错误
+                answer = "F"  # F = 错误
             elif "、" in raw_answer or "," in raw_answer:
                 # Multiple choice: "A、C、D" or "A,C,D"
                 if detected_type is None:
@@ -541,6 +541,12 @@ def parse_word_paper(file_data: bytes, filename: str = "paper.docx") -> dict:
                     if standalone:
                         current_answer_section_type = standalone
 
+            # Auto-infer section type from line format when no explicit sub-header found
+            if current_answer_section_type is None:
+                # Strict TF symbols only (avoid confusing single-choice "B" etc.)
+                if re.search(r"(?:第\s*)?(\d+)(?:\s*题)?\s*[.、．]*[：:]?\s*([√×✓✗]|正确|错误)", text):
+                    current_answer_section_type = "true_false"
+
             if current_answer_section_type:
                 if current_answer_section_type not in answers:
                     answers[current_answer_section_type] = {}
@@ -567,7 +573,7 @@ def parse_word_paper(file_data: bytes, filename: str = "paper.docx") -> dict:
                             qnum = int(mc_match.group(1))
                             answers[current_answer_section_type][qnum] = mc_match.group(2).upper()
 
-                exp_match = re.search(r"第(\d+)题[：:]\s*(.+)", text)
+                exp_match = re.search(r"第\s*(\d+)\s*题[：:]\s*(.+)", text)
                 if exp_match and current_answer_section_type in answers:
                     qnum = int(exp_match.group(1))
                     if qnum in answers[current_answer_section_type]:
@@ -684,13 +690,15 @@ def parse_word_paper(file_data: bytes, filename: str = "paper.docx") -> dict:
             correct_answer = answer_entry
             explanation = None
 
-        # For true/false, set standard options
-        if effective_qtype == "true_false" and not options:
-            current_question["options"] = {"A": "正确", "B": "错误"}
-            if correct_answer == "正确":
-                correct_answer = "A"
-            elif correct_answer == "错误":
-                correct_answer = "B"
+        # For true/false, set standard options and normalize answer to T/F
+        if effective_qtype == "true_false":
+            if not options:
+                current_question["options"] = {"T": "正确", "F": "错误"}
+            # Normalize legacy A/B or text values
+            if correct_answer in ("正确", "A", "√", "✓", "对"):
+                correct_answer = "T"
+            elif correct_answer in ("错误", "B", "×", "✗", "错"):
+                correct_answer = "F"
 
         # Clean up empty options
         final_options = current_question.get("options") or None

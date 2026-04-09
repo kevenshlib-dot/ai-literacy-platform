@@ -604,29 +604,98 @@
       v-model:open="importModalVisible"
       title="导入题目（Markdown 格式）"
       :footer="null"
-      width="520px"
+      width="580px"
+      @cancel="importPreview = null; importPendingFile = null; importResult = null"
     >
+      <!-- Answer type format hint -->
       <a-alert
         type="info"
         show-icon
         style="margin-bottom: 16px"
-        message="请上传通过本系统导出的 .md 格式题库文件，导入的题目将以草稿状态进入审核流程。"
-      />
-
-      <a-upload-dragger
-        :before-upload="handleImportUpload"
-        :show-upload-list="false"
-        accept=".md"
-        :disabled="importLoading"
+        message="试题类型与答案格式对照"
       >
-        <p class="ant-upload-drag-icon">
-          <UploadOutlined />
-        </p>
-        <p class="ant-upload-text">点击或拖拽 .md 文件到此区域</p>
-        <p class="ant-upload-hint">仅支持 Markdown 格式的题库文件</p>
-      </a-upload-dragger>
+        <template #description>
+          <div style="font-size: 12px; line-height: 1.8">
+            <span style="margin-right: 16px">📌 <b>单选题</b>：答案为单个字母，如 <code>A</code></span>
+            <span style="margin-right: 16px">📌 <b>多选题</b>：答案为多个字母，如 <code>ABD</code></span><br/>
+            <span style="margin-right: 16px">📌 <b>判断题</b>：答案为 <code>T（正确）</code> 或 <code>F（错误）</code></span>
+            <span>📌 <b>填空/简答</b>：答案为文本内容</span>
+          </div>
+        </template>
+      </a-alert>
 
-      <div v-if="importLoading" style="margin-top: 16px; text-align: center">
+      <!-- File picker (show when no file selected yet and no result) -->
+      <template v-if="!importPendingFile && !importResult">
+        <a-upload-dragger
+          :before-upload="handleImportSelect"
+          :show-upload-list="false"
+          accept=".md"
+        >
+          <p class="ant-upload-drag-icon"><UploadOutlined /></p>
+          <p class="ant-upload-text">点击或拖拽 .md 文件到此区域</p>
+          <p class="ant-upload-hint">仅支持 Markdown 格式的题库文件</p>
+        </a-upload-dragger>
+      </template>
+
+      <!-- File selected: preview + confirm -->
+      <template v-if="importPendingFile && !importResult">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px">
+          <a-tag color="blue">{{ importPendingFile.name }}</a-tag>
+          <a-button size="small" type="text" danger @click="importPendingFile = null; importPreview = null">移除</a-button>
+        </div>
+
+        <!-- Pre-analysis -->
+        <a-button
+          :loading="importPreviewing"
+          style="margin-bottom: 12px"
+          @click="handleImportPreview"
+        >
+          <template #icon><SearchOutlined /></template>
+          解析预览（检查题目结构）
+        </a-button>
+
+        <div v-if="importPreview" class="import-preview-block">
+          <a-descriptions :column="2" size="small" bordered style="margin-bottom: 10px">
+            <a-descriptions-item label="共解析题目">{{ importPreview.total }} 道</a-descriptions-item>
+            <a-descriptions-item label="答案问题">
+              <span :style="importPreview.answer_issues.length > 0 ? 'color:#faad14' : 'color:#52c41a'">
+                {{ importPreview.answer_issues.length > 0 ? importPreview.answer_issues.length + ' 处' : '无' }}
+              </span>
+            </a-descriptions-item>
+          </a-descriptions>
+
+          <div style="margin-bottom: 8px; font-weight: 500; font-size: 13px">题型统计</div>
+          <a-table
+            :data-source="importPreview.type_stats"
+            :columns="importPreviewColumns"
+            :pagination="false"
+            size="small"
+            style="margin-bottom: 10px"
+          />
+
+          <a-alert
+            v-if="importPreview.answer_issues.length > 0"
+            type="warning"
+            show-icon
+            :message="`发现 ${importPreview.answer_issues.length} 处答案格式问题，建议修正后再导入`"
+          >
+            <template #description>
+              <div v-for="(issue, i) in importPreview.answer_issues" :key="i" style="font-size: 12px">
+                {{ issue.message }}
+              </div>
+            </template>
+          </a-alert>
+          <a-alert v-else type="success" show-icon message="答案格式检查通过，可以导入" />
+        </div>
+
+        <a-divider style="margin: 12px 0" />
+        <a-button type="primary" :loading="importLoading" block @click="handleImportUpload">
+          确认导入
+        </a-button>
+      </template>
+
+      <!-- Result -->
+      <div v-if="importLoading && !importResult" style="margin-top: 16px; text-align: center">
         <a-spin tip="正在导入..." />
       </div>
 
@@ -637,7 +706,7 @@
         style="margin-top: 16px; padding: 16px 0"
       >
         <template #extra>
-          <a-button type="primary" @click="importModalVisible = false; importResult = null; fetchQuestions()">
+          <a-button type="primary" @click="importModalVisible = false; importResult = null; importPendingFile = null; importPreview = null; fetchQuestions()">
             查看题目列表
           </a-button>
         </template>
@@ -1240,23 +1309,60 @@ function batchDelete() {
 // ---- Import / Export ----
 const importModalVisible = ref(false)
 const importLoading = ref(false)
+const importPreviewing = ref(false)
 const importResult = ref<any>(null)
+const importPendingFile = ref<File | null>(null)
+const importPreview = ref<any>(null)
+
+const importPreviewColumns = [
+  { title: '题型', dataIndex: 'label', key: 'label' },
+  { title: '题数', dataIndex: 'count', key: 'count', width: 70 },
+  { title: '示例答案', dataIndex: 'sample_answer', key: 'sample_answer', width: 100 },
+]
 
 function showImportModal() {
   importResult.value = null
+  importPendingFile.value = null
+  importPreview.value = null
   importModalVisible.value = true
 }
 
-async function handleImportUpload(file: File) {
+function handleImportSelect(file: File) {
+  importPendingFile.value = file
+  importPreview.value = null
+  return false // prevent default upload
+}
+
+async function handleImportPreview() {
+  if (!importPendingFile.value) return
+  importPreviewing.value = true
+  try {
+    const formData = new FormData()
+    formData.append('file', importPendingFile.value)
+    const data: any = await request.post('/questions/batch/preview-md', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    importPreview.value = data
+  } catch (e: any) {
+    message.error(e?.response?.data?.detail || '预览失败')
+  } finally {
+    importPreviewing.value = false
+  }
+}
+
+async function handleImportUpload() {
+  if (!importPendingFile.value) return
   importLoading.value = true
   importResult.value = null
   try {
     const formData = new FormData()
-    formData.append('file', file)
+    formData.append('file', importPendingFile.value)
     const data: any = await request.post('/questions/batch/import-md', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
     importResult.value = data
+    importPendingFile.value = null
+    importPreview.value = null
     if (data.imported > 0) {
       message.success(`成功导入 ${data.imported} 道题目`)
     }
@@ -1265,7 +1371,6 @@ async function handleImportUpload(file: File) {
   } finally {
     importLoading.value = false
   }
-  return false // prevent default upload behaviour
 }
 
 async function exportSelectedMd() {
@@ -1543,6 +1648,14 @@ onMounted(() => {
 </script>
 
 <style scoped>
+.import-preview-block {
+  background: #fafafa;
+  border: 1px solid #e8e8e8;
+  border-radius: 6px;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
 .page-container {
   padding: 0;
 }

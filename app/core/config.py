@@ -4,10 +4,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     # Application
     APP_NAME: str = "AI素养评测平台"
-    APP_VERSION: str = "0.1.0"
+    APP_VERSION: str = "2.2.1"
     DEBUG: bool = True
     SECRET_KEY: str = "change-this"
     API_V1_PREFIX: str = "/api/v1"
+    APP_PORT: int = 8080
 
     # PostgreSQL
     POSTGRES_HOST: str = "localhost"

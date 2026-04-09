@@ -270,7 +270,7 @@ SYSTEM_PROMPT = """\
 {"question_type": "multiple_choice", "dimension": "AI技术应用", "stem": "以下哪些属于深度学习的常见应用？", "options": {"A": "图像识别", "B": "自然语言处理", "C": "手动数据录入", "D": "语音识别"}, "correct_answer": "ABD", "explanation": "深度学习广泛应用于图像识别、NLP和语音识别，手动数据录入不属于深度学习应用。", "knowledge_tags": ["深度学习", "应用场景"]}
 
 ### 判断题 (true_false)
-{"question_type": "true_false", "dimension": "AI基础知识", "stem": "监督学习需要使用带标签的训练数据。", "options": {"A": "正确", "B": "错误"}, "correct_answer": "A", "explanation": "监督学习的核心就是利用带有标签的数据来训练模型。", "knowledge_tags": ["监督学习"]}
+{"question_type": "true_false", "dimension": "AI基础知识", "stem": "监督学习需要使用带标签的训练数据。", "options": {"T": "正确", "F": "错误"}, "correct_answer": "T", "explanation": "监督学习的核心就是利用带有标签的数据来训练模型。", "knowledge_tags": ["监督学习"]}
 
 ### 填空题 (fill_blank)
 {"question_type": "fill_blank", "dimension": "AI基础知识", "stem": "神经网络中，用于引入非线性变换的函数称为____函数。", "options": null, "correct_answer": "激活", "explanation": "激活函数（如ReLU、Sigmoid等）为神经网络引入非线性。", "knowledge_tags": ["神经网络", "激活函数"]}
@@ -283,7 +283,7 @@ SYSTEM_PROMPT = """\
 1. **options 字段的键必须是大写字母 A/B/C/D**，不得使用中文键或数字键
 2. **单选题 correct_answer** 只能是单个大写字母：A、B、C 或 D
 3. **多选题 correct_answer** 是多个大写字母的拼接（按字母排序）：AB、AC、ABC、ABD、ACD、ABCD 等
-4. **判断题 correct_answer** 只能是 A（正确）或 B（错误）
+4. **判断题 correct_answer** 只能是 T（正确）或 F（错误）
 5. **填空题和简答题** 的 options 必须为 null
 6. **explanation 必须提供**，不能为空，且应解释为什么正确答案对、其他选项错
 7. **stem 必须完整**，语句通顺，不能截断
@@ -514,7 +514,7 @@ def _validate_and_fix_question(raw: dict, requested_types: list[str]) -> Optiona
         if not options or not isinstance(options, dict):
             # 判断题可以自动补充
             if qt == "true_false":
-                options = {"A": "正确", "B": "错误"}
+                options = {"T": "正确", "F": "错误"}
             else:
                 logger.warning(f"选择题缺少有效 options，已丢弃: {stem[:30]}")
                 return None
@@ -788,8 +788,8 @@ def _template_fallback(
             "question_type": "true_false",
             "dimension": dim,
             "stem": sent + "。",
-            "options": {"A": "正确", "B": "错误"},
-            "correct_answer": "A",
+            "options": {"T": "正确", "F": "错误"},
+            "correct_answer": "T",
             "explanation": "该描述正确。" + sent + "是AI领域公认的基本事实。",
             "knowledge_tags": ["AI素养", "基础判断"],
         }
@@ -799,8 +799,8 @@ def _template_fallback(
             "question_type": "true_false",
             "dimension": "AI伦理安全",
             "stem": "AI技术的所有应用都不需要人类进行任何形式的监督和审核。",
-            "options": {"A": "正确", "B": "错误"},
-            "correct_answer": "B",
+            "options": {"T": "正确", "F": "错误"},
+            "correct_answer": "F",
             "explanation": "该说法错误。虽然AI技术可以自动化许多任务，但在关键决策、伦理审查等方面仍需要人类监督，这是负责任AI的基本原则。",
             "knowledge_tags": ["AI伦理", "人机协作"],
         }
@@ -810,8 +810,8 @@ def _template_fallback(
             "question_type": "true_false",
             "dimension": "AI基础知识",
             "stem": "机器学习模型的性能完全取决于算法的先进程度，与训练数据的质量无关。",
-            "options": {"A": "正确", "B": "错误"},
-            "correct_answer": "B",
+            "options": {"T": "正确", "F": "错误"},
+            "correct_answer": "F",
             "explanation": "该说法错误。数据质量对模型性能有至关重要的影响，'垃圾进，垃圾出'（Garbage In, Garbage Out）是机器学习的基本准则。",
             "knowledge_tags": ["机器学习", "数据质量"],
         }

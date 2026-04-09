@@ -603,8 +603,8 @@
         <!-- True/False -->
         <div v-if="currentTrainingQuestion.question_type === 'true_false'">
           <a-radio-group v-model:value="trainingAnswers[trainingCurrentIndex]" style="width: 100%">
-            <div style="margin-bottom: 12px"><a-radio value="A">A. 正确</a-radio></div>
-            <div style="margin-bottom: 12px"><a-radio value="B">B. 错误</a-radio></div>
+            <div style="margin-bottom: 12px"><a-radio value="T">T. 正确</a-radio></div>
+            <div style="margin-bottom: 12px"><a-radio value="F">F. 错误</a-radio></div>
           </a-radio-group>
         </div>
 

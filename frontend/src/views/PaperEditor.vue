@@ -133,18 +133,45 @@
                   <!-- Expandable override editing -->
                   <div v-if="expandedQuestion === pq.id" class="question-expand" @click.stop>
                     <a-form layout="vertical" size="small">
-                      <a-form-item label="题干覆盖 (stem_override)">
-                        <a-textarea v-model:value="pq.stem_override" :rows="2" placeholder="留空则使用原题干" @blur="updateQuestionOverride(pq)" />
+                      <a-form-item label="题干">
+                        <a-textarea v-model:value="pq.stem_override" :rows="3" :placeholder="pq.stem || '留空则使用原题干'" @blur="updateQuestionOverride(pq)" />
+                        <div v-if="pq.stem && pq.stem_override && pq.stem_override !== pq.stem" class="answer-hint">原题干: {{ pq.stem }}</div>
                       </a-form-item>
-                      <a-form-item label="选项覆盖 (options_override, JSON)">
-                        <a-textarea v-model:value="pq.options_override_str" :rows="2" placeholder='留空则使用原选项，例: {"A":"xxx","B":"xxx"}' @blur="updateQuestionOverride(pq)" />
-                      </a-form-item>
-                      <a-form-item v-if="needsAnswerOverride(pq)" label="正确答案">
+                      <template v-if="hasOptionsType(pq)">
+                        <a-form-item label="选项">
+                          <a-row :gutter="[8, 8]">
+                            <a-col v-for="key in optionKeys(pq)" :key="key" :span="12">
+                              <a-input
+                                :addon-before="key"
+                                v-model:value="pq.editOptions[key]"
+                                size="small"
+                                @blur="commitOptionsEdit(pq)"
+                              />
+                            </a-col>
+                          </a-row>
+                        </a-form-item>
+                      </template>
+                      <a-form-item label="正确答案">
                         <a-radio-group v-if="effectiveType(pq) === 'true_false'" v-model:value="pq.correct_answer_override" @change="updateCorrectAnswerOverride(pq)">
-                          <a-radio value="A">A. 正确 (True)</a-radio>
-                          <a-radio value="B">B. 错误 (False)</a-radio>
+                          <a-radio value="T">T. 正确</a-radio>
+                          <a-radio value="F">F. 错误</a-radio>
                         </a-radio-group>
-                        <a-input v-else v-model:value="pq.correct_answer_override" placeholder="如单选填 A，多选填 ACD" @blur="updateCorrectAnswerOverride(pq)" />
+                        <template v-else-if="effectiveType(pq) === 'single_choice'">
+                          <a-radio-group v-model:value="pq.correct_answer_override" @change="updateCorrectAnswerOverride(pq)">
+                            <a-radio v-for="key in optionKeys(pq)" :key="key" :value="key">{{ key }}</a-radio>
+                          </a-radio-group>
+                        </template>
+                        <template v-else-if="effectiveType(pq) === 'multiple_choice'">
+                          <a-checkbox-group v-model:value="pq.multiAnswerSelected" @change="onMultiAnswerChange(pq)">
+                            <a-checkbox v-for="key in optionKeys(pq)" :key="key" :value="key">{{ key }}</a-checkbox>
+                          </a-checkbox-group>
+                        </template>
+                        <a-input
+                          v-else
+                          v-model:value="pq.correct_answer_override"
+                          placeholder="输入答案内容"
+                          @blur="updateCorrectAnswerOverride(pq)"
+                        />
                         <div class="answer-hint">原答案: {{ pq.correct_answer || '（无）' }}</div>
                       </a-form-item>
                     </a-form>
@@ -212,18 +239,45 @@
 
                 <div v-if="expandedQuestion === pq.id" class="question-expand" @click.stop>
                   <a-form layout="vertical" size="small">
-                    <a-form-item label="题干覆盖 (stem_override)">
-                      <a-textarea v-model:value="pq.stem_override" :rows="2" placeholder="留空则使用原题干" @blur="updateQuestionOverride(pq)" />
+                    <a-form-item label="题干">
+                      <a-textarea v-model:value="pq.stem_override" :rows="3" :placeholder="pq.stem || '留空则使用原题干'" @blur="updateQuestionOverride(pq)" />
+                      <div v-if="pq.stem && pq.stem_override && pq.stem_override !== pq.stem" class="answer-hint">原题干: {{ pq.stem }}</div>
                     </a-form-item>
-                    <a-form-item label="选项覆盖 (options_override, JSON)">
-                      <a-textarea v-model:value="pq.options_override_str" :rows="2" placeholder='留空则使用原选项，例: {"A":"xxx","B":"xxx"}' @blur="updateQuestionOverride(pq)" />
-                    </a-form-item>
-                    <a-form-item v-if="needsAnswerOverride(pq)" label="正确答案">
+                    <template v-if="hasOptionsType(pq)">
+                      <a-form-item label="选项">
+                        <a-row :gutter="[8, 8]">
+                          <a-col v-for="key in optionKeys(pq)" :key="key" :span="12">
+                            <a-input
+                              :addon-before="key"
+                              v-model:value="pq.editOptions[key]"
+                              size="small"
+                              @blur="commitOptionsEdit(pq)"
+                            />
+                          </a-col>
+                        </a-row>
+                      </a-form-item>
+                    </template>
+                    <a-form-item label="正确答案">
                       <a-radio-group v-if="effectiveType(pq) === 'true_false'" v-model:value="pq.correct_answer_override" @change="updateCorrectAnswerOverride(pq)">
-                        <a-radio value="A">A. 正确 (True)</a-radio>
-                        <a-radio value="B">B. 错误 (False)</a-radio>
+                        <a-radio value="A">A. 正确</a-radio>
+                        <a-radio value="B">B. 错误</a-radio>
                       </a-radio-group>
-                      <a-input v-else v-model:value="pq.correct_answer_override" placeholder="如单选填 A，多选填 ACD" @blur="updateCorrectAnswerOverride(pq)" />
+                      <template v-else-if="effectiveType(pq) === 'single_choice'">
+                        <a-radio-group v-model:value="pq.correct_answer_override" @change="updateCorrectAnswerOverride(pq)">
+                          <a-radio v-for="key in optionKeys(pq)" :key="key" :value="key">{{ key }}</a-radio>
+                        </a-radio-group>
+                      </template>
+                      <template v-else-if="effectiveType(pq) === 'multiple_choice'">
+                        <a-checkbox-group v-model:value="pq.multiAnswerSelected" @change="onMultiAnswerChange(pq)">
+                          <a-checkbox v-for="key in optionKeys(pq)" :key="key" :value="key">{{ key }}</a-checkbox>
+                        </a-checkbox-group>
+                      </template>
+                      <a-input
+                        v-else
+                        v-model:value="pq.correct_answer_override"
+                        placeholder="输入答案内容"
+                        @blur="updateCorrectAnswerOverride(pq)"
+                      />
                       <div class="answer-hint">原答案: {{ pq.correct_answer || '（无）' }}</div>
                     </a-form-item>
                   </a-form>
@@ -428,8 +482,13 @@ interface PaperQuestion {
   correct_answer_override: string | null
   stem: string
   stem_override: string | null
+  options: any | null
   options_override: any | null
   options_override_str: string
+  // Parsed editable options for UI (merged override or original)
+  editOptions: Record<string, string>
+  // For multiple_choice answer editing
+  multiAnswerSelected: string[]
 }
 
 interface Section {
@@ -521,21 +580,33 @@ async function loadPaper() {
       allQuestions.push({ ...q, section_id: null })
     }
 
-    paperQuestions.value = allQuestions.map((q: any) => ({
-      id: q.id,
-      question_id: q.question_id,
-      section_id: q.section_id || null,
-      score: q.score ?? 0,
-      order_num: q.order_num ?? 0,
-      question_type: q.question?.question_type || '',
-      question_type_override: q.question_type_override || null,
-      correct_answer: q.question?.correct_answer || '',
-      correct_answer_override: q.correct_answer_override || null,
-      stem: q.question?.stem || '',
-      stem_override: q.stem_override || null,
-      options_override: q.options_override || null,
-      options_override_str: q.options_override ? JSON.stringify(q.options_override) : '',
-    }))
+    paperQuestions.value = allQuestions.map((q: any) => {
+      const origOptions = q.question?.options || null
+      const overrideOptions = q.options_override || null
+      const mergedOptions: Record<string, string> = { ...(origOptions || {}), ...(overrideOptions || {}) }
+      const effectiveAnswer = q.correct_answer_override || q.question?.correct_answer || ''
+      const qtype = q.question_type_override || q.question?.question_type || ''
+      return {
+        id: q.id,
+        question_id: q.question_id,
+        section_id: q.section_id || null,
+        score: q.score ?? 0,
+        order_num: q.order_num ?? 0,
+        question_type: q.question?.question_type || '',
+        question_type_override: q.question_type_override || null,
+        correct_answer: q.question?.correct_answer || '',
+        correct_answer_override: q.correct_answer_override || null,
+        stem: q.question?.stem || '',
+        stem_override: q.stem_override || null,
+        options: origOptions,
+        options_override: overrideOptions,
+        options_override_str: overrideOptions ? JSON.stringify(overrideOptions) : '',
+        editOptions: mergedOptions,
+        multiAnswerSelected: qtype === 'multiple_choice'
+          ? effectiveAnswer.split('').filter((c: string) => /[A-Z]/i.test(c)).map((c: string) => c.toUpperCase())
+          : [],
+      }
+    })
   } catch { /* handled by interceptor */ }
   finally { loading.value = false }
 }
@@ -614,11 +685,43 @@ async function updateQuestionScore(pq: PaperQuestion) {
 }
 
 const OBJECTIVE_TYPES = new Set(['single_choice', 'multiple_choice', 'true_false'])
+const OPTIONS_TYPES = new Set(['single_choice', 'multiple_choice'])
 
 function needsAnswerOverride(pq: PaperQuestion): boolean {
-  // Show answer override input when type is changed to an objective type
   const etype = effectiveType(pq)
   return OBJECTIVE_TYPES.has(etype) && (pq.question_type_override !== null || !pq.correct_answer)
+}
+
+function hasOptionsType(pq: PaperQuestion): boolean {
+  return OPTIONS_TYPES.has(effectiveType(pq))
+}
+
+function optionKeys(pq: PaperQuestion): string[] {
+  const merged = { ...(pq.options || {}), ...(pq.editOptions || {}) }
+  const keys = Object.keys(merged).filter(k => k.length === 1 && /[A-Z]/i.test(k))
+  if (keys.length === 0) return ['A', 'B', 'C', 'D']
+  return keys.sort()
+}
+
+async function commitOptionsEdit(pq: PaperQuestion) {
+  // Build the override from editOptions — only include non-empty entries
+  const override: Record<string, string> = {}
+  for (const [k, v] of Object.entries(pq.editOptions)) {
+    if (v && v.trim()) override[k] = v.trim()
+  }
+  pq.options_override = Object.keys(override).length > 0 ? override : null
+  pq.options_override_str = pq.options_override ? JSON.stringify(pq.options_override) : ''
+  try {
+    await request.put(`/papers/questions/${pq.id}`, {
+      options_override: pq.options_override,
+    })
+    message.success('选项已保存')
+  } catch { /* handled */ }
+}
+
+function onMultiAnswerChange(pq: PaperQuestion) {
+  pq.correct_answer_override = pq.multiAnswerSelected.sort().join('')
+  updateCorrectAnswerOverride(pq)
 }
 
 async function changeQuestionType(pq: PaperQuestion, newType: string) {
@@ -637,6 +740,13 @@ async function changeQuestionType(pq: PaperQuestion, newType: string) {
   // If reverting to original type, clear the answer override too
   if (!override) {
     pq.correct_answer_override = null
+  }
+  // Sync multiAnswerSelected when switching to multiple_choice
+  if (override === 'multiple_choice' || pq.question_type === 'multiple_choice') {
+    const answer = pq.correct_answer_override || pq.correct_answer || ''
+    pq.multiAnswerSelected = answer.split('').filter((c: string) => /[A-Z]/i.test(c)).map((c: string) => c.toUpperCase())
+  } else {
+    pq.multiAnswerSelected = []
   }
   try {
     await request.put(`/papers/questions/${pq.id}`, {
@@ -661,21 +771,11 @@ async function updateCorrectAnswerOverride(pq: PaperQuestion) {
 }
 
 async function updateQuestionOverride(pq: PaperQuestion) {
-  let optionsOverride = null
-  if (pq.options_override_str && pq.options_override_str.trim()) {
-    try {
-      optionsOverride = JSON.parse(pq.options_override_str)
-    } catch {
-      message.warning('选项覆盖 JSON 格式不正确')
-      return
-    }
-  }
   try {
     await request.put(`/papers/questions/${pq.id}`, {
       stem_override: pq.stem_override || null,
-      options_override: optionsOverride,
     })
-    message.success('已更新')
+    message.success('题干已保存')
   } catch { /* handled */ }
 }
 

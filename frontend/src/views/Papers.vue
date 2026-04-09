@@ -371,8 +371,26 @@
       v-model:open="importModal.visible"
       title="导入试卷"
       :footer="null"
-      :width="480"
+      :width="600"
+      @cancel="importModal.preview = null; importModal.fileList = []"
     >
+      <!-- Answer type format hint box -->
+      <a-alert
+        type="info"
+        show-icon
+        style="margin-bottom: 16px"
+        message="试题类型与答案格式对照"
+      >
+        <template #description>
+          <div style="font-size: 12px; line-height: 1.8">
+            <span style="margin-right: 16px">📌 <b>单选题</b>：答案为单个字母，如 <code>A</code></span>
+            <span style="margin-right: 16px">📌 <b>多选题</b>：答案为多个字母，如 <code>ABD</code></span><br/>
+            <span style="margin-right: 16px">📌 <b>判断题</b>：答案为 <code>T（正确）</code> 或 <code>F（错误）</code></span>
+            <span>📌 <b>填空/简答</b>：答案为文本内容</span>
+          </div>
+        </template>
+      </a-alert>
+
       <a-form layout="vertical">
         <a-form-item label="选择试卷文件" required>
           <a-upload
@@ -380,12 +398,61 @@
             :file-list="importModal.fileList"
             :max-count="1"
             accept=".json,.docx"
-            @remove="importModal.fileList = []"
+            @remove="() => { importModal.fileList = []; importModal.preview = null }"
           >
             <a-button><UploadOutlined /> 选择文件</a-button>
           </a-upload>
           <div class="upload-hint">支持 Word (.docx) 和 JSON 格式文件</div>
         </a-form-item>
+
+        <!-- Pre-analysis button + results -->
+        <a-form-item v-if="importModal.fileList.length > 0">
+          <a-button
+            :loading="importModal.previewing"
+            :disabled="importModal.previewing"
+            @click="handleImportPreview"
+            style="margin-bottom: 12px"
+          >
+            <template #icon><SearchOutlined /></template>
+            解析预览（检查试卷结构）
+          </a-button>
+
+          <!-- Preview result -->
+          <div v-if="importModal.preview" class="import-preview">
+            <a-descriptions :column="2" size="small" bordered style="margin-bottom: 10px">
+              <a-descriptions-item label="试卷标题" :span="2">{{ importModal.preview.title }}</a-descriptions-item>
+              <a-descriptions-item label="总题数">{{ importModal.preview.total_questions }}</a-descriptions-item>
+              <a-descriptions-item label="分节数">{{ importModal.preview.sections.length }}</a-descriptions-item>
+            </a-descriptions>
+
+            <div style="margin-bottom: 8px; font-weight: 500; font-size: 13px">题型统计</div>
+            <a-table
+              :data-source="importModal.preview.type_stats"
+              :columns="previewTypeColumns"
+              :pagination="false"
+              size="small"
+              style="margin-bottom: 10px"
+            />
+
+            <!-- Answer issues -->
+            <div v-if="importModal.preview.answer_issues.length > 0">
+              <a-alert
+                type="warning"
+                show-icon
+                :message="`发现 ${importModal.preview.answer_issues.length} 处答案格式问题，请检查后再导入`"
+                style="margin-bottom: 8px"
+              >
+                <template #description>
+                  <div v-for="(issue, i) in importModal.preview.answer_issues" :key="i" style="font-size: 12px">
+                    {{ issue.message }}
+                  </div>
+                </template>
+              </a-alert>
+            </div>
+            <a-alert v-else type="success" show-icon message="答案格式检查通过，可以导入" />
+          </div>
+        </a-form-item>
+
         <a-form-item>
           <a-button
             type="primary"
@@ -394,7 +461,7 @@
             @click="handleImport"
             block
           >
-            导入
+            确认导入
           </a-button>
         </a-form-item>
       </a-form>
@@ -650,12 +717,44 @@ function goAssemble(record: any) {
 const importModal = reactive({
   visible: false,
   loading: false,
+  previewing: false,
   fileList: [] as any[],
+  preview: null as null | {
+    title: string
+    total_questions: number
+    sections: any[]
+    type_stats: any[]
+    answer_issues: any[]
+    warnings: string[]
+  },
 })
+
+const previewTypeColumns = [
+  { title: '题型', dataIndex: 'label', key: 'label' },
+  { title: '题数', dataIndex: 'count', key: 'count', width: 70 },
+  { title: '示例答案', dataIndex: 'sample_answer', key: 'sample_answer', width: 100 },
+]
 
 function handleImportBeforeUpload(file: any) {
   importModal.fileList = [file]
+  importModal.preview = null
   return false
+}
+
+async function handleImportPreview() {
+  if (importModal.fileList.length === 0) return
+  importModal.previewing = true
+  try {
+    const file = importModal.fileList[0]
+    const formData = new FormData()
+    formData.append('file', file)
+    const data: any = await request.post('/papers/preview-file', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    importModal.preview = data
+  } catch { /* handled by interceptor */ } finally {
+    importModal.previewing = false
+  }
 }
 
 async function handleImport() {
@@ -670,6 +769,7 @@ async function handleImport() {
     })
     importModal.visible = false
     importModal.fileList = []
+    importModal.preview = null
     await fetchPapers()
     // Show warnings about missing answers
     if (data?.warnings?.length) {
@@ -827,6 +927,13 @@ onMounted(() => { fetchPapers() })
   margin-top: 8px;
   font-size: 12px;
   color: var(--text-hint);
+}
+
+.import-preview {
+  background: #fafafa;
+  border: 1px solid #e8e8e8;
+  border-radius: 6px;
+  padding: 12px;
 }
 
 .modal-hint {

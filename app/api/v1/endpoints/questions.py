@@ -414,6 +414,71 @@ async def batch_export_md(
     )
 
 
+@router.post("/batch/preview-md")
+async def batch_preview_md(
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    """Parse a Markdown question file and return structure analysis WITHOUT saving.
+
+    Returns type statistics and answer-format validation warnings.
+    """
+    if not file.filename or not file.filename.endswith(".md"):
+        raise HTTPException(status_code=400, detail="仅支持 .md 文件")
+
+    content = await file.read()
+    try:
+        md_text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="文件编码错误，请使用 UTF-8")
+
+    parsed = parse_md_to_questions(md_text)
+    if not parsed:
+        raise HTTPException(status_code=400, detail="未能从文件中解析出任何题目")
+
+    TYPE_LABELS = {
+        "single_choice": "单选题",
+        "multiple_choice": "多选题",
+        "true_false": "判断题",
+        "fill_blank": "填空题",
+        "short_answer": "简答题",
+        "essay": "论述题",
+        "sjt": "情境判断题",
+    }
+
+    type_stats: dict[str, dict] = {}
+    answer_issues: list[dict] = []
+
+    for idx, q in enumerate(parsed, 1):
+        qt = q.get("question_type", "unknown")
+        answer = (q.get("correct_answer") or "").strip()
+
+        if qt not in type_stats:
+            type_stats[qt] = {"label": TYPE_LABELS.get(qt, qt), "count": 0, "sample_answer": answer}
+        type_stats[qt]["count"] += 1
+
+        issue = None
+        if qt == "single_choice":
+            if len(answer) > 1:
+                issue = f'第{idx}题（单选题）答案"{answer}"含多个字符，单选题答案应为单个字母'
+        elif qt == "multiple_choice":
+            if len(answer) == 1:
+                issue = f'第{idx}题（多选题）答案"{answer}"只有1个字母，多选题通常有2个以上选项'
+        elif qt == "true_false":
+            valid_tf = {"a", "b", "对", "错", "√", "×", "正确", "错误", "true", "false", "t", "f", "是", "否"}
+            if answer.lower() not in valid_tf and answer:
+                issue = f'第{idx}题（判断题）答案"{answer}"格式不标准（期望 T/F 或 对/错/√/×）'
+
+        if issue:
+            answer_issues.append({"question_index": idx, "message": issue})
+
+    return {
+        "total": len(parsed),
+        "type_stats": list(type_stats.values()),
+        "answer_issues": answer_issues,
+    }
+
+
 @router.post("/batch/import-md")
 async def batch_import_md(
     file: UploadFile = File(...),

@@ -510,6 +510,111 @@ async def import_paper_from_file(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.post("/preview-file")
+async def preview_paper_file(
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    """Parse a paper file and return structure analysis WITHOUT saving.
+
+    Returns a preview with:
+    - Paper title, section count, total question count
+    - Per-section question breakdown by type
+    - Answer type validation warnings (e.g. single_choice with multi-letter answer)
+    """
+    filename = file.filename or "paper"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    file_data = await file.read()
+
+    if not file_data:
+        raise HTTPException(status_code=400, detail="上传文件不能为空")
+
+    try:
+        if ext in ("docx", "doc"):
+            from app.services.paper_word_parser import parse_word_paper
+            parsed = parse_word_paper(file_data, filename)
+        elif ext == "json":
+            import json as json_lib
+            try:
+                parsed = json_lib.loads(file_data.decode("utf-8"))
+            except (json_lib.JSONDecodeError, UnicodeDecodeError) as e:
+                raise ValueError(f"JSON解析失败: {e}")
+        else:
+            raise ValueError(f"不支持的文件格式: .{ext}，仅支持 .docx 和 .json")
+
+        warnings = list(parsed.pop("warnings", []))
+
+        paper_data = parsed.get("paper", parsed)
+        title = paper_data.get("title", "未命名试卷")
+
+        # Collect all questions from sections and unsectioned
+        all_questions: list[dict] = []
+        sections_summary: list[dict] = []
+
+        for sec in paper_data.get("sections", []):
+            qs = sec.get("questions", [])
+            all_questions.extend(qs)
+            sec_types: dict[str, int] = {}
+            for q in qs:
+                qt = (q.get("question") or q).get("question_type", "unknown")
+                sec_types[qt] = sec_types.get(qt, 0) + 1
+            sections_summary.append({"title": sec.get("title", ""), "count": len(qs), "types": sec_types})
+
+        for q in paper_data.get("unsectioned_questions", []):
+            all_questions.append(q)
+
+        # Build type statistics
+        TYPE_LABELS = {
+            "single_choice": "单选题",
+            "multiple_choice": "多选题",
+            "true_false": "判断题",
+            "fill_blank": "填空题",
+            "short_answer": "简答题",
+            "essay": "论述题",
+            "sjt": "情境判断题",
+        }
+
+        type_stats: dict[str, dict] = {}
+        answer_issues: list[dict] = []
+
+        for idx, pq in enumerate(all_questions, 1):
+            q = pq.get("question") or pq
+            qt = q.get("question_type", "unknown")
+            answer = (q.get("correct_answer") or "").strip()
+
+            if qt not in type_stats:
+                type_stats[qt] = {"label": TYPE_LABELS.get(qt, qt), "count": 0, "sample_answer": answer}
+            type_stats[qt]["count"] += 1
+
+            # Validate answer format vs question type
+            issue = None
+            if qt == "single_choice":
+                if len(answer) > 1:
+                    issue = f'第{idx}题（单选题）答案"{answer}"含多个字符，单选题答案应为单个字母'
+            elif qt == "multiple_choice":
+                if len(answer) == 1:
+                    issue = f'第{idx}题（多选题）答案"{answer}"只有1个字母，多选题通常有2个以上选项'
+            elif qt == "true_false":
+                valid_tf = {"a", "b", "对", "错", "√", "×", "正确", "错误", "true", "false", "t", "f", "是", "否"}
+                if answer.lower() not in valid_tf and answer:
+                    issue = f'第{idx}题（判断题）答案"{answer}"格式不标准（期望 T/F 或 对/错/√/×）'
+
+            if issue:
+                answer_issues.append({"question_index": idx, "message": issue})
+                warnings.append(issue)
+
+        return {
+            "title": title,
+            "total_questions": len(all_questions),
+            "sections": sections_summary,
+            "type_stats": list(type_stats.values()),
+            "answer_issues": answer_issues,
+            "warnings": warnings,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 # ──────────────────────────────────────────────
 # Sync paper questions to question bank
 # ──────────────────────────────────────────────

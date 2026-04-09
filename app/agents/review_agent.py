@@ -147,7 +147,7 @@ def _rule_based_review(
             scores["answer_correctness"] = 4
         elif question_type == "multiple_choice" and all(c in "ABCD" for c in correct_answer):
             scores["answer_correctness"] = 4
-        elif question_type == "true_false" and correct_answer in ("A", "B"):
+        elif question_type == "true_false" and correct_answer in ("T", "F", "A", "B"):
             scores["answer_correctness"] = 4
         else:
             scores["answer_correctness"] = 3
