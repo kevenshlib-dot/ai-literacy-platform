@@ -119,6 +119,14 @@ def test_build_knowledge_unit_prompt_content_omits_generated_segment_title():
     assert "第一句正文内容" in planner_content
 
 
+def test_build_source_knowledge_unit_excerpt_trims_and_truncates():
+    short = question_service._build_source_knowledge_unit_excerpt("  摘要内容  ")
+    long = question_service._build_source_knowledge_unit_excerpt("a" * 205)
+
+    assert short == "摘要内容"
+    assert long == ("a" * 200) + "..."
+
+
 def test_template_fallback_mixed_types():
     """Mixed types cycle through the list."""
     questions = _template_fallback(
@@ -3005,6 +3013,75 @@ async def test_get_question_by_id_includes_source_titles():
     data = resp.json()
     assert data["source_material_title"] == "AI基础教材"
     assert data["source_knowledge_unit_title"] == ku_title
+    assert data["source_knowledge_unit_excerpt"]
+
+
+@pytest.mark.asyncio
+async def test_get_question_by_id_includes_truncated_source_excerpt():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        create_material_resp = await client.post(
+            "/api/v1/materials",
+            headers=headers,
+            files={"file": ("excerpt.md", io.BytesIO(b"long content"), "text/markdown")},
+            data={"title": "摘要素材"},
+        )
+        assert create_material_resp.status_code == 201
+        material_id = create_material_resp.json()["id"]
+
+        long_content = "A" * 210
+        engine = create_async_engine(settings.DATABASE_URL)
+        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with session_factory() as session:
+            unit = KnowledgeUnit(
+                material_id=uuid.UUID(material_id),
+                title="摘要片段",
+                content=long_content,
+                chunk_index=0,
+            )
+            session.add(unit)
+            await session.commit()
+            await session.refresh(unit)
+            ku_id = str(unit.id)
+        await engine.dispose()
+
+        create_resp = await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": "来源摘要题目",
+            "correct_answer": "A",
+            "options": {"A": "对", "B": "错"},
+            "source_material_id": material_id,
+            "source_knowledge_unit_id": ku_id,
+        }, headers=headers)
+        qid = create_resp.json()["id"]
+
+        resp = await client.get(f"/api/v1/questions/{qid}", headers=headers)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["source_knowledge_unit_excerpt"] == ("A" * 200) + "..."
+
+
+@pytest.mark.asyncio
+async def test_get_question_by_id_without_source_has_no_excerpt():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        create_resp = await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": "无来源摘要题目",
+            "correct_answer": "A",
+            "options": {"A": "对", "B": "错"},
+        }, headers=headers)
+        qid = create_resp.json()["id"]
+
+        resp = await client.get(f"/api/v1/questions/{qid}", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["source_knowledge_unit_excerpt"] is None
 
 
 @pytest.mark.asyncio

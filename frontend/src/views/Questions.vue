@@ -460,7 +460,14 @@
           </a-descriptions-item>
           <a-descriptions-item v-if="detailQuestion.dimension" label="维度">{{ detailQuestion.dimension }}</a-descriptions-item>
           <a-descriptions-item v-if="detailQuestion.bloom_level" label="认知层次">{{ bloomLabel(detailQuestion.bloom_level) }}</a-descriptions-item>
-          <a-descriptions-item label="来源">{{ formatQuestionSource(detailQuestion) }}</a-descriptions-item>
+          <a-descriptions-item label="来源">
+            <div class="question-source-detail">
+              <div class="question-source-title">{{ formatQuestionSource(detailQuestion) }}</div>
+              <div v-if="detailQuestion.source_knowledge_unit_excerpt" class="question-source-excerpt">
+                {{ detailQuestion.source_knowledge_unit_excerpt }}
+              </div>
+            </div>
+          </a-descriptions-item>
           <a-descriptions-item v-if="detailQuestion.review_comment" label="审核意见">{{ detailQuestion.review_comment }}</a-descriptions-item>
           <a-descriptions-item label="创建时间">{{ formatDate(detailQuestion.created_at) }}</a-descriptions-item>
         </a-descriptions>
@@ -1762,11 +1769,24 @@ async function loadInteractions(qid: string) {
   }
 }
 
+async function fetchQuestionDetail(questionId: string) {
+  return await request.get(`/questions/${questionId}`) as any
+}
+
 async function showDetail(q: any) {
   detailQuestion.value = q
   aiCheckResult.value = null
   detailVisible.value = true
-  await Promise.all([loadReviewHistory(q.id), loadInteractions(q.id)])
+  try {
+    const [questionDetail] = await Promise.all([
+      fetchQuestionDetail(q.id),
+      loadReviewHistory(q.id),
+      loadInteractions(q.id),
+    ])
+    detailQuestion.value = questionDetail
+  } catch {
+    message.error('加载题目详情失败')
+  }
 }
 
 const detailIndex = computed(() =>
@@ -3145,6 +3165,26 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: #666;
+}
+
+.question-source-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.question-source-title {
+  color: #262626;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.question-source-excerpt {
+  color: #8c8c8c;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .table-action-group {

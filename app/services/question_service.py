@@ -61,6 +61,7 @@ WORKBENCH_DIMENSIONS = [
     "AI创新实践",
 ]
 UNCATEGORIZED_DIMENSION_LABEL = "未分类"
+SOURCE_KNOWLEDGE_UNIT_EXCERPT_LIMIT = 200
 
 
 def _coerce_uuid(value: Optional[uuid.UUID | str]) -> Optional[uuid.UUID]:
@@ -1008,9 +1009,21 @@ def _review_preview_calibration(raw_questions: list[dict]) -> dict:
         "warnings": warnings,
     }
 
+
+def _build_source_knowledge_unit_excerpt(content: Optional[str]) -> Optional[str]:
+    text = (content or "").strip()
+    if not text:
+        return None
+    if len(text) <= SOURCE_KNOWLEDGE_UNIT_EXCERPT_LIMIT:
+        return text
+    return f"{text[:SOURCE_KNOWLEDGE_UNIT_EXCERPT_LIMIT]}..."
+
+
 async def enrich_question_source_titles(
     db: AsyncSession,
     questions: list[Question],
+    *,
+    include_excerpt: bool = False,
 ) -> list[Question]:
     """Attach source titles to question objects for API serialization."""
     if not questions:
@@ -1029,14 +1042,26 @@ async def enrich_question_source_titles(
 
     knowledge_unit_map: dict[uuid.UUID, dict[str, Optional[uuid.UUID | str]]] = {}
     if knowledge_unit_ids:
+        knowledge_unit_columns = [
+            KnowledgeUnit.id,
+            KnowledgeUnit.title,
+            KnowledgeUnit.material_id,
+        ]
+        if include_excerpt:
+            knowledge_unit_columns.append(KnowledgeUnit.content)
         result = await db.execute(
-            select(KnowledgeUnit.id, KnowledgeUnit.title, KnowledgeUnit.material_id)
+            select(*knowledge_unit_columns)
             .where(KnowledgeUnit.id.in_(knowledge_unit_ids))
         )
-        for ku_id, ku_title, material_id in result.all():
+        for row in result.all():
+            ku_id = row[0]
+            ku_title = row[1]
+            material_id = row[2]
+            ku_content = row[3] if include_excerpt and len(row) > 3 else None
             knowledge_unit_map[ku_id] = {
                 "title": ku_title,
                 "material_id": material_id,
+                "excerpt": _build_source_knowledge_unit_excerpt(ku_content) if include_excerpt else None,
             }
             if material_id is not None:
                 material_ids.add(material_id)
@@ -1059,6 +1084,11 @@ async def enrich_question_source_titles(
         material_title = material_title_map.get(material_id) if material_id else None
         setattr(question, "source_knowledge_unit_title", knowledge_unit_title)
         setattr(question, "source_material_title", material_title)
+        setattr(
+            question,
+            "source_knowledge_unit_excerpt",
+            knowledge_unit.get("excerpt") if knowledge_unit and include_excerpt else None,
+        )
 
     return questions
 

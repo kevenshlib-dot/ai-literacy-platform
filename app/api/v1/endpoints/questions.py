@@ -65,6 +65,7 @@ def _to_response(q) -> QuestionResponse:
         source_knowledge_unit_id=q.source_knowledge_unit_id,
         source_material_title=getattr(q, "source_material_title", None),
         source_knowledge_unit_title=getattr(q, "source_knowledge_unit_title", None),
+        source_knowledge_unit_excerpt=getattr(q, "source_knowledge_unit_excerpt", None),
         status=q.status.value if hasattr(q.status, 'value') else q.status,
         usage_count=q.usage_count,
         correct_rate=q.correct_rate,
@@ -78,7 +79,7 @@ def _to_response(q) -> QuestionResponse:
 
 
 async def _to_enriched_response(db: AsyncSession, q) -> QuestionResponse:
-    await question_service.enrich_question_source_titles(db, [q])
+    await question_service.enrich_question_source_titles(db, [q], include_excerpt=True)
     return _to_response(q)
 
 
