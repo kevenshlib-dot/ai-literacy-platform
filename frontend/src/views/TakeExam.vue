@@ -170,8 +170,8 @@
 
             <div v-else-if="currentQuestion.question_type === 'true_false'" class="question-options">
               <a-radio-group v-model:value="answers[currentQuestion.question_id]" @change="saveAnswer">
-                <a-radio value="A" class="option-item">A. 正确</a-radio>
-                <a-radio value="B" class="option-item">B. 错误</a-radio>
+                <a-radio value="T" class="option-item">T. 正确</a-radio>
+                <a-radio value="F" class="option-item">F. 错误</a-radio>
               </a-radio-group>
             </div>
 
@@ -187,7 +187,10 @@
             <!-- Navigation Buttons -->
             <div class="question-actions">
               <a-button :disabled="currentIndex === 0" @click="currentIndex--">上一题</a-button>
-              <a-button type="primary" :disabled="currentIndex === questions.length - 1" @click="currentIndex++">下一题</a-button>
+              <a-button v-if="currentIndex < questions.length - 1" type="primary" @click="currentIndex++">下一题</a-button>
+              <a-popconfirm v-else title="确定提交考试？提交后不可修改。" @confirm="submitExam">
+                <a-button type="primary" danger>交卷</a-button>
+              </a-popconfirm>
             </div>
           </div>
         </div>
@@ -202,6 +205,7 @@ import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { ClockCircleOutlined, ThunderboltOutlined } from '@ant-design/icons-vue'
 import request from '@/utils/request'
+import { checkLLMModule } from '@/composables/useLLMStatus'
 
 const router = useRouter()
 const loadingExams = ref(false)
@@ -327,6 +331,8 @@ async function toggleMark() {
 
 async function submitExam() {
   if (!session.value) return
+  // Warn if scoring LLM is not configured (subjective questions may score inaccurately)
+  await checkLLMModule('scoring', '智能评分')
   try {
     const sheetId = session.value.answer_sheet_id
     const data: any = await request.post(`/sessions/${sheetId}/submit`)

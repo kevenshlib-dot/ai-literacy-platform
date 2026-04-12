@@ -179,7 +179,7 @@
             </div>
           </div>
         </template>
-        <template #customFilterIcon="{ filtered }">
+        <template #customFilterIcon="{ column, filtered }">
           <SearchOutlined :style="{ color: filtered ? '#1890ff' : undefined }" />
         </template>
         <template #bodyCell="{ column, record }">
@@ -262,7 +262,7 @@
     <!-- Diagnostic Report -->
     <template v-if="selectedScore && diagnostic">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px">
-        <a-button @click="selectedScore = null">
+        <a-button @click="selectedScore = null; fullReviewData = null">
           <LeftOutlined /> 返回列表
         </a-button>
         <a-space>
@@ -388,8 +388,118 @@
           </template>
         </a-list>
       </a-card>
+
+      <!-- 批卷详情 (Full Grading Details) -->
+      <a-card :bordered="false" style="margin-top: 16px">
+        <template #title>
+          <div style="display: flex; align-items: center; gap: 12px">
+            <span style="font-size: 16px; font-weight: 600">批卷详情</span>
+            <template v-if="fullReviewData">
+              <a-tag color="green"><CheckCircleOutlined /> 答对 {{ fullReviewData.correct_count }} 题</a-tag>
+              <a-tag color="red"><CloseCircleOutlined /> 答错 {{ fullReviewData.wrong_count }} 题</a-tag>
+              <a-tag>共 {{ fullReviewData.total }} 题</a-tag>
+            </template>
+          </div>
+        </template>
+        <a-spin :spinning="fullReviewLoading">
+          <a-empty v-if="!fullReviewData?.items?.length && !fullReviewLoading" description="暂无数据" />
+          <div v-for="(item, idx) in (fullReviewData?.items || [])" :key="idx"
+               :style="{
+                 marginBottom: '16px',
+                 padding: '16px',
+                 borderRadius: '8px',
+                 borderLeft: item.is_correct === false ? '5px solid #ff4d4f' : item.is_correct === true ? '5px solid #52c41a' : '5px solid #faad14',
+                 background: item.is_correct === false ? '#fff1f0' : item.is_correct === true ? '#f6ffed' : '#fffbe6',
+               }">
+            <!-- Question header -->
+            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap">
+              <span style="font-weight: 700; font-size: 15px; color: #333">第 {{ item.order_num }} 题</span>
+              <a-tag>{{ typeLabel(item.question_type) }}</a-tag>
+              <a-tag v-if="item.dimension" color="blue">{{ item.dimension }}</a-tag>
+              <a-tag v-if="item.is_correct === true" color="success"><CheckCircleOutlined /> 答对</a-tag>
+              <a-tag v-else-if="item.is_correct === false" color="error" style="font-weight: 600"><CloseCircleOutlined /> 答错</a-tag>
+              <a-tag v-else color="warning"><ExclamationCircleOutlined /> 待人工判定</a-tag>
+              <a-tag :color="item.is_correct === false ? 'red' : 'green'">
+                {{ item.earned_score }} / {{ item.max_score }} 分
+              </a-tag>
+              <a-button size="small" type="link" style="margin-left: auto" @click="openComplaintModal(item)">
+                <ExclamationCircleOutlined /> 反馈投诉
+              </a-button>
+            </div>
+
+            <!-- Question stem -->
+            <div style="font-size: 15px; line-height: 1.8; margin-bottom: 12px; color: #333">{{ item.stem }}</div>
+
+            <!-- Options (for choice questions) -->
+            <div v-if="item.options" style="margin-bottom: 12px">
+              <div v-for="(val, key) in item.options" :key="key"
+                   :style="{
+                     padding: '8px 12px',
+                     borderRadius: '6px',
+                     marginBottom: '6px',
+                     background: isCorrectOption(key as string, item.correct_answer) ? '#d9f7be'
+                       : isUserWrongOption(key as string, item.user_answer, item.correct_answer) ? '#ffa39e40' : '#fafafa',
+                     border: isCorrectOption(key as string, item.correct_answer) ? '1px solid #95de64'
+                       : isUserWrongOption(key as string, item.user_answer, item.correct_answer) ? '1px solid #ff7875' : '1px solid #f0f0f0',
+                     fontWeight: isCorrectOption(key as string, item.correct_answer) || isUserWrongOption(key as string, item.user_answer, item.correct_answer) ? '600' : 'normal',
+                   }">
+                {{ key }}. {{ val }}
+                <a-tag v-if="isCorrectOption(key as string, item.correct_answer)" color="green" size="small" style="margin-left: 8px">正确答案</a-tag>
+                <a-tag v-if="isUserCorrectOption(key as string, item.user_answer, item.correct_answer)" color="green" size="small" style="margin-left: 4px">✓ 你的选择</a-tag>
+                <a-tag v-if="isUserWrongOption(key as string, item.user_answer, item.correct_answer)" color="red" size="small" style="margin-left: 4px">✗ 你的选择</a-tag>
+              </div>
+            </div>
+
+            <!-- Non-option questions (short answer, fill-blank) -->
+            <div v-if="!item.options" style="margin-bottom: 12px; padding: 12px; background: #fafafa; border-radius: 6px">
+              <div style="margin-bottom: 8px"><strong>你的答案：</strong><span :style="{ color: item.is_correct === false ? '#ff4d4f' : '#333' }">{{ item.user_answer || '（未作答）' }}</span></div>
+              <div v-if="item.correct_answer"><strong>参考答案：</strong><span style="color: #52c41a">{{ item.correct_answer }}</span></div>
+            </div>
+
+            <!-- Feedback / Explanation -->
+            <a-alert
+              :type="item.is_correct === true ? 'success' : item.is_correct === false ? 'error' : 'warning'"
+              show-icon
+              style="margin-top: 8px"
+            >
+              <template #message>
+                <div>
+                  <strong>评语：</strong>{{ item.feedback || '暂无评语' }}
+                </div>
+                <div v-if="item.explanation && item.is_correct === false" style="margin-top: 6px; color: #666">
+                  <strong>解析：</strong>{{ item.explanation }}
+                </div>
+              </template>
+            </a-alert>
+          </div>
+        </a-spin>
+      </a-card>
+
       </div>
     </template>
+
+    <!-- Complaint Modal -->
+    <a-modal
+      v-model:open="complaintModalVisible"
+      title="评分反馈投诉"
+      :confirm-loading="complaintSubmitting"
+      @ok="submitComplaint"
+      ok-text="提交反馈"
+      cancel-text="取消"
+    >
+      <div v-if="complaintTargetDetail" style="margin-bottom: 16px; padding: 12px; background: #f5f5f5; border-radius: 6px">
+        <div style="margin-bottom: 4px"><strong>题目：</strong>第 {{ complaintTargetDetail.order_num }} 题（{{ typeLabel(complaintTargetDetail.question_type) }}）</div>
+        <div style="margin-bottom: 4px"><strong>得分：</strong>{{ complaintTargetDetail.earned_score }} / {{ complaintTargetDetail.max_score }}</div>
+        <div style="color: #666; font-size: 13px">{{ complaintTargetDetail.stem?.substring(0, 80) }}{{ complaintTargetDetail.stem?.length > 80 ? '...' : '' }}</div>
+      </div>
+      <a-textarea
+        v-model:value="complaintReason"
+        placeholder="请详细描述您认为评分有误的原因，例如：答案选择了B但被判为错误，实际B也是正确答案..."
+        :rows="4"
+        :maxlength="2000"
+        show-count
+      />
+    </a-modal>
 
     <!-- Review Mode: Wrong Answer Review -->
     <template v-if="reviewMode && !trainingMode && !trainingSubmitted">
@@ -410,7 +520,7 @@
         <div v-for="(item, idx) in (reviewData?.wrong_items || [])" :key="idx"
              style="margin-bottom: 24px; border-bottom: 1px solid #f0f0f0; padding-bottom: 16px">
           <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px">
-            <span style="font-weight: 600; font-size: 15px">第 {{ (idx as number) + 1 }} 题</span>
+            <span style="font-weight: 600; font-size: 15px">第 {{ idx + 1 }} 题</span>
             <a-tag>{{ typeLabel(item.question_type) }}</a-tag>
             <a-tag v-if="item.dimension" color="blue">{{ item.dimension }}</a-tag>
             <a-tag color="red">{{ item.earned_score }}/{{ item.max_score }}分</a-tag>
@@ -493,8 +603,8 @@
         <!-- True/False -->
         <div v-if="currentTrainingQuestion.question_type === 'true_false'">
           <a-radio-group v-model:value="trainingAnswers[trainingCurrentIndex]" style="width: 100%">
-            <div style="margin-bottom: 12px"><a-radio value="A">A. 正确</a-radio></div>
-            <div style="margin-bottom: 12px"><a-radio value="B">B. 错误</a-radio></div>
+            <div style="margin-bottom: 12px"><a-radio value="T">T. 正确</a-radio></div>
+            <div style="margin-bottom: 12px"><a-radio value="F">F. 错误</a-radio></div>
           </a-radio-group>
         </div>
 
@@ -604,7 +714,7 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, nextTick, watch } from 'vue'
-import { LeftOutlined, DownloadOutlined, SafetyCertificateOutlined, ThunderboltOutlined, SearchOutlined, ExportOutlined, DatabaseOutlined } from '@ant-design/icons-vue'
+import { LeftOutlined, DownloadOutlined, SafetyCertificateOutlined, ThunderboltOutlined, SearchOutlined, ExportOutlined, FilterOutlined, DatabaseOutlined, DeleteOutlined, WarningOutlined, CheckCircleOutlined, CloseCircleOutlined, ExclamationCircleOutlined } from '@ant-design/icons-vue'
 import { useRouter } from 'vue-router'
 import { message, Empty } from 'ant-design-vue'
 import * as echarts from 'echarts/core'
@@ -650,6 +760,16 @@ const leaderboardModalVisible = ref(false)
 const showOnLeaderboard = ref(true)
 const optOutLoading = ref(false)
 const currentUserId = computed(() => userStore.userInfo?.id ? String(userStore.userInfo.id) : '')
+
+// Full review (grading details) state
+const fullReviewData = ref<any>(null)
+const fullReviewLoading = ref(false)
+
+// Complaint state
+const complaintModalVisible = ref(false)
+const complaintTargetDetail = ref<any>(null)
+const complaintReason = ref('')
+const complaintSubmitting = ref(false)
 
 // Review/Training state
 const reviewMode = ref(false)
@@ -1062,6 +1182,7 @@ async function viewDiagnosticByScoreId(record: any) {
   selectedScore.value = record
   try {
     diagnostic.value = await request.get(`/scores/${record.score_id}/diagnostic`)
+    fetchFullReview(record.score_id)
     await nextTick()
     renderRadarChart()
     renderBarChart()
@@ -1124,6 +1245,50 @@ async function downloadCertForRecord(record: any) {
   }
 }
 
+async function fetchFullReview(scoreId: string) {
+  fullReviewLoading.value = true
+  try {
+    fullReviewData.value = await request.get(`/scores/${scoreId}/full-review`)
+  } catch (e) {
+    console.error('获取批卷详情失败', e)
+  } finally {
+    fullReviewLoading.value = false
+  }
+}
+
+function openComplaintModal(item: any) {
+  complaintTargetDetail.value = item
+  complaintReason.value = ''
+  complaintModalVisible.value = true
+}
+
+async function submitComplaint() {
+  if (!complaintReason.value.trim()) {
+    message.warning('请输入反馈原因')
+    return
+  }
+  complaintSubmitting.value = true
+  try {
+    await request.post('/scores/complaints', {
+      score_detail_id: complaintTargetDetail.value.score_detail_id,
+      reason: complaintReason.value,
+    })
+    message.success('反馈已提交，我们会尽快处理')
+    complaintModalVisible.value = false
+  } catch (e: any) {
+    message.error(e?.message || '反馈提交失败，请重试')
+  } finally {
+    complaintSubmitting.value = false
+  }
+}
+
+function isUserCorrectOption(key: string, userAnswer: string, correctAnswer: string): boolean {
+  if (!userAnswer) return false
+  const isUserChoice = userAnswer.toUpperCase().includes(key.toUpperCase())
+  const isCorrect = correctAnswer?.toUpperCase().includes(key.toUpperCase())
+  return isUserChoice && !!isCorrect
+}
+
 async function viewDiagnostic(record: any) {
   if (!record.score_id) {
     message.warning('该考试尚未评分，无法查看诊断分析报告')
@@ -1132,6 +1297,7 @@ async function viewDiagnostic(record: any) {
   selectedScore.value = record
   try {
     diagnostic.value = await request.get(`/scores/${record.score_id}/diagnostic`)
+    fetchFullReview(record.score_id)
     await nextTick()
     renderRadarChart()
     renderBarChart()
@@ -1350,6 +1516,7 @@ function exitReview() {
   trainingSubmitted.value = false
   reviewData.value = null
   selectedScore.value = null
+  fullReviewData.value = null
   trainingQuestions.value = []
   trainingResults.value = []
   trainingRound.value = 0

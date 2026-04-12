@@ -35,6 +35,9 @@ class Exam(Base):
     created_by: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
     )
+    paper_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("papers.id"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -61,5 +64,7 @@ class ExamQuestion(Base):
     )
     order_num: Mapped[int] = mapped_column(Integer, nullable=False)
     score: Mapped[float] = mapped_column(Float, default=5.0)
+    question_type_override: Mapped[str] = mapped_column(String(50), nullable=True)
+    correct_answer_override: Mapped[str] = mapped_column(Text, nullable=True)
 
     exam: Mapped["Exam"] = relationship(back_populates="questions")

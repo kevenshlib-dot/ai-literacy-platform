@@ -1,14 +1,17 @@
 """Question service - handles question CRUD, generation, and review."""
 import logging
-import time
 import uuid
 from typing import Optional
 
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.question import Question, QuestionType, QuestionStatus, BloomLevel, ReviewRecord
 from app.models.material import Material, KnowledgeUnit
+from app.models.paper import PaperQuestion
+from app.models.exam import ExamQuestion
+from app.models.answer import Answer
+from app.models.score import ScoreDetail
 from app.agents.question_agent import generate_questions_via_llm, classify_dimension
 from app.agents.review_agent import ai_review_question
 
@@ -143,7 +146,19 @@ async def delete_question(
 async def batch_delete(
     db: AsyncSession, question_ids: list[uuid.UUID]
 ) -> int:
-    """Batch delete questions. Returns count of actually deleted."""
+    """Batch delete questions. Cleans up FK references first, then deletes."""
+    if not question_ids:
+        return 0
+
+    # Clean up all foreign-key references before deleting questions
+    await db.execute(delete(ScoreDetail).where(ScoreDetail.question_id.in_(question_ids)))
+    await db.execute(delete(Answer).where(Answer.question_id.in_(question_ids)))
+    await db.execute(delete(ExamQuestion).where(ExamQuestion.question_id.in_(question_ids)))
+    await db.execute(delete(PaperQuestion).where(PaperQuestion.question_id.in_(question_ids)))
+    # Delete review records
+    await db.execute(delete(ReviewRecord).where(ReviewRecord.question_id.in_(question_ids)))
+    await db.flush()
+
     deleted = 0
     for qid in question_ids:
         ok = await delete_question(db, qid)
@@ -311,7 +326,7 @@ async def generate_from_knowledge_unit(
         raise ValueError(f"Knowledge unit {knowledge_unit_id} not found")
 
     # Generate via LLM/template
-    llm_result = generate_questions_via_llm(
+    raw_questions = generate_questions_via_llm(
         content=ku.content,
         question_types=question_types,
         count=count,
@@ -319,8 +334,6 @@ async def generate_from_knowledge_unit(
         bloom_level=bloom_level,
         custom_prompt=custom_prompt,
     )
-    raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
-    usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
 
     # Create question records (with per-question error handling)
     questions = []
@@ -369,7 +382,7 @@ async def generate_from_knowledge_unit(
             )
             continue
 
-    return {"questions": questions, "usage": usage}
+    return questions
 
 
 async def batch_generate_from_material(
@@ -466,9 +479,6 @@ async def build_question_bank_from_material(
 
     all_questions: list[Question] = []
     num_units = len(units)
-    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    type_counts: dict[str, int] = {}
-    start_time = time.time()
 
     for qtype, total_count in type_distribution.items():
         if total_count <= 0:
@@ -481,7 +491,7 @@ async def build_question_bank_from_material(
             count_for_unit = base + (1 if i < remainder else 0)
             if count_for_unit <= 0:
                 continue
-            result = await generate_from_knowledge_unit(
+            questions = await generate_from_knowledge_unit(
                 db=db,
                 knowledge_unit_id=ku.id,
                 question_types=[qtype],
@@ -491,17 +501,9 @@ async def build_question_bank_from_material(
                 created_by=created_by,
                 custom_prompt=custom_prompt,
             )
-            questions = result.get("questions", result) if isinstance(result, dict) else result
-            usage = result.get("usage", {}) if isinstance(result, dict) else {}
             all_questions.extend(questions)
-            for k in total_usage:
-                total_usage[k] += usage.get(k, 0)
 
-        type_counts[qtype] = len([q for q in all_questions if q.question_type.value == qtype or q.question_type == qtype])
-
-    duration = round(time.time() - start_time, 2)
-    stats = {**total_usage, "duration_seconds": duration, "type_counts": type_counts}
-    return {"questions": all_questions, "stats": stats}
+    return all_questions
 
 
 async def suggest_question_distribution(
@@ -576,14 +578,11 @@ async def generate_questions_free(
 ) -> list[Question]:
     """Generate questions without material, using LLM's own knowledge."""
     all_questions: list[Question] = []
-    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    type_counts: dict[str, int] = {}
-    start_time = time.time()
 
     for qtype, count in type_distribution.items():
         if count <= 0:
             continue
-        llm_result = generate_questions_via_llm(
+        raw_questions = generate_questions_via_llm(
             content="",
             question_types=[qtype],
             count=count,
@@ -591,10 +590,6 @@ async def generate_questions_free(
             bloom_level=bloom_level,
             custom_prompt=custom_prompt,
         )
-        raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
-        usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
-        for k in total_usage:
-            total_usage[k] += usage.get(k, 0)
         for raw in raw_questions:
             try:
                 qt = raw.get("question_type", qtype)
@@ -635,211 +630,7 @@ async def generate_questions_free(
                 logger.error(f"Free generate: failed to create question: {e}")
                 continue
 
-        type_counts[qtype] = len([q for q in all_questions if q.question_type.value == qtype or q.question_type == qtype])
-
-    duration = round(time.time() - start_time, 2)
-    stats = {**total_usage, "duration_seconds": duration, "type_counts": type_counts}
-    return {"questions": all_questions, "stats": stats}
-
-
-async def preview_question_bank_from_material(
-    db: AsyncSession,
-    material_id: uuid.UUID,
-    type_distribution: dict[str, int],
-    difficulty: int = 3,
-    bloom_level: Optional[str] = None,
-    max_units: int = 10,
-    custom_prompt: Optional[str] = None,
-) -> dict:
-    """Preview question bank generation WITHOUT saving to DB.
-
-    Same LLM logic as build_question_bank_from_material but returns raw dicts.
-    """
-    from app.models.material import MaterialStatus
-
-    mat_result = await db.execute(
-        select(Material).where(Material.id == material_id)
-    )
-    material = mat_result.scalar_one_or_none()
-    if not material:
-        raise ValueError(f"素材 {material_id} 不存在")
-
-    mat_status = material.status.value if hasattr(material.status, 'value') else material.status
-    if mat_status not in ("parsed", "vectorized"):
-        raise ValueError(f"素材尚未解析完成，当前状态: {mat_status}")
-
-    ku_result = await db.execute(
-        select(KnowledgeUnit)
-        .where(KnowledgeUnit.material_id == material_id)
-        .order_by(KnowledgeUnit.chunk_index)
-        .limit(max_units)
-    )
-    units = list(ku_result.scalars().all())
-    if not units:
-        raise ValueError("该素材没有知识单元，请先解析素材")
-
-    all_preview: list[dict] = []
-    num_units = len(units)
-    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    type_counts: dict[str, int] = {}
-    start_time = time.time()
-
-    for qtype, total_count in type_distribution.items():
-        if total_count <= 0:
-            continue
-        base = total_count // num_units
-        remainder = total_count % num_units
-        type_generated = 0
-
-        for i, ku in enumerate(units):
-            count_for_unit = base + (1 if i < remainder else 0)
-            if count_for_unit <= 0:
-                continue
-
-            llm_result = generate_questions_via_llm(
-                content=ku.content,
-                question_types=[qtype],
-                count=count_for_unit,
-                difficulty=difficulty,
-                bloom_level=bloom_level,
-                custom_prompt=custom_prompt,
-            )
-            raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
-            usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
-            for k in total_usage:
-                total_usage[k] += usage.get(k, 0)
-
-            for raw in raw_questions:
-                tags = raw.get("knowledge_tags")
-                if isinstance(tags, str):
-                    tags = [tags]
-                if not isinstance(tags, list):
-                    tags = None
-
-                dim = ku.dimension or raw.get("dimension")
-                if not dim:
-                    dim = classify_dimension(raw.get("stem", ""), tags)
-
-                all_preview.append({
-                    "question_type": raw.get("question_type", qtype),
-                    "stem": raw.get("stem", ""),
-                    "options": raw.get("options"),
-                    "correct_answer": raw.get("correct_answer", ""),
-                    "explanation": raw.get("explanation", ""),
-                    "difficulty": difficulty,
-                    "dimension": dim,
-                    "knowledge_tags": tags,
-                    "bloom_level": bloom_level,
-                    "source_material_id": str(ku.material_id),
-                    "source_knowledge_unit_id": str(ku.id),
-                })
-                type_generated += 1
-
-        type_counts[qtype] = type_generated
-
-    duration = round(time.time() - start_time, 2)
-    stats = {**total_usage, "duration_seconds": duration, "type_counts": type_counts}
-    return {"questions": all_preview, "stats": stats}
-
-
-def preview_questions_free(
-    type_distribution: dict[str, int],
-    difficulty: int = 3,
-    bloom_level: Optional[str] = None,
-    custom_prompt: Optional[str] = None,
-) -> dict:
-    """Preview question generation without material. No DB involvement."""
-    all_preview: list[dict] = []
-    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    type_counts: dict[str, int] = {}
-    start_time = time.time()
-
-    for qtype, count in type_distribution.items():
-        if count <= 0:
-            continue
-        llm_result = generate_questions_via_llm(
-            content="",
-            question_types=[qtype],
-            count=count,
-            difficulty=difficulty,
-            bloom_level=bloom_level,
-            custom_prompt=custom_prompt,
-        )
-        raw_questions = llm_result.get("questions", llm_result) if isinstance(llm_result, dict) else llm_result
-        usage = llm_result.get("usage", {}) if isinstance(llm_result, dict) else {}
-        for k in total_usage:
-            total_usage[k] += usage.get(k, 0)
-
-        type_generated = 0
-        for raw in raw_questions:
-            tags = raw.get("knowledge_tags")
-            if isinstance(tags, str):
-                tags = [tags]
-            if not isinstance(tags, list):
-                tags = None
-
-            dim = raw.get("dimension")
-            if not dim:
-                dim = classify_dimension(raw.get("stem", ""), tags)
-
-            all_preview.append({
-                "question_type": raw.get("question_type", qtype),
-                "stem": raw.get("stem", ""),
-                "options": raw.get("options"),
-                "correct_answer": raw.get("correct_answer", ""),
-                "explanation": raw.get("explanation", ""),
-                "difficulty": difficulty,
-                "dimension": dim,
-                "knowledge_tags": tags,
-                "bloom_level": bloom_level,
-                "source_material_id": None,
-                "source_knowledge_unit_id": None,
-            })
-            type_generated += 1
-
-        type_counts[qtype] = type_generated
-
-    duration = round(time.time() - start_time, 2)
-    stats = {**total_usage, "duration_seconds": duration, "type_counts": type_counts}
-    return {"questions": all_preview, "stats": stats}
-
-
-async def batch_create_from_raw(
-    db: AsyncSession,
-    raw_questions: list[dict],
-    created_by: Optional[uuid.UUID] = None,
-) -> list:
-    """Batch save preview question dicts to DB. Used after user review."""
-    questions = []
-    for raw in raw_questions:
-        try:
-            qt = raw.get("question_type", "single_choice")
-            try:
-                QuestionType(qt)
-            except ValueError:
-                logger.warning(f"batch_create_from_raw: invalid type '{qt}', skipping")
-                continue
-
-            q = await create_question(
-                db=db,
-                question_type=qt,
-                stem=raw.get("stem", ""),
-                correct_answer=raw.get("correct_answer", ""),
-                options=raw.get("options"),
-                explanation=raw.get("explanation", ""),
-                difficulty=raw.get("difficulty", 3),
-                dimension=raw.get("dimension"),
-                knowledge_tags=raw.get("knowledge_tags"),
-                bloom_level=raw.get("bloom_level"),
-                source_material_id=uuid.UUID(raw["source_material_id"]) if raw.get("source_material_id") else None,
-                source_knowledge_unit_id=uuid.UUID(raw["source_knowledge_unit_id"]) if raw.get("source_knowledge_unit_id") else None,
-                created_by=created_by,
-            )
-            questions.append(q)
-        except Exception as e:
-            logger.error(f"batch_create_from_raw: failed: {e}", exc_info=True)
-            continue
-    return questions
+    return all_questions
 
 
 async def get_question_stats(

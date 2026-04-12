@@ -24,6 +24,18 @@ from app.services.parse_worker import trigger_parse, parse_and_store
 router = APIRouter(prefix="/materials", tags=["素材管理"])
 
 
+@router.get("/files/{bucket}/{rest_of_path:path}")
+async def serve_local_file(bucket: str, rest_of_path: str):
+    """Serve files from local storage fallback (dev mode, MinIO unavailable)."""
+    from fastapi.responses import FileResponse
+    from app.services.minio_service import LOCAL_STORAGE_ROOT
+
+    file_path = LOCAL_STORAGE_ROOT / bucket / rest_of_path
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(file_path)
+
+
 @router.post("", response_model=MaterialResponse, status_code=status.HTTP_201_CREATED)
 async def upload_material(
     background_tasks: BackgroundTasks,

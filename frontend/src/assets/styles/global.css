@@ -8,17 +8,26 @@
 
 html, body, #app {
   height: 100%;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue',
-    Arial, 'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji';
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Arial, 'Noto Sans',
+    sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji';
   color: var(--text-color);
   background-color: var(--bg-color);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 a {
   color: var(--primary-color);
   text-decoration: none;
+  transition: color 0.2s;
 }
 
+a:hover {
+  color: var(--primary-hover);
+}
+
+/* Page container */
 .page-container {
   padding: 24px;
   min-height: calc(100vh - var(--header-height) - 48px);
@@ -26,6 +35,9 @@ a {
 
 .page-header {
   margin-bottom: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
 }
 
 .page-header h2 {
@@ -39,4 +51,44 @@ a {
   border-radius: 8px;
   padding: 24px;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+/* Better scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.25);
+}
+
+/* Ant Design overrides for consistent look */
+.ant-btn-primary {
+  box-shadow: 0 2px 4px rgba(31, 78, 121, 0.2);
+}
+
+.ant-card {
+  border-radius: 8px;
+}
+
+.ant-table {
+  border-radius: 8px;
+}
+
+/* Smooth transitions */
+.ant-menu-item,
+.ant-btn,
+.ant-input,
+.ant-select-selector {
+  transition: all 0.2s ease;
 }

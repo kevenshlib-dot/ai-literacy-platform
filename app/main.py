@@ -17,6 +17,10 @@ async def lifespan(app: FastAPI):
         await init_roles(session)
         await session.commit()
     print("Roles initialized")
+    from app.core.llm_config import load_cache_from_db
+    async with async_session() as session:
+        await load_cache_from_db(session)
+    print("LLM config cache loaded")
     yield
     # Shutdown
     print(f"Shutting down {settings.APP_NAME}")

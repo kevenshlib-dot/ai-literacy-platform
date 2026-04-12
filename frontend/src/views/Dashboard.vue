@@ -1,8 +1,25 @@
 <template>
   <div class="page-container">
     <div class="page-header">
-      <h2>工作台</h2>
+      <h2>工作面板</h2>
     </div>
+
+    <!-- LLM Status Warning -->
+    <a-alert
+      v-if="llmWarning"
+      :message="llmWarning.title"
+      :description="llmWarning.desc"
+      type="warning"
+      show-icon
+      closable
+      style="margin-bottom: 16px"
+    >
+      <template #action>
+        <a-button size="small" type="primary" ghost @click="$router.push('/system-config')">
+          前往配置
+        </a-button>
+      </template>
+    </a-alert>
 
     <!-- Stats Cards -->
     <a-row :gutter="[16, 16]">
@@ -73,16 +90,7 @@
 
     <a-row :gutter="[24, 24]" style="margin-top: 24px;">
       <a-col :xs="24" :lg="12">
-        <a-card class="card-container">
-          <template #title>
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-              <span>待审核题目</span>
-              <a-button type="link" size="small" style="color: #1F4E79; font-weight: 500;" @click="goToBatchReview">
-                <template #icon><AuditOutlined /></template>
-                批量审核
-              </a-button>
-            </div>
-          </template>
+        <a-card title="待审核题目" class="card-container">
           <a-list size="small" :data-source="pendingQuestions" :locale="{ emptyText: '暂无待审核题目' }">
             <template #renderItem="{ item }">
               <a-list-item>
@@ -103,29 +111,20 @@
 
       <a-col :xs="24" :lg="12">
         <a-card title="最新素材" class="card-container">
-          <div v-if="materialBatches.length === 0" style="text-align: center; color: #999; padding: 24px 0;">
-            暂无素材
-          </div>
-          <div v-for="(batch, bIdx) in materialBatches" :key="bIdx" class="material-batch">
-            <div class="batch-header">
-              <span class="batch-time">{{ batch.label }}</span>
-              <a-tag color="blue" size="small">{{ batch.items.length }} 份</a-tag>
-            </div>
-            <a-list size="small" :data-source="batch.items" :split="false">
-              <template #renderItem="{ item }">
-                <a-list-item style="padding: 4px 0 4px 12px;">
-                  <a-list-item-meta :title="item.title">
-                    <template #description>
-                      <a-space>
-                        <a-tag>{{ item.format }}</a-tag>
-                        <span>{{ item.category || '未分类' }}</span>
-                      </a-space>
-                    </template>
-                  </a-list-item-meta>
-                </a-list-item>
-              </template>
-            </a-list>
-          </div>
+          <a-list size="small" :data-source="recentMaterials" :locale="{ emptyText: '暂无素材' }">
+            <template #renderItem="{ item }">
+              <a-list-item>
+                <a-list-item-meta :title="item.title">
+                  <template #description>
+                    <a-space>
+                      <a-tag>{{ item.format }}</a-tag>
+                      <span>{{ item.category || '未分类' }}</span>
+                    </a-space>
+                  </template>
+                </a-list-item-meta>
+              </a-list-item>
+            </template>
+          </a-list>
         </a-card>
       </a-col>
     </a-row>
@@ -134,22 +133,16 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
-import { FolderOutlined, FileTextOutlined, FormOutlined, TeamOutlined, AuditOutlined } from '@ant-design/icons-vue'
+import { FolderOutlined, FileTextOutlined, FormOutlined, TeamOutlined } from '@ant-design/icons-vue'
 import request from '@/utils/request'
 
-const router = useRouter()
 const primaryColor = '#1F4E79'
 
+const llmWarning = ref<{ title: string; desc: string } | null>(null)
 const stats = ref({ materials: 0, questions: 0, exams: 0, users: 0 })
 const recentExams = ref<any[]>([])
 const pendingQuestions = ref<any[]>([])
-
-interface MaterialBatch {
-  label: string
-  items: any[]
-}
-const materialBatches = ref<MaterialBatch[]>([])
+const recentMaterials = ref<any[]>([])
 
 const dimensions = ref([
   { name: 'AI基础知识', coverage: 0 },
@@ -163,53 +156,9 @@ function typeLabel(t: string) {
   return { single_choice: '单选题', multiple_choice: '多选题', true_false: '判断题', fill_blank: '填空题', short_answer: '简答题' }[t] || t
 }
 
-function goToBatchReview() {
-  router.push('/questions?tab=review')
-}
-
-/**
- * Group materials into upload batches.
- * Materials uploaded within 120 seconds by the same user are considered the same batch.
- * Returns the most recent 3 batches, with items sorted by title pinyin within each batch.
- */
-function groupIntoBatches(materials: any[]): MaterialBatch[] {
-  if (!materials || materials.length === 0) return []
-
-  // Materials are already sorted by created_at DESC from the API
-  const batches: { time: Date; uploadedBy: string; items: any[] }[] = []
-
-  for (const m of materials) {
-    const mTime = new Date(m.created_at)
-    const uploader = m.uploaded_by || ''
-
-    if (batches.length === 0) {
-      batches.push({ time: mTime, uploadedBy: uploader, items: [m] })
-      continue
-    }
-
-    const lastBatch = batches[batches.length - 1]!
-    const timeDiff = Math.abs(lastBatch.time.getTime() - mTime.getTime()) / 1000
-
-    if (timeDiff <= 120 && lastBatch.uploadedBy === uploader) {
-      lastBatch.items.push(m)
-    } else {
-      if (batches.length >= 3) break
-      batches.push({ time: mTime, uploadedBy: uploader, items: [m] })
-    }
-  }
-
-  // Sort within each batch by title pinyin, then format the label
-  return batches.slice(0, 3).map(b => {
-    b.items.sort((a: any, b: any) => (a.title || '').localeCompare(b.title || '', 'zh-Hans'))
-    const d = b.time
-    const label = `${d.getMonth() + 1}月${d.getDate()}日 ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} 上传`
-    return { label, items: b.items }
-  })
-}
-
 async function loadDashboard() {
   const results = await Promise.allSettled([
-    request.get('/materials', { params: { skip: 0, limit: 100 } }),
+    request.get('/materials', { params: { skip: 0, limit: 5 } }),
     request.get('/questions', { params: { skip: 0, limit: 5, status: 'pending_review' } }),
     request.get('/exams', { params: { skip: 0, limit: 5 } }),
     request.get('/users', { params: { skip: 0, limit: 1 } }),
@@ -218,8 +167,7 @@ async function loadDashboard() {
   if (results[0].status === 'fulfilled') {
     const d = results[0].value as any
     stats.value.materials = d.total || 0
-    const allMaterials = d.data || d.items || []
-    materialBatches.value = groupIntoBatches(allMaterials)
+    recentMaterials.value = d.items?.slice(0, 5) || []
   }
   if (results[1].status === 'fulfilled') {
     const d = results[1].value as any
@@ -251,7 +199,25 @@ async function loadDashboard() {
   } catch { /* ignore */ }
 }
 
-onMounted(() => { loadDashboard() })
+async function checkLLMStatus() {
+  try {
+    const data: any = await request.get('/system/llm-status')
+    if (!data.configured) {
+      llmWarning.value = {
+        title: 'AI 大模型尚未配置',
+        desc: '题目生成、智能评分、试卷解析等功能需要配置大模型才能正常工作，当前将使用规则降级模式（功能受限）。',
+      }
+    } else if (data.unconfigured_modules?.length > 0) {
+      const names = data.unconfigured_modules.map((m: any) => m.name).join('、')
+      llmWarning.value = {
+        title: '部分 AI 功能未配置大模型',
+        desc: `以下功能将使用规则降级模式：${names}。建议在系统配置中为所有模块分配模型提供者。`,
+      }
+    }
+  } catch { /* non-admin users may not have access, ignore */ }
+}
+
+onMounted(() => { loadDashboard(); checkLLMStatus() })
 </script>
 
 <style scoped>
@@ -259,24 +225,4 @@ onMounted(() => { loadDashboard() })
 .dimension-list { display: flex; flex-direction: column; gap: 16px; }
 .dimension-item { display: flex; align-items: center; gap: 12px; }
 .dim-name { white-space: nowrap; width: 120px; font-size: 14px; }
-
-.material-batch {
-  margin-bottom: 12px;
-}
-.material-batch:last-child {
-  margin-bottom: 0;
-}
-.batch-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 0;
-  border-bottom: 1px solid #f0f0f0;
-  margin-bottom: 4px;
-}
-.batch-time {
-  font-size: 13px;
-  color: #666;
-  font-weight: 500;
-}
 </style>

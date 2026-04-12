@@ -121,7 +121,7 @@
         >
           <template #bodyCell="{ column, record }">
             <template v-if="column.key === 'stem'">
-              <a class="stem-cell" @click="showDetail(record)">{{ record.stem }}</a>
+              <a @click="showDetail(record)">{{ truncate(record.stem, 40) }}</a>
             </template>
             <template v-if="column.key === 'question_type'">
               <a-tag :color="typeColor(record.question_type)">{{ typeLabel(record.question_type) }}</a-tag>
@@ -252,7 +252,7 @@
         >
           <template #bodyCell="{ column, record }">
             <template v-if="column.key === 'stem'">
-              <a class="stem-cell" @click="showDetail(record)">{{ record.stem }}</a>
+              <a @click="showDetail(record)">{{ truncate(record.stem, 50) }}</a>
             </template>
             <template v-if="column.key === 'question_type'">
               <a-tag :color="typeColor(record.question_type)">{{ typeLabel(record.question_type) }}</a-tag>
@@ -301,34 +301,9 @@
       v-model:open="createModalVisible"
       :title="editingQuestion ? '编辑题目' : '新建题目'"
       :width="720"
+      @ok="handleCreateOrUpdate"
       :confirm-loading="submitLoading"
     >
-      <template #footer>
-        <div style="display: flex; justify-content: space-between;">
-          <a-space v-if="editingQuestion">
-            <a-button
-              v-if="editingQuestion.status === 'draft'"
-              style="background: #1f4e79; color: #fff; border-color: #1f4e79"
-              @click="handleCreateOrUpdate().then(() => submitForReview(editingQuestion.id))"
-            >保存并提交审核</a-button>
-            <a-button @click="runAICheck(editingQuestion.id)" :loading="aiCheckLoading">
-              <template #icon><RobotOutlined /></template>
-              AI检查
-            </a-button>
-            <a-popconfirm
-              title="确认删除该题目？"
-              @confirm="deleteQuestion(editingQuestion.id); createModalVisible = false"
-            >
-              <a-button danger>删除</a-button>
-            </a-popconfirm>
-          </a-space>
-          <span v-else></span>
-          <a-space>
-            <a-button @click="createModalVisible = false">取消</a-button>
-            <a-button type="primary" :loading="submitLoading" @click="handleCreateOrUpdate">保存</a-button>
-          </a-space>
-        </div>
-      </template>
       <a-form :label-col="{ span: 4 }" :wrapper-col="{ span: 20 }">
         <a-form-item label="题型" required>
           <a-select v-model:value="form.question_type" placeholder="选择题型">
@@ -419,48 +394,23 @@
           <a-descriptions-item label="创建时间">{{ formatDate(detailQuestion.created_at) }}</a-descriptions-item>
         </a-descriptions>
 
-        <!-- Action Buttons -->
-        <div style="margin-top: 16px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
-          <a-space wrap>
+        <!-- Review Actions -->
+        <div style="margin-top: 16px">
+          <a-space>
             <a-button @click="runAICheck(detailQuestion.id)" :loading="aiCheckLoading">
               <template #icon><RobotOutlined /></template>
               AI质量检查
             </a-button>
             <a-button
-              v-if="detailQuestion.status === 'draft'"
+              v-if="detailQuestion.status === 'pending_review'"
               type="primary"
-              style="background: #1f4e79; border-color: #1f4e79"
-              @click="submitForReview(detailQuestion.id)"
-            >提交审核</a-button>
-            <a-button
-              v-if="detailQuestion.status === 'draft' || detailQuestion.status === 'pending_review'"
-              type="primary"
-              style="background: #52c41a; border-color: #52c41a"
               @click="reviewAction(detailQuestion.id, 'approve')"
             >通过</a-button>
             <a-button
-              v-if="detailQuestion.status === 'draft' || detailQuestion.status === 'pending_review'"
+              v-if="detailQuestion.status === 'pending_review'"
               danger
               @click="reviewAction(detailQuestion.id, 'reject')"
             >拒绝</a-button>
-          </a-space>
-          <a-space>
-            <a-button
-              v-if="detailQuestion.status === 'draft' || detailQuestion.status === 'pending_review'"
-              @click="detailVisible = false; editQuestion(detailQuestion)"
-            >
-              <template #icon><EditOutlined /></template>
-              编辑
-            </a-button>
-            <a-popconfirm
-              title="确认删除该题目？"
-              @confirm="deleteQuestion(detailQuestion.id); detailVisible = false"
-            >
-              <a-button danger>
-                <template #icon><DeleteOutlined /></template>
-                删除
-              </a-button>
-            </a-popconfirm>
           </a-space>
         </div>
 
@@ -511,70 +461,10 @@
       </a-form-item>
     </a-modal>
 
-    <!-- AI Check Result Modal -->
-    <a-modal
-      v-model:open="aiResultModalVisible"
-      title="AI 质量检查结果"
-      :width="480"
-      :footer="null"
-    >
-      <div v-if="aiCheckResult" style="text-align: center; padding: 16px 0;">
-        <div style="margin-bottom: 16px;">
-          <span
-            style="font-size: 56px; font-weight: 700; line-height: 1;"
-            :style="{ color: aiScore10(aiCheckResult.overall_score) <= 5 ? '#ff4d4f' : '#52c41a' }"
-          >{{ aiScore10(aiCheckResult.overall_score) }}</span>
-          <span style="font-size: 20px; color: #999; margin-left: 2px;">/10</span>
-        </div>
-        <a-tag
-          :color="aiScore10(aiCheckResult.overall_score) <= 5 ? 'red' : 'green'"
-          style="font-size: 16px; padding: 4px 16px;"
-        >
-          {{ aiScore10(aiCheckResult.overall_score) <= 5 ? '建议拒绝' : '建议通过' }}
-        </a-tag>
-
-        <div v-if="aiCheckResult.scores" style="margin-top: 20px; text-align: left;">
-          <div
-            v-for="(score, key) in aiCheckResult.scores"
-            :key="key"
-            style="display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid #f5f5f5;"
-          >
-            <span style="color: #666;">{{ scoreLabel(key as string) }}</span>
-            <span :style="{ fontWeight: 600, color: aiScore10(score as number) <= 5 ? '#ff4d4f' : '#52c41a' }">
-              {{ aiScore10(score as number) }}/10
-            </span>
-          </div>
-        </div>
-
-        <p v-if="aiCheckResult.comments" style="margin-top: 16px; color: #666; text-align: left; background: #fafafa; padding: 12px; border-radius: 6px;">
-          {{ aiCheckResult.comments }}
-        </p>
-
-        <div style="margin-top: 24px;">
-          <a-space v-if="aiScore10(aiCheckResult.overall_score) <= 5">
-            <a-popconfirm title="确认删除该题目？" @confirm="aiResultDelete">
-              <a-button danger type="primary">
-                <template #icon><DeleteOutlined /></template>
-                删除
-              </a-button>
-            </a-popconfirm>
-            <a-button @click="aiResultModalVisible = false">保留</a-button>
-          </a-space>
-          <a-space v-else>
-            <a-button type="primary" style="background: #52c41a; border-color: #52c41a" @click="aiResultApprove">
-              <template #icon><CheckOutlined /></template>
-              通过
-            </a-button>
-            <a-button @click="aiResultModalVisible = false">暂不操作</a-button>
-          </a-space>
-        </div>
-      </div>
-    </a-modal>
-
     <!-- Question Bank Build Modal -->
     <a-modal
       v-model:open="bankBuildModal.visible"
-      title="新建题库 - 从素材生成试题"
+      title="题库建设 - 从素材生成题目"
       width="720px"
       @ok="handleBankBuild"
       :confirm-loading="bankBuildModal.loading"
@@ -673,12 +563,7 @@
         </a-row>
       </a-form>
 
-      <div v-if="bankBuildModal.loading" style="margin-top: 16px">
-        <!-- LLM Model Info -->
-        <div class="gen-model-info">
-          <RobotOutlined class="gen-robot-icon" />
-          <span class="gen-model-name">{{ genModelName || 'AI' }} 正在生成...</span>
-        </div>
+      <div v-if="bankBuildModal.loading" style="margin-top: 12px">
         <div style="display: flex; justify-content: space-between; margin-bottom: 4px">
           <span style="color: #1F4E79; font-weight: 500">{{ genProgress.statusText }}</span>
           <span style="color: #999">{{ genProgress.percent }}%</span>
@@ -697,240 +582,21 @@
     <!-- Generation Result Modal -->
     <a-modal
       v-model:open="bankResultModal.visible"
-      title="试题生成完成"
-      width="520px"
-      @ok="closeBankResult"
-      ok-text="确定"
-      :cancel-button-props="{ style: { display: 'none' } }"
+      title="题目生成完成"
+      :footer="null"
+      width="480px"
     >
-      <div style="text-align: center; padding: 8px 0 16px;">
-        <CheckCircleOutlined style="font-size: 48px; color: #52c41a;" />
-        <h3 style="margin: 12px 0 4px; font-size: 20px; font-weight: 600;">
-          成功生成 {{ bankResultModal.generated }} 道试题
-        </h3>
-        <p style="color: #999; margin: 0;">所有题目已保存为草稿状态</p>
-      </div>
-
-      <!-- Stats Report -->
-      <div class="gen-report-section">
-        <div class="gen-report-title">📊 生成报告</div>
-        <div class="gen-report-card">
-          <div class="gen-report-row">
-            <span class="gen-report-label">模型</span>
-            <span class="gen-report-value">{{ bankResultModal.modelName || '-' }}</span>
-          </div>
-          <div class="gen-report-row">
-            <span class="gen-report-label">耗时</span>
-            <span class="gen-report-value">{{ bankResultModal.durationText || '-' }}</span>
-          </div>
-          <div class="gen-report-row">
-            <span class="gen-report-label">Token 消耗</span>
-            <span class="gen-report-value">{{ bankResultModal.totalTokens?.toLocaleString() || '-' }}</span>
-          </div>
-          <div v-if="bankResultModal.promptTokens || bankResultModal.completionTokens" class="gen-report-row" style="padding-left: 16px;">
-            <span class="gen-report-label" style="color: #aaa; font-size: 12px;">输入 / 输出</span>
-            <span class="gen-report-value" style="color: #aaa; font-size: 12px;">
-              {{ bankResultModal.promptTokens?.toLocaleString() || '0' }} / {{ bankResultModal.completionTokens?.toLocaleString() || '0' }}
-            </span>
-          </div>
-        </div>
-      </div>
-
-      <div v-if="bankResultModal.typeCounts && Object.keys(bankResultModal.typeCounts).length > 0" class="gen-report-section">
-        <div class="gen-report-title">📝 题型分布</div>
-        <div class="gen-report-card">
-          <div
-            v-for="(count, qtype) in bankResultModal.typeCounts"
-            :key="qtype"
-            class="gen-type-row"
-          >
-            <span class="gen-type-label">{{ typeLabel(qtype as string) }}</span>
-            <span class="gen-type-count">{{ count }} 题</span>
-            <div class="gen-type-bar-bg">
-              <div
-                class="gen-type-bar"
-                :style="{ width: Math.round(((count as number) / bankResultModal.generated) * 100) + '%' }"
-              ></div>
-            </div>
-            <span class="gen-type-pct">{{ Math.round(((count as number) / bankResultModal.generated) * 100) }}%</span>
-          </div>
-        </div>
-      </div>
-    </a-modal>
-
-    <!-- Preview & Review Drawer -->
-    <a-drawer
-      v-model:open="previewDrawerVisible"
-      title="题目预览 - 审阅后保存"
-      :width="1100"
-      :mask-closable="false"
-      :closable="true"
-      @close="onPreviewDrawerClose"
-    >
-      <!-- Action Bar -->
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 8px;">
-        <a-space>
-          <a-tag color="blue" style="font-size: 14px; padding: 4px 12px;">共 {{ previewQuestions.length }} 道题目</a-tag>
-          <a-button
-            size="small"
-            danger
-            :disabled="previewSelectedKeys.length === 0"
-            @click="removeSelectedPreview"
-          >
-            <template #icon><DeleteOutlined /></template>
-            删除选中 ({{ previewSelectedKeys.length }})
-          </a-button>
-        </a-space>
-        <a-space>
-          <a-button @click="openCandidateSelector">
-            <template #icon><PlusOutlined /></template>
-            从题库添加
-          </a-button>
-          <a-button
-            type="primary"
-            :loading="previewSaving"
-            @click="savePreviewQuestions"
-            :disabled="previewQuestions.length === 0"
-            style="background: #1f4e79; border-color: #1f4e79"
-          >
-            <template #icon><CheckOutlined /></template>
-            确认保存 ({{ previewQuestions.length }} 题)
-          </a-button>
-        </a-space>
-      </div>
-
-      <!-- Preview Stats Summary -->
-      <div v-if="previewStats" style="margin-bottom: 12px;">
-        <a-space :size="16">
-          <span style="color: #666; font-size: 13px;">模型: <b>{{ previewStats.modelName || '-' }}</b></span>
-          <span style="color: #666; font-size: 13px;">耗时: <b>{{ previewStats.durationText || '-' }}</b></span>
-          <span style="color: #666; font-size: 13px;">Token: <b>{{ previewStats.totalTokens?.toLocaleString() || '-' }}</b></span>
-        </a-space>
-      </div>
-
-      <!-- Preview Table -->
-      <a-table
-        :columns="previewColumns"
-        :data-source="previewQuestions"
-        :row-selection="{ selectedRowKeys: previewSelectedKeys, onChange: (keys: string[]) => { previewSelectedKeys = keys } }"
-        row-key="_uid"
-        :pagination="{ pageSize: 50, showTotal: (total: number) => `共 ${total} 道` }"
-        size="middle"
+      <a-result
+        status="success"
+        :title="`成功生成 ${bankResultModal.generated} 道题目`"
+        sub-title="所有题目已保存为草稿状态，可在列表中查看和审核"
       >
-        <template #bodyCell="{ column, record }">
-          <template v-if="column.key === 'stem'">
-            <a class="stem-cell" @click="showPreviewDetail(record)">{{ record.stem }}</a>
-            <a-tag v-if="record._fromExisting" color="gold" style="margin-left: 4px; font-size: 11px;">已有</a-tag>
-          </template>
-          <template v-if="column.key === 'question_type'">
-            <a-tag :color="typeColor(record.question_type)">{{ typeLabel(record.question_type) }}</a-tag>
-          </template>
-          <template v-if="column.key === 'difficulty'">
-            <a-rate :value="record.difficulty" disabled :count="5" style="font-size: 12px" />
-          </template>
-          <template v-if="column.key === 'dimension'">
-            <a-tag v-if="record.dimension" :color="dimensionColor(record.dimension)">{{ record.dimension }}</a-tag>
-            <span v-else style="color: #ccc">未分类</span>
-          </template>
-          <template v-if="column.key === 'correct_answer'">
-            <span style="color: #52c41a; font-weight: 600;">{{ record.correct_answer }}</span>
-          </template>
-          <template v-if="column.key === 'preview_actions'">
-            <a-space>
-              <a-button size="small" type="link" @click="showPreviewDetail(record)">
-                <template #icon><EyeOutlined /></template>
-              </a-button>
-              <a-popconfirm title="确认移除此题？" @confirm="removePreviewQuestion(record._uid)">
-                <a-button size="small" type="link" danger>
-                  <template #icon><DeleteOutlined /></template>
-                </a-button>
-              </a-popconfirm>
-            </a-space>
-          </template>
+        <template #extra>
+          <a-button type="primary" @click="bankResultModal.visible = false; fetchQuestions()">
+            查看题目列表
+          </a-button>
         </template>
-      </a-table>
-    </a-drawer>
-
-    <!-- Candidate Question Selector Modal -->
-    <a-modal
-      v-model:open="candidateSelectorVisible"
-      title="从已有题库添加题目"
-      width="960px"
-      @ok="addCandidatesToPreview"
-      ok-text="添加选中"
-      :ok-button-props="{ disabled: candidateSelectedKeys.length === 0 }"
-    >
-      <a-row :gutter="8" style="margin-bottom: 12px">
-        <a-col :span="7">
-          <a-input
-            v-model:value="candidateFilters.keyword"
-            placeholder="搜索题干关键词"
-            allow-clear
-            @press-enter="fetchCandidateQuestions"
-          >
-            <template #prefix><SearchOutlined /></template>
-          </a-input>
-        </a-col>
-        <a-col :span="5">
-          <a-select v-model:value="candidateFilters.question_type" placeholder="题型" allow-clear style="width: 100%" @change="fetchCandidateQuestions">
-            <a-select-option value="single_choice">单选题</a-select-option>
-            <a-select-option value="multiple_choice">多选题</a-select-option>
-            <a-select-option value="true_false">判断题</a-select-option>
-            <a-select-option value="fill_blank">填空题</a-select-option>
-            <a-select-option value="short_answer">简答题</a-select-option>
-          </a-select>
-        </a-col>
-        <a-col :span="5">
-          <a-select v-model:value="candidateFilters.dimension" placeholder="维度" allow-clear style="width: 100%" @change="fetchCandidateQuestions">
-            <a-select-option value="AI基础知识">AI基础知识</a-select-option>
-            <a-select-option value="AI技术应用">AI技术应用</a-select-option>
-            <a-select-option value="AI伦理安全">AI伦理安全</a-select-option>
-            <a-select-option value="AI批判思维">AI批判思维</a-select-option>
-            <a-select-option value="AI创新实践">AI创新实践</a-select-option>
-          </a-select>
-        </a-col>
-        <a-col :span="3">
-          <a-button type="primary" @click="fetchCandidateQuestions">查询</a-button>
-        </a-col>
-        <a-col :span="4" style="text-align: right;">
-          <span v-if="candidateSelectedKeys.length > 0" style="color: #1f4e79; font-weight: 500;">
-            已选 {{ candidateSelectedKeys.length }} 题
-          </span>
-        </a-col>
-      </a-row>
-
-      <a-table
-        :columns="candidateColumns"
-        :data-source="candidateQuestions"
-        :loading="candidateLoading"
-        :row-selection="{ selectedRowKeys: candidateSelectedKeys, onChange: (keys: string[]) => { candidateSelectedKeys = keys } }"
-        row-key="id"
-        :pagination="candidatePagination"
-        @change="handleCandidateTableChange"
-        size="small"
-      >
-        <template #bodyCell="{ column, record }">
-          <template v-if="column.key === 'stem'">
-            <a class="stem-cell">{{ record.stem }}</a>
-          </template>
-          <template v-if="column.key === 'question_type'">
-            <a-tag :color="typeColor(record.question_type)">{{ typeLabel(record.question_type) }}</a-tag>
-          </template>
-          <template v-if="column.key === 'difficulty'">
-            <a-rate :value="record.difficulty" disabled :count="5" style="font-size: 12px" />
-          </template>
-          <template v-if="column.key === 'dimension'">
-            <a-tag v-if="record.dimension" :color="dimensionColor(record.dimension)">{{ record.dimension }}</a-tag>
-            <span v-else style="color: #ccc">未分类</span>
-          </template>
-          <template v-if="column.key === 'status'">
-            <a-tag :color="statusColor(record.status)">{{ statusLabel(record.status) }}</a-tag>
-          </template>
-          <template v-if="column.key === 'created_at'">
-            {{ formatDate(record.created_at) }}
-          </template>
-        </template>
-      </a-table>
+      </a-result>
     </a-modal>
 
     <!-- Import MD Modal -->
@@ -938,29 +604,98 @@
       v-model:open="importModalVisible"
       title="导入题目（Markdown 格式）"
       :footer="null"
-      width="520px"
+      width="580px"
+      @cancel="importPreview = null; importPendingFile = null; importResult = null"
     >
+      <!-- Answer type format hint -->
       <a-alert
         type="info"
         show-icon
         style="margin-bottom: 16px"
-        message="请上传通过本系统导出的 .md 格式题库文件，导入的题目将以草稿状态进入审核流程。"
-      />
-
-      <a-upload-dragger
-        :before-upload="handleImportUpload"
-        :show-upload-list="false"
-        accept=".md"
-        :disabled="importLoading"
+        message="试题类型与答案格式对照"
       >
-        <p class="ant-upload-drag-icon">
-          <UploadOutlined />
-        </p>
-        <p class="ant-upload-text">点击或拖拽 .md 文件到此区域</p>
-        <p class="ant-upload-hint">仅支持 Markdown 格式的题库文件</p>
-      </a-upload-dragger>
+        <template #description>
+          <div style="font-size: 12px; line-height: 1.8">
+            <span style="margin-right: 16px">📌 <b>单选题</b>：答案为单个字母，如 <code>A</code></span>
+            <span style="margin-right: 16px">📌 <b>多选题</b>：答案为多个字母，如 <code>ABD</code></span><br/>
+            <span style="margin-right: 16px">📌 <b>判断题</b>：答案为 <code>T（正确）</code> 或 <code>F（错误）</code></span>
+            <span>📌 <b>填空/简答</b>：答案为文本内容</span>
+          </div>
+        </template>
+      </a-alert>
 
-      <div v-if="importLoading" style="margin-top: 16px; text-align: center">
+      <!-- File picker (show when no file selected yet and no result) -->
+      <template v-if="!importPendingFile && !importResult">
+        <a-upload-dragger
+          :before-upload="handleImportSelect"
+          :show-upload-list="false"
+          accept=".md"
+        >
+          <p class="ant-upload-drag-icon"><UploadOutlined /></p>
+          <p class="ant-upload-text">点击或拖拽 .md 文件到此区域</p>
+          <p class="ant-upload-hint">仅支持 Markdown 格式的题库文件</p>
+        </a-upload-dragger>
+      </template>
+
+      <!-- File selected: preview + confirm -->
+      <template v-if="importPendingFile && !importResult">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px">
+          <a-tag color="blue">{{ importPendingFile.name }}</a-tag>
+          <a-button size="small" type="text" danger @click="importPendingFile = null; importPreview = null">移除</a-button>
+        </div>
+
+        <!-- Pre-analysis -->
+        <a-button
+          :loading="importPreviewing"
+          style="margin-bottom: 12px"
+          @click="handleImportPreview"
+        >
+          <template #icon><SearchOutlined /></template>
+          解析预览（检查题目结构）
+        </a-button>
+
+        <div v-if="importPreview" class="import-preview-block">
+          <a-descriptions :column="2" size="small" bordered style="margin-bottom: 10px">
+            <a-descriptions-item label="共解析题目">{{ importPreview.total }} 道</a-descriptions-item>
+            <a-descriptions-item label="答案问题">
+              <span :style="importPreview.answer_issues.length > 0 ? 'color:#faad14' : 'color:#52c41a'">
+                {{ importPreview.answer_issues.length > 0 ? importPreview.answer_issues.length + ' 处' : '无' }}
+              </span>
+            </a-descriptions-item>
+          </a-descriptions>
+
+          <div style="margin-bottom: 8px; font-weight: 500; font-size: 13px">题型统计</div>
+          <a-table
+            :data-source="importPreview.type_stats"
+            :columns="importPreviewColumns"
+            :pagination="false"
+            size="small"
+            style="margin-bottom: 10px"
+          />
+
+          <a-alert
+            v-if="importPreview.answer_issues.length > 0"
+            type="warning"
+            show-icon
+            :message="`发现 ${importPreview.answer_issues.length} 处答案格式问题，建议修正后再导入`"
+          >
+            <template #description>
+              <div v-for="(issue, i) in importPreview.answer_issues" :key="i" style="font-size: 12px">
+                {{ issue.message }}
+              </div>
+            </template>
+          </a-alert>
+          <a-alert v-else type="success" show-icon message="答案格式检查通过，可以导入" />
+        </div>
+
+        <a-divider style="margin: 12px 0" />
+        <a-button type="primary" :loading="importLoading" block @click="handleImportUpload">
+          确认导入
+        </a-button>
+      </template>
+
+      <!-- Result -->
+      <div v-if="importLoading && !importResult" style="margin-top: 16px; text-align: center">
         <a-spin tip="正在导入..." />
       </div>
 
@@ -971,7 +706,7 @@
         style="margin-top: 16px; padding: 16px 0"
       >
         <template #extra>
-          <a-button type="primary" @click="importModalVisible = false; importResult = null; fetchQuestions()">
+          <a-button type="primary" @click="importModalVisible = false; importResult = null; importPendingFile = null; importPreview = null; fetchQuestions()">
             查看题目列表
           </a-button>
         </template>
@@ -989,7 +724,6 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted } from 'vue'
-import { useRoute } from 'vue-router'
 import {
   PlusOutlined,
   SearchOutlined,
@@ -1004,11 +738,10 @@ import {
   AuditOutlined,
   ReloadOutlined,
   EyeOutlined,
-  EditOutlined,
-  DeleteOutlined,
 } from '@ant-design/icons-vue'
 import { message, Modal } from 'ant-design-vue'
 import request from '@/utils/request'
+import { checkLLMModule } from '@/composables/useLLMStatus'
 
 // ---- State ----
 const loading = ref(false)
@@ -1022,8 +755,6 @@ const reviewModalVisible = ref(false)
 const editingQuestion = ref<any>(null)
 const detailQuestion = ref<any>(null)
 const aiCheckResult = ref<any>(null)
-const aiResultModalVisible = ref(false)
-const aiCheckQuestionId = ref('')
 const reviewHistory = ref<any[]>([])
 const reviewModalAction = ref('')
 const reviewModalQuestionId = ref('')
@@ -1083,7 +814,7 @@ const hasOptions = computed(() =>
 
 // ---- Table Columns ----
 const columns = [
-  { title: '题干', key: 'stem', dataIndex: 'stem', width: 320 },
+  { title: '题干', key: 'stem', dataIndex: 'stem', ellipsis: true, width: 280 },
   { title: '题型', key: 'question_type', dataIndex: 'question_type', width: 90 },
   { title: '难度', key: 'difficulty', dataIndex: 'difficulty', width: 140 },
   { title: '维度', key: 'dimension', dataIndex: 'dimension', width: 120, ellipsis: true },
@@ -1094,33 +825,13 @@ const columns = [
 
 // ---- Review Tab Columns ----
 const reviewColumns = [
-  { title: '题干', key: 'stem', dataIndex: 'stem', width: 340 },
+  { title: '题干', key: 'stem', dataIndex: 'stem', ellipsis: true, width: 300 },
   { title: '题型', key: 'question_type', dataIndex: 'question_type', width: 90 },
   { title: '难度', key: 'difficulty', dataIndex: 'difficulty', width: 140 },
   { title: '维度', key: 'dimension', dataIndex: 'dimension', width: 120, ellipsis: true },
   { title: '认知层次', key: 'bloom_level', dataIndex: 'bloom_level', width: 90 },
   { title: '创建时间', key: 'created_at', dataIndex: 'created_at', width: 110 },
   { title: '操作', key: 'review_actions', width: 260, fixed: 'right' as const },
-]
-
-// ---- Preview Table Columns ----
-const previewColumns = [
-  { title: '题干', key: 'stem', dataIndex: 'stem', width: 300 },
-  { title: '题型', key: 'question_type', dataIndex: 'question_type', width: 90 },
-  { title: '难度', key: 'difficulty', dataIndex: 'difficulty', width: 140 },
-  { title: '维度', key: 'dimension', dataIndex: 'dimension', width: 120, ellipsis: true },
-  { title: '答案', key: 'correct_answer', dataIndex: 'correct_answer', width: 80 },
-  { title: '操作', key: 'preview_actions', width: 100 },
-]
-
-// ---- Candidate Table Columns ----
-const candidateColumns = [
-  { title: '题干', key: 'stem', dataIndex: 'stem', width: 280 },
-  { title: '题型', key: 'question_type', dataIndex: 'question_type', width: 90 },
-  { title: '难度', key: 'difficulty', dataIndex: 'difficulty', width: 140 },
-  { title: '维度', key: 'dimension', dataIndex: 'dimension', width: 120, ellipsis: true },
-  { title: '状态', key: 'status', dataIndex: 'status', width: 90 },
-  { title: '创建时间', key: 'created_at', dataIndex: 'created_at', width: 110 },
 ]
 
 // Computed: client-side filter for review tab (type & dimension)
@@ -1182,14 +893,10 @@ function statusColor(s: string) {
   }
   return map[s] || 'default'
 }
+function truncate(s: string, n: number) { return s.length > n ? s.slice(0, n) + '...' : s }
 function formatDate(d: string) {
   if (!d) return '-'
-  const dt = new Date(d)
-  const M = String(dt.getMonth() + 1).padStart(2, '0')
-  const D = String(dt.getDate()).padStart(2, '0')
-  const h = String(dt.getHours()).padStart(2, '0')
-  const m = String(dt.getMinutes()).padStart(2, '0')
-  return `${M}-${D} ${h}:${m}`
+  return new Date(d).toLocaleDateString('zh-CN')
 }
 
 // ---- API Calls ----
@@ -1401,51 +1108,12 @@ async function runAICheck(id: string) {
   aiCheckLoading.value = true
   try {
     aiCheckResult.value = await request.post(`/questions/${id}/ai-check`)
-    aiCheckQuestionId.value = id
-    aiResultModalVisible.value = true
+    message.success('AI质量检查完成')
     await loadReviewHistory(id)
   } catch (e) {
     message.error('AI检查失败')
   } finally {
     aiCheckLoading.value = false
-  }
-}
-
-function aiScore10(score5: number): number {
-  return Math.round(score5 * 2)
-}
-
-async function aiResultApprove() {
-  aiResultModalVisible.value = false
-  try {
-    await request.post(`/questions/${aiCheckQuestionId.value}/review`, { action: 'approve', comment: 'AI检查通过' })
-    message.success('已通过')
-    if (activeTab.value === 'review') {
-      await fetchReviewQuestions()
-    } else {
-      fetchQuestions()
-    }
-    if (detailQuestion.value?.id === aiCheckQuestionId.value) {
-      detailQuestion.value.status = 'approved'
-    }
-  } catch (e) {
-    message.error('操作失败')
-  }
-}
-
-async function aiResultDelete() {
-  aiResultModalVisible.value = false
-  try {
-    await request.delete(`/questions/${aiCheckQuestionId.value}`)
-    message.success('题目已删除')
-    detailVisible.value = false
-    if (activeTab.value === 'review') {
-      await fetchReviewQuestions()
-    } else {
-      fetchQuestions()
-    }
-  } catch (e) {
-    message.error('删除失败')
   }
 }
 
@@ -1642,23 +1310,60 @@ function batchDelete() {
 // ---- Import / Export ----
 const importModalVisible = ref(false)
 const importLoading = ref(false)
+const importPreviewing = ref(false)
 const importResult = ref<any>(null)
+const importPendingFile = ref<File | null>(null)
+const importPreview = ref<any>(null)
+
+const importPreviewColumns = [
+  { title: '题型', dataIndex: 'label', key: 'label' },
+  { title: '题数', dataIndex: 'count', key: 'count', width: 70 },
+  { title: '示例答案', dataIndex: 'sample_answer', key: 'sample_answer', width: 100 },
+]
 
 function showImportModal() {
   importResult.value = null
+  importPendingFile.value = null
+  importPreview.value = null
   importModalVisible.value = true
 }
 
-async function handleImportUpload(file: File) {
+function handleImportSelect(file: File) {
+  importPendingFile.value = file
+  importPreview.value = null
+  return false // prevent default upload
+}
+
+async function handleImportPreview() {
+  if (!importPendingFile.value) return
+  importPreviewing.value = true
+  try {
+    const formData = new FormData()
+    formData.append('file', importPendingFile.value)
+    const data: any = await request.post('/questions/batch/preview-md', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    importPreview.value = data
+  } catch (e: any) {
+    message.error(e?.response?.data?.detail || '预览失败')
+  } finally {
+    importPreviewing.value = false
+  }
+}
+
+async function handleImportUpload() {
+  if (!importPendingFile.value) return
   importLoading.value = true
   importResult.value = null
   try {
     const formData = new FormData()
-    formData.append('file', file)
+    formData.append('file', importPendingFile.value)
     const data: any = await request.post('/questions/batch/import-md', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
     importResult.value = data
+    importPendingFile.value = null
+    importPreview.value = null
     if (data.imported > 0) {
       message.success(`成功导入 ${data.imported} 道题目`)
     }
@@ -1667,7 +1372,6 @@ async function handleImportUpload(file: File) {
   } finally {
     importLoading.value = false
   }
-  return false // prevent default upload behaviour
 }
 
 async function exportSelectedMd() {
@@ -1723,46 +1427,7 @@ const bankTypeDist = reactive({
 const bankResultModal = reactive({
   visible: false,
   generated: 0,
-  modelName: '' as string,
-  durationText: '' as string,
-  totalTokens: 0 as number,
-  promptTokens: 0 as number,
-  completionTokens: 0 as number,
-  typeCounts: {} as Record<string, number>,
 })
-
-const genModelName = ref('')
-
-// ---- Preview & Review State ----
-const previewDrawerVisible = ref(false)
-const previewQuestions = ref<any[]>([])
-const previewSelectedKeys = ref<string[]>([])
-const previewSaving = ref(false)
-const previewStats = ref<any>(null)
-
-// Candidate selector
-const candidateSelectorVisible = ref(false)
-const candidateQuestions = ref<any[]>([])
-const candidateSelectedKeys = ref<string[]>([])
-const candidateLoading = ref(false)
-const candidateFilters = reactive({
-  keyword: '',
-  question_type: undefined as string | undefined,
-  dimension: undefined as string | undefined,
-})
-const candidatePagination = reactive({
-  current: 1,
-  pageSize: 10,
-  total: 0,
-  showSizeChanger: true,
-  showTotal: (total: number) => `共 ${total} 条`,
-})
-
-let previewUidCounter = 0
-function assignPreviewUid(item: any) {
-  item._uid = `preview_${++previewUidCounter}`
-  return item
-}
 
 // ---- Generation Progress ----
 const genProgress = reactive({
@@ -1863,18 +1528,14 @@ async function showBankBuildModal() {
   bankTypeDist.short_answer = 0
   bankBuildModal.visible = true
 
-  // Fetch parsed + vectorized materials and model name
+  // Fetch parsed + vectorized materials
   bankBuildModal.materialsLoading = true
   try {
-    const [d1, d2, healthData]: any[] = await Promise.all([
+    const [d1, d2]: any[] = await Promise.all([
       request.get('/materials', { params: { status: 'parsed', skip: 0, limit: 100 } }),
       request.get('/materials', { params: { status: 'vectorized', skip: 0, limit: 100 } }),
-      request.get('/health').catch(() => null),
     ])
     parsedMaterials.value = [...(d1.data || []), ...(d2.data || [])]
-    if (healthData?.llm_model) {
-      genModelName.value = healthData.llm_model
-    }
   } catch {
     parsedMaterials.value = []
   } finally {
@@ -1926,6 +1587,9 @@ async function autoSuggest() {
 }
 
 async function handleBankBuild() {
+  // Check LLM configuration before generating
+  await checkLLMModule('question_generation', '题目生成')
+
   const dist: Record<string, number> = {}
   for (const [k, v] of Object.entries(bankTypeDist)) {
     if (v > 0) dist[k] = v
@@ -1937,14 +1601,8 @@ async function handleBankBuild() {
 
   bankBuildModal.loading = true
   startGenProgress(bankTotalCount.value)
-
-  // Aggregated stats
-  let allPreviewItems: any[] = []
-  let aggTokens = { total: 0, prompt: 0, completion: 0 }
-  let aggDuration = 0
-  let modelName = ''
-
   try {
+    let totalGenerated = 0
     const payload = {
       type_distribution: dist,
       difficulty: bankBuildModal.difficulty,
@@ -1953,57 +1611,31 @@ async function handleBankBuild() {
     }
 
     if (bankBuildModal.materialIds.length > 0) {
-      // Preview from each selected material (no DB save)
+      // Generate from each selected material
       for (const matId of bankBuildModal.materialIds) {
         const result: any = await request.post(
-          `/questions/preview/bank/${matId}`,
+          `/questions/generate/bank/${matId}`,
           payload,
           { timeout: 300000 },
         )
-        allPreviewItems.push(...(result.questions || []))
-        if (result.model_name) modelName = result.model_name
-        if (result.stats) {
-          aggTokens.total += result.stats.total_tokens || 0
-          aggTokens.prompt += result.stats.prompt_tokens || 0
-          aggTokens.completion += result.stats.completion_tokens || 0
-          aggDuration += result.stats.duration_seconds || 0
-        }
+        totalGenerated += result.generated || 0
       }
     } else {
-      // Free preview generation (no DB save)
+      // Free generation without material
       const result: any = await request.post(
-        '/questions/preview/free',
+        '/questions/generate/free',
         payload,
         { timeout: 300000 },
       )
-      allPreviewItems = result.questions || []
-      if (result.model_name) modelName = result.model_name
-      if (result.stats) {
-        aggTokens.total = result.stats.total_tokens || 0
-        aggTokens.prompt = result.stats.prompt_tokens || 0
-        aggTokens.completion = result.stats.completion_tokens || 0
-        aggDuration = result.stats.duration_seconds || 0
-      }
+      totalGenerated = result.generated || 0
     }
 
     stopGenProgress(true)
+    // Small delay to show 100% before closing
     await new Promise(r => setTimeout(r, 600))
     bankBuildModal.visible = false
-
-    // Open preview drawer for review
-    previewUidCounter = 0
-    previewQuestions.value = allPreviewItems.map(assignPreviewUid)
-    previewSelectedKeys.value = []
-    const dur = aggDuration || (Date.now() - genStartTime) / 1000
-    previewStats.value = {
-      modelName,
-      durationText: formatDuration(dur * 1000),
-      totalTokens: aggTokens.total,
-      promptTokens: aggTokens.prompt,
-      completionTokens: aggTokens.completion,
-    }
-    previewDrawerVisible.value = true
-    message.success(`已生成 ${allPreviewItems.length} 道题目，请审阅后保存`)
+    bankResultModal.generated = totalGenerated
+    bankResultModal.visible = true
   } catch {
     stopGenProgress(false)
     message.error('题目生成失败，请重试')
@@ -2012,167 +1644,22 @@ async function handleBankBuild() {
   }
 }
 
-function closeBankResult() {
-  bankResultModal.visible = false
-  fetchQuestions()
-}
-
-// ---- Preview & Review Functions ----
-function removePreviewQuestion(uid: string) {
-  previewQuestions.value = previewQuestions.value.filter(q => q._uid !== uid)
-}
-
-function removeSelectedPreview() {
-  previewQuestions.value = previewQuestions.value.filter(
-    q => !previewSelectedKeys.value.includes(q._uid)
-  )
-  message.success(`已移除 ${previewSelectedKeys.value.length} 道题目`)
-  previewSelectedKeys.value = []
-}
-
-async function savePreviewQuestions() {
-  if (previewQuestions.value.length === 0) {
-    message.warning('没有可保存的题目')
-    return
-  }
-  previewSaving.value = true
-  try {
-    // Strip frontend-only fields before sending
-    const payload = previewQuestions.value.map(({ _uid, _fromExisting, ...rest }: any) => rest)
-    const result: any = await request.post('/questions/batch/create-raw', {
-      questions: payload,
-    })
-    message.success(`成功保存 ${result.generated} 道题目为草稿`)
-    previewDrawerVisible.value = false
-    previewQuestions.value = []
-    fetchQuestions()
-  } catch {
-    message.error('保存失败，请重试')
-  } finally {
-    previewSaving.value = false
-  }
-}
-
-function onPreviewDrawerClose() {
-  if (previewQuestions.value.length > 0 && !previewSaving.value) {
-    Modal.confirm({
-      title: '确认放弃',
-      content: `有 ${previewQuestions.value.length} 道题目未保存，确定放弃？`,
-      okText: '放弃',
-      okType: 'danger',
-      cancelText: '继续编辑',
-      onOk() {
-        previewQuestions.value = []
-        previewDrawerVisible.value = false
-      },
-      onCancel() {
-        previewDrawerVisible.value = true
-      },
-    })
-  }
-}
-
-function showPreviewDetail(record: any) {
-  detailQuestion.value = {
-    ...record,
-    id: record._uid,
-    status: 'draft',
-    usage_count: 0,
-    created_at: new Date().toISOString(),
-  }
-  aiCheckResult.value = null
-  reviewHistory.value = []
-  detailVisible.value = true
-}
-
-// ---- Candidate Selector Functions ----
-function openCandidateSelector() {
-  candidateSelectedKeys.value = []
-  candidateFilters.keyword = ''
-  candidateFilters.question_type = undefined
-  candidateFilters.dimension = undefined
-  candidatePagination.current = 1
-  candidateSelectorVisible.value = true
-  fetchCandidateQuestions()
-}
-
-async function fetchCandidateQuestions() {
-  candidateLoading.value = true
-  try {
-    const params: any = {
-      skip: (candidatePagination.current - 1) * candidatePagination.pageSize,
-      limit: candidatePagination.pageSize,
-      status: 'approved',
-    }
-    if (candidateFilters.keyword) params.keyword = candidateFilters.keyword
-    if (candidateFilters.question_type) params.question_type = candidateFilters.question_type
-    if (candidateFilters.dimension) params.dimension = candidateFilters.dimension
-
-    const data: any = await request.get('/questions', { params })
-    candidateQuestions.value = data.items || []
-    candidatePagination.total = data.total || 0
-  } catch {
-    candidateQuestions.value = []
-  } finally {
-    candidateLoading.value = false
-  }
-}
-
-function handleCandidateTableChange(pag: any) {
-  candidatePagination.current = pag.current
-  candidatePagination.pageSize = pag.pageSize
-  fetchCandidateQuestions()
-}
-
-function addCandidatesToPreview() {
-  const selected = candidateQuestions.value.filter(
-    (q: any) => candidateSelectedKeys.value.includes(q.id)
-  )
-  let addedCount = 0
-  for (const q of selected) {
-    // Check duplicates by stem
-    const exists = previewQuestions.value.some((p: any) => p.stem === q.stem)
-    if (exists) continue
-
-    previewQuestions.value.push(assignPreviewUid({
-      question_type: q.question_type,
-      stem: q.stem,
-      options: q.options,
-      correct_answer: q.correct_answer,
-      explanation: q.explanation,
-      difficulty: q.difficulty,
-      dimension: q.dimension,
-      knowledge_tags: q.knowledge_tags,
-      bloom_level: q.bloom_level,
-      source_material_id: q.source_material_id,
-      source_knowledge_unit_id: q.source_knowledge_unit_id,
-      _fromExisting: true,
-    }))
-    addedCount++
-  }
-  if (addedCount > 0) {
-    message.success(`已添加 ${addedCount} 道题目`)
-  } else {
-    message.info('没有新题目可添加（可能已存在）')
-  }
-  candidateSelectorVisible.value = false
-}
-
 // ---- Init ----
-const route = useRoute()
-
 onMounted(() => {
-  if (route.query.tab === 'review') {
-    activeTab.value = 'review'
-    fetchReviewQuestions()
-  } else {
-    fetchQuestions()
-  }
+  fetchQuestions()
   fetchReviewCount()
 })
 </script>
 
 <style scoped>
+.import-preview-block {
+  background: #fafafa;
+  border: 1px solid #e8e8e8;
+  border-radius: 6px;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
 .page-container {
   padding: 0;
 }
@@ -2202,126 +1689,5 @@ onMounted(() => {
 .main-tabs :deep(.ant-tabs-tab-active .ant-tabs-tab-btn) {
   color: #1f4e79;
   font-weight: 600;
-}
-.stem-cell {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  line-height: 1.5;
-  max-height: 3em;
-  word-break: break-all;
-}
-
-/* Generation progress - animated robot */
-.gen-model-info {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 12px;
-  padding: 10px 16px;
-  background: linear-gradient(135deg, #f0f7ff 0%, #e8f4f8 100%);
-  border-radius: 8px;
-  border: 1px solid #d6e8f5;
-}
-.gen-robot-icon {
-  font-size: 28px;
-  color: #1F4E79;
-  animation: robotPulse 1.5s ease-in-out infinite;
-}
-.gen-model-name {
-  font-size: 14px;
-  font-weight: 600;
-  color: #1F4E79;
-}
-
-@keyframes robotPulse {
-  0%, 100% { transform: scale(1) rotate(0deg); opacity: 1; }
-  25% { transform: scale(1.15) rotate(-5deg); opacity: 0.85; }
-  50% { transform: scale(1) rotate(0deg); opacity: 1; }
-  75% { transform: scale(1.15) rotate(5deg); opacity: 0.85; }
-}
-
-/* Generation result report */
-.gen-report-section {
-  margin-top: 16px;
-}
-.gen-report-title {
-  font-size: 15px;
-  font-weight: 600;
-  color: #333;
-  margin-bottom: 8px;
-}
-.gen-report-card {
-  background: #fafafa;
-  border-radius: 8px;
-  padding: 12px 16px;
-  border: 1px solid #f0f0f0;
-}
-.gen-report-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 6px 0;
-  border-bottom: 1px solid #f0f0f0;
-}
-.gen-report-row:last-child {
-  border-bottom: none;
-}
-.gen-report-label {
-  color: #666;
-  font-size: 13px;
-}
-.gen-report-value {
-  font-weight: 600;
-  color: #333;
-  font-size: 13px;
-}
-
-/* Type distribution bars */
-.gen-type-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 0;
-  border-bottom: 1px solid #f0f0f0;
-}
-.gen-type-row:last-child {
-  border-bottom: none;
-}
-.gen-type-label {
-  width: 56px;
-  font-size: 13px;
-  color: #666;
-  flex-shrink: 0;
-}
-.gen-type-count {
-  width: 44px;
-  font-size: 13px;
-  font-weight: 600;
-  color: #333;
-  flex-shrink: 0;
-  text-align: right;
-}
-.gen-type-bar-bg {
-  flex: 1;
-  height: 12px;
-  background: #f0f0f0;
-  border-radius: 6px;
-  overflow: hidden;
-}
-.gen-type-bar {
-  height: 100%;
-  background: linear-gradient(90deg, #1F4E79, #3D8ED0);
-  border-radius: 6px;
-  transition: width 0.6s ease;
-}
-.gen-type-pct {
-  width: 36px;
-  font-size: 12px;
-  color: #999;
-  flex-shrink: 0;
-  text-align: right;
 }
 </style>

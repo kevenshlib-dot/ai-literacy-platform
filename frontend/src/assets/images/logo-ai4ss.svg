@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" fill="none">
+  <!-- AI4SS LAB 圆形徽章 -->
+  <defs>
+    <linearGradient id="ai4ss-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#2A6BA6"/>
+      <stop offset="100%" style="stop-color:#1F4E79"/>
+    </linearGradient>
+  </defs>
+  <!-- 外圆 -->
+  <circle cx="100" cy="100" r="95" fill="none" stroke="#1F4E79" stroke-width="3"/>
+  <circle cx="100" cy="100" r="88" fill="none" stroke="#1F4E79" stroke-width="1"/>
+  <!-- 上方弧形文字: 社会科学智能实验室 -->
+  <path id="topArc" d="M 30 100 A 70 70 0 0 1 170 100" fill="none"/>
+  <text font-size="13" font-weight="600" fill="#1F4E79" letter-spacing="4">
+    <textPath href="#topArc" startOffset="50%" text-anchor="middle">社会科学智能实验室</textPath>
+  </text>
+  <!-- 下方弧形文字: AI Laboratory for Social Sciences -->
+  <path id="bottomArc" d="M 25 110 A 78 78 0 0 0 175 110" fill="none"/>
+  <text font-size="8" fill="#1F4E79" letter-spacing="1">
+    <textPath href="#bottomArc" startOffset="50%" text-anchor="middle">AI Laboratory for Social Sciences</textPath>
+  </text>
+  <!-- 中间 AI4SS LAB 文字 -->
+  <text x="100" y="95" text-anchor="middle" font-size="18" font-weight="800" fill="url(#ai4ss-grad)" font-family="Arial, sans-serif">AI4SS</text>
+  <text x="100" y="113" text-anchor="middle" font-size="12" font-weight="600" fill="#1F4E79" font-family="Arial, sans-serif" letter-spacing="3">LAB</text>
+  <!-- 装饰色条 (仿原logo的蓝黄橙色彩) -->
+  <rect x="72" y="72" width="6" height="18" rx="2" fill="#2A6BA6"/>
+  <rect x="80" y="66" width="6" height="24" rx="2" fill="#F7C948"/>
+  <rect x="88" y="72" width="6" height="18" rx="2" fill="#F47B20"/>
+  <path d="M100 72 L106 72 L103 90 Z" fill="#2A6BA6"/>
+</svg>

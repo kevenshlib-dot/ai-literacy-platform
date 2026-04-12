@@ -80,6 +80,11 @@
         @change="handleTableChange"
       >
         <template #bodyCell="{ column, record }">
+          <template v-if="column.key === 'title'">
+            <a href="javascript:void(0)" @click="openMaterial(record)" style="color: #1677ff; font-weight: 500;">
+              <FileTextOutlined style="margin-right: 4px" />{{ record.title }}
+            </a>
+          </template>
           <template v-if="column.key === 'format'">
             <a-tag :color="formatColors[record.format] || 'default'">
               {{ formatLabels[record.format] || record.format }}
@@ -253,6 +258,7 @@ import {
   UploadOutlined,
   CloudUploadOutlined,
   InboxOutlined,
+  FileTextOutlined,
 } from '@ant-design/icons-vue'
 import request from '@/utils/request'
 
@@ -432,6 +438,16 @@ async function handleBatchUpload() {
     // Error handled by interceptor
   } finally {
     uploading.value = false
+  }
+}
+
+// Open / Preview material in new tab
+async function openMaterial(record: Material) {
+  try {
+    const res: any = await request.get(`/materials/${record.id}/download`)
+    window.open(res.download_url, '_blank')
+  } catch {
+    message.error('打开素材失败')
   }
 }
 

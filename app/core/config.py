@@ -4,10 +4,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     # Application
     APP_NAME: str = "AI素养评测平台"
-    APP_VERSION: str = "0.1.0"
+    APP_VERSION: str = "2.2.1"
     DEBUG: bool = True
     SECRET_KEY: str = "change-this"
     API_V1_PREFIX: str = "/api/v1"
+    APP_PORT: int = 8080
 
     # PostgreSQL
     POSTGRES_HOST: str = "localhost"
@@ -74,10 +75,10 @@ class Settings(BaseSettings):
     def REDIS_URL(self) -> str:
         return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/0"
 
-    # LLM (vLLM local server)
-    LLM_API_KEY: str = "token-not-needed"
-    LLM_BASE_URL: str = "http://localhost:8100/v1"
-    LLM_MODEL: str = "Qwen/Qwen3.5-35B-A3B"
+    # LLM
+    LLM_API_KEY: str = "your-api-key"
+    LLM_BASE_URL: str = "https://api.deepseek.com/v1"
+    LLM_MODEL: str = "deepseek-reasoner"
 
     # JWT
     JWT_SECRET_KEY: str = "change-this"

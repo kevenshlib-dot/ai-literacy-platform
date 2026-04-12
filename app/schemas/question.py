@@ -85,19 +85,9 @@ class BatchGenerateRequest(BaseModel):
     max_units: int = Field(default=10, ge=1, le=50)
 
 
-class GenerateStats(BaseModel):
-    total_tokens: int = 0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    duration_seconds: float = 0.0
-    type_counts: dict = {}
-
-
 class GenerateResponse(BaseModel):
     generated: int
     questions: List[QuestionResponse]
-    stats: Optional[GenerateStats] = None
-    model_name: Optional[str] = None
 
 
 class ReviewRequest(BaseModel):
@@ -171,31 +161,3 @@ class QuestionBankSuggestResponse(BaseModel):
     suggested_distribution: dict
     suggested_total: int
     difficulty: int
-
-
-class PreviewQuestionItem(BaseModel):
-    """预览题目（未保存），匹配 generate_questions_via_llm() 的原始dict结构。"""
-    question_type: str
-    stem: str
-    options: Optional[dict] = None
-    correct_answer: str
-    explanation: Optional[str] = None
-    difficulty: int = Field(default=3, ge=1, le=5)
-    dimension: Optional[str] = None
-    knowledge_tags: Optional[list] = None
-    bloom_level: Optional[str] = None
-    source_material_id: Optional[UUID] = None
-    source_knowledge_unit_id: Optional[UUID] = None
-
-
-class PreviewResponse(BaseModel):
-    """预览生成结果（不存DB）。"""
-    questions: List[PreviewQuestionItem]
-    total: int
-    stats: Optional[GenerateStats] = None
-    model_name: Optional[str] = None
-
-
-class BatchCreateFromRawRequest(BaseModel):
-    """批量保存预览题目到数据库。"""
-    questions: List[PreviewQuestionItem]

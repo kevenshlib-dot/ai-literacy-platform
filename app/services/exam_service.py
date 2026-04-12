@@ -9,8 +9,12 @@ from sqlalchemy import select, func, and_, or_, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.models.answer import AnswerSheet, Answer
 from app.models.exam import Exam, ExamQuestion, ExamStatus
+from app.models.interactive import InteractiveSession
+from app.models.paper import Paper, PaperStatus
 from app.models.question import Question, QuestionType, QuestionStatus
+from app.models.score import Score, ScoreDetail
 
 
 async def create_exam(
@@ -68,6 +72,13 @@ async def list_exams(
             conditions.append(Exam.title.startswith("随机测试"))
         elif is_random_test is False:
             conditions.append(~Exam.title.startswith("随机测试"))
+    # Exclude exams whose linked paper is archived (unless in archive mode)
+    if not archive:
+        archived_paper_ids = select(Paper.id).where(Paper.status == PaperStatus.ARCHIVED).scalar_subquery()
+        conditions.append(or_(
+            Exam.paper_id.is_(None),
+            ~Exam.paper_id.in_(archived_paper_ids),
+        ))
     if keyword:
         conditions.append(Exam.title.ilike(f"%{keyword}%"))
     if created_by:
@@ -107,10 +118,24 @@ async def delete_exam(db: AsyncSession, exam_id: uuid.UUID) -> bool:
     exam = await get_exam_by_id(db, exam_id)
     if not exam:
         return False
-    # Delete exam questions first
-    await db.execute(
-        delete(ExamQuestion).where(ExamQuestion.exam_id == exam_id)
-    )
+
+    # Cascade-delete all related records
+    sheet_ids_subq = select(AnswerSheet.id).where(AnswerSheet.exam_id == exam_id).scalar_subquery()
+
+    # 1. score_details → scores
+    score_ids_subq = select(Score.id).where(Score.answer_sheet_id.in_(sheet_ids_subq)).scalar_subquery()
+    await db.execute(delete(ScoreDetail).where(ScoreDetail.score_id.in_(score_ids_subq)))
+    await db.execute(delete(Score).where(Score.answer_sheet_id.in_(sheet_ids_subq)))
+
+    # 2. interactive_sessions
+    await db.execute(delete(InteractiveSession).where(InteractiveSession.answer_sheet_id.in_(sheet_ids_subq)))
+
+    # 3. answers → answer_sheets
+    await db.execute(delete(Answer).where(Answer.answer_sheet_id.in_(sheet_ids_subq)))
+    await db.execute(delete(AnswerSheet).where(AnswerSheet.exam_id == exam_id))
+
+    # 4. exam_questions → exam
+    await db.execute(delete(ExamQuestion).where(ExamQuestion.exam_id == exam_id))
     await db.delete(exam)
     await db.flush()
     return True

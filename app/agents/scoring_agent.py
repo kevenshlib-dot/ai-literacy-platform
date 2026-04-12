@@ -10,7 +10,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
-from app.agents.llm_utils import strip_thinking_tags
+from app.core.llm_config import get_llm_config_sync, make_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -47,16 +47,14 @@ def score_subjective_answer(
 
     Returns dict with earned_score, is_correct, and feedback.
     """
-    if settings.LLM_API_KEY == "your-api-key":
+    _cfg = get_llm_config_sync("scoring")
+    if _cfg.api_key == "your-api-key":
         return _rule_based_scoring(
             stem, correct_answer, student_answer, question_type, max_score
         )
 
     try:
-        client = OpenAI(
-            api_key=settings.LLM_API_KEY,
-            base_url=settings.LLM_BASE_URL,
-        )
+        client = make_openai_client(_cfg)
 
         rubric_text = ""
         if rubric:
@@ -70,18 +68,16 @@ def score_subjective_answer(
 请评分并给出反馈。"""
 
         response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
+            model=_cfg.model,
             messages=[
                 {"role": "system", "content": SCORING_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.2,
             max_tokens=512,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
 
         raw = response.choices[0].message.content.strip()
-        raw = strip_thinking_tags(raw)
         if "```json" in raw:
             raw = raw.split("```json", 1)[1].split("```", 1)[0].strip()
         elif "```" in raw:
@@ -223,9 +219,10 @@ def _single_evaluator_score(
 满分：{max_score}"""
 
     try:
-        client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
+        _cfg = get_llm_config_sync("scoring")
+        client = make_openai_client(_cfg)
         response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
+            model=_cfg.model,
             messages=[
                 {"role": "system", "content": PANEL_SYSTEM_PROMPT.format(
                     position_instruction=position_instruction
@@ -234,10 +231,8 @@ def _single_evaluator_score(
             ],
             temperature=0.3,
             max_tokens=512,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         raw = response.choices[0].message.content.strip()
-        raw = strip_thinking_tags(raw)
         if "```json" in raw:
             raw = raw.split("```json", 1)[1].split("```", 1)[0].strip()
         elif "```" in raw:
@@ -276,7 +271,7 @@ def multi_model_score(
             },
         }
 
-    if settings.LLM_API_KEY == "your-api-key":
+    if get_llm_config_sync("scoring").api_key == "your-api-key":
         return _rule_based_panel_scoring(
             stem, correct_answer, student_answer, question_type, max_score, num_evaluators
         )

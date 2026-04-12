@@ -13,25 +13,34 @@ from app.services.parsing_service import parse_material, chunk_text
 logger = logging.getLogger(__name__)
 
 
-async def fetch_file_from_minio(file_path: str) -> bytes:
-    """Download file content from MinIO."""
+async def fetch_file_from_storage(file_path: str) -> bytes:
+    """Download file content from MinIO, or read from local fallback."""
+    from app.services.minio_service import _minio_available, LOCAL_STORAGE_ROOT
+
     parts = file_path.split("/", 1)
     if len(parts) != 2:
         raise ValueError(f"无效的文件路径: {file_path}")
 
     bucket, object_name = parts
-    client = get_minio_client()
 
-    loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(
-        None, lambda: client.get_object(bucket, object_name)
-    )
-    try:
-        data = response.read()
-    finally:
-        response.close()
-        response.release_conn()
-    return data
+    if _minio_available():
+        client = get_minio_client()
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None, lambda: client.get_object(bucket, object_name)
+        )
+        try:
+            data = response.read()
+        finally:
+            response.close()
+            response.release_conn()
+        return data
+
+    # Local filesystem fallback
+    local_path = LOCAL_STORAGE_ROOT / bucket / object_name
+    if local_path.exists():
+        return local_path.read_bytes()
+    raise FileNotFoundError(f"文件不存在: {file_path}")
 
 
 async def parse_and_store(db: AsyncSession, material_id: uuid.UUID) -> bool:
@@ -50,7 +59,7 @@ async def parse_and_store(db: AsyncSession, material_id: uuid.UUID) -> bool:
 
     try:
         # Fetch file from MinIO
-        file_data = await fetch_file_from_minio(material.file_path)
+        file_data = await fetch_file_from_storage(material.file_path)
 
         # Extract filename from path
         filename = material.file_path.rsplit("/", 1)[-1]

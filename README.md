@@ -69,20 +69,25 @@
 │   ├── schemas/                # Pydantic 数据模型
 │   ├── api/v1/endpoints/       # API 端点 (14 模块)
 │   ├── services/               # 业务逻辑层
-│   └── agents/                 # 8 个 AI Agent
+│   └── agents/                 # 9 个 AI Agent
 │       ├── question_agent.py   # 题目生成
 │       ├── scoring_agent.py    # 评分（单评/多评）
 │       ├── review_agent.py     # 质量审核
 │       ├── interactive_agent.py# 情景互动
 │       ├── annotation_agent.py # 自动标注
 │       ├── intent_agent.py     # 意图解析
-│       └── indicator_agents.py # 指标分析
+│       ├── indicator_agents.py # 指标分析
+│       └── paper_parse_agent.py# 试卷智能解析
 ├── frontend/                   # 前端代码
 │   ├── src/views/              # 页面组件
 │   │   ├── Dashboard.vue       # 仪表盘
 │   │   ├── Questions.vue       # 题目管理
 │   │   ├── Materials.vue       # 素材管理
 │   │   └── Scores.vue          # 成绩管理
+│   ├── src/components/
+│   │   └── PaperImportPreview.vue # 交互式导入预览
+│   ├── src/composables/
+│   │   └── useLLMStatus.ts     # LLM 状态检测
 │   └── Dockerfile              # 前端构建 (Nginx)
 ├── docker-compose.yml          # Docker 编排
 ├── docker-compose.webui.yml    # Open WebUI（LLM Chat 调试界面）
@@ -202,3 +207,8 @@ make webui-logs   # 查看日志
 - [服务器迁移重启指南](SERVER_RESTART.md) — 服务器搬迁后重新建立服务
 - [本地开发指南](STARTUP.md) — 开发环境配置
 - [系统管理员手册](AI素养评测平台_系统管理员手册.md) — 详细运维手册
+- [管理员操作手册](docs/USER_MANUAL_ADMIN.md) — 管理员全功能操作指南
+- [组织者操作手册](docs/USER_MANUAL_ORGANIZER.md) — 组织者日常操作指南
+- [考生操作手册](docs/USER_MANUAL_EXAMINEE.md) — 考生考试与查分指南
+- [v2.3 更新日志](docs/CHANGELOG-v2.3.md) — LLM 智能解析、交互式预览、状态检测
+- [v2.0 更新日志](docs/CHANGELOG-v2.0.md) — 试卷管理、Word 导入、系统配置

@@ -12,7 +12,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
-from app.agents.llm_utils import strip_thinking_tags
+from app.core.llm_config import get_llm_config_sync, make_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +30,12 @@ def research_agent(topic: Optional[str] = None) -> dict:
 
     Returns research findings with source references.
     """
-    if settings.LLM_API_KEY == "your-api-key":
+    _cfg = get_llm_config_sync("indicator")
+    if _cfg.api_key == "your-api-key":
         return _rule_based_research(topic)
 
     try:
-        client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
+        client = make_openai_client(_cfg)
         prompt = f"""你是一个AI领域研究员。请分析最新的AI发展动态，识别以下方面的趋势：
 1. 新兴AI技术或工具
 2. AI政策法规变化
@@ -59,14 +60,12 @@ def research_agent(topic: Optional[str] = None) -> dict:
 }}
 ```"""
         response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
+            model=_cfg.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
             max_tokens=1000,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         raw = response.choices[0].message.content.strip()
-        raw = strip_thinking_tags(raw)
         json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
         if json_match:
             raw = json_match.group(1)
@@ -81,11 +80,12 @@ def consultant_agent(research_findings: dict) -> list[dict]:
 
     Generates indicator proposals from research findings.
     """
-    if settings.LLM_API_KEY == "your-api-key":
+    _cfg = get_llm_config_sync("indicator")
+    if _cfg.api_key == "your-api-key":
         return _rule_based_consultant(research_findings)
 
     try:
-        client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
+        client = make_openai_client(_cfg)
         dims_str = "、".join(FIVE_DIMENSIONS)
         findings_str = json.dumps(research_findings, ensure_ascii=False, indent=2)
 
@@ -109,14 +109,12 @@ def consultant_agent(research_findings: dict) -> list[dict]:
 ]
 ```"""
         response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
+            model=_cfg.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.5,
             max_tokens=1000,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         raw = response.choices[0].message.content.strip()
-        raw = strip_thinking_tags(raw)
         json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', raw, re.DOTALL)
         if json_match:
             raw = json_match.group(1)
@@ -131,11 +129,12 @@ def review_agent(proposals: list[dict]) -> list[dict]:
 
     Evaluates feasibility, relevance, and potential issues.
     """
-    if settings.LLM_API_KEY == "your-api-key":
+    _cfg = get_llm_config_sync("indicator")
+    if _cfg.api_key == "your-api-key":
         return _rule_based_review(proposals)
 
     try:
-        client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
+        client = make_openai_client(_cfg)
         proposals_str = json.dumps(proposals, ensure_ascii=False, indent=2)
 
         prompt = f"""你是一个AI素养评测框架的红队审核员。请审查以下指标更新建议，评估：
@@ -162,14 +161,12 @@ def review_agent(proposals: list[dict]) -> list[dict]:
 ]
 ```"""
         response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
+            model=_cfg.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=1000,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         raw = response.choices[0].message.content.strip()
-        raw = strip_thinking_tags(raw)
         json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', raw, re.DOTALL)
         if json_match:
             raw = json_match.group(1)
