@@ -11,6 +11,10 @@
           <template #icon><UploadOutlined /></template>
           导入试卷
         </a-button>
+        <a-button v-if="importModal.preview?.parsed_data" type="primary" ghost @click="importPreviewDrawer = true">
+          <template #icon><SearchOutlined /></template>
+          恢复解析预览
+        </a-button>
         <a-button @click="router.push('/papers/archive')">
           <template #icon><RestOutlined /></template>
           试卷归档
@@ -473,7 +477,7 @@
       title="试卷智能解析预览"
       placement="right"
       :width="'90%'"
-      :destroyOnClose="true"
+      :destroyOnClose="false"
       @close="importPreviewDrawer = false"
     >
       <PaperImportPreview
@@ -487,7 +491,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { PlusOutlined, SearchOutlined, UploadOutlined, DownOutlined, EditOutlined, DeleteOutlined, RestOutlined, DatabaseOutlined } from '@ant-design/icons-vue'
@@ -774,12 +778,14 @@ async function handleImportPreview() {
     formData.append('file', file)
     const data: any = await request.post('/papers/preview-file', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
-      timeout: 60000,  // LLM enhancement may take longer
+      timeout: 180000,  // 3 min — local LLM with thinking mode can be slow
     })
     importModal.preview = data
     // If we have parsed_data (with or without LLM), open the interactive preview drawer
     if (data.parsed_data) {
       importPreviewDrawer.value = true
+      // Persist to sessionStorage so navigating away doesn't lose it
+      try { sessionStorage.setItem('paperImportPreview', JSON.stringify(data)) } catch { /* ignore */ }
     }
   } catch { /* handled by interceptor */ } finally {
     importModal.previewing = false
@@ -791,6 +797,7 @@ function onPreviewImported(paper: any) {
   importModal.visible = false
   importModal.fileList = []
   importModal.preview = null
+  sessionStorage.removeItem('paperImportPreview')
   fetchPapers()
   if (paper && paper.id) {
     message.success(`导入成功：「${paper.title || '试卷'}」`)
@@ -960,7 +967,22 @@ async function exportPaper(record: any, format: 'json' | 'docx' = 'json') {
   } catch { /* handled */ }
 }
 
-onMounted(() => { fetchPapers() })
+onMounted(async () => {
+  fetchPapers()
+  // Restore import preview if user navigated away and came back
+  try {
+    const saved = sessionStorage.getItem('paperImportPreview')
+    if (saved) {
+      const data = JSON.parse(saved)
+      if (data?.parsed_data) {
+        importModal.preview = data
+        await nextTick()
+        importPreviewDrawer.value = true
+        message.info('已恢复智能解析预览')
+      }
+    }
+  } catch { /* ignore */ }
+})
 </script>
 
 <style scoped>

@@ -558,7 +558,7 @@ async def preview_paper_file(
 
         # LLM enhancement: verify types and infer missing answers
         from app.agents.paper_parse_agent import enhance_parsed_paper
-        parsed = enhance_parsed_paper(parsed)
+        parsed = await enhance_parsed_paper(parsed)
         llm_enhanced = parsed.get("llm_enhanced", False)
 
         paper_data = parsed.get("paper", parsed)

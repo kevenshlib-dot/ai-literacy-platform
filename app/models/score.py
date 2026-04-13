@@ -71,7 +71,7 @@ class ScoreComplaint(Base):
     )
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[ComplaintStatus] = mapped_column(
-        SAEnum(ComplaintStatus, name="complaint_status"),
+        SAEnum(ComplaintStatus, name="complaint_status", values_callable=lambda x: [e.value for e in x]),
         default=ComplaintStatus.PENDING,
         nullable=False,
         index=True,

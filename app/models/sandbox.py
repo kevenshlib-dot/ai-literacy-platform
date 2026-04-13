@@ -34,7 +34,7 @@ class SandboxSession(Base):
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True
     )
     sandbox_type: Mapped[str] = mapped_column(
-        Enum(SandboxType), nullable=False
+        Enum(SandboxType, values_callable=lambda x: [e.value for e in x]), nullable=False
     )
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=True)
@@ -42,7 +42,7 @@ class SandboxSession(Base):
     dimension: Mapped[str] = mapped_column(String(100), nullable=True, index=True)
     difficulty: Mapped[int] = mapped_column(Integer, default=3)
     status: Mapped[str] = mapped_column(
-        Enum(SandboxSessionStatus), default=SandboxSessionStatus.ACTIVE
+        Enum(SandboxSessionStatus, values_callable=lambda x: [e.value for e in x]), default=SandboxSessionStatus.ACTIVE
     )
     evaluation: Mapped[dict] = mapped_column(JSONB, nullable=True)
     score: Mapped[float] = mapped_column(Float, nullable=True)

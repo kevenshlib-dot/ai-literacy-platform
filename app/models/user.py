@@ -23,7 +23,7 @@ class Role(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     name: Mapped[str] = mapped_column(
-        Enum(RoleEnum), unique=True, nullable=False
+        Enum(RoleEnum, values_callable=lambda x: [e.value for e in x]), unique=True, nullable=False
     )
     description: Mapped[str] = mapped_column(String(255), nullable=True)
 

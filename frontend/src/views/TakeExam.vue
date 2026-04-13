@@ -36,6 +36,21 @@
           </a-button>
         </div>
 
+        <!-- Resume in-progress exam banner -->
+        <a-alert
+          v-if="inProgressSession"
+          type="info"
+          show-icon
+          style="margin-bottom: 16px"
+          :message="`您有一场正在进行的考试：「${inProgressSession.exam_title}」`"
+        >
+          <template #action>
+            <a-button type="primary" size="small" :loading="resumingExam" @click="resumeExam(inProgressSession)">
+              继续考试
+            </a-button>
+          </template>
+        </a-alert>
+
         <!-- Published Exams -->
         <a-card class="card-container" :bordered="false">
           <a-list :loading="loadingExams" :data-source="availableExams" :locale="{ emptyText: '暂无可用考试' }">
@@ -218,6 +233,10 @@ const currentIndex = ref(0)
 const remainingSeconds = ref<number | null>(null)
 let timerInterval: any = null
 
+// In-progress session recovery
+const inProgressSession = ref<any>(null)
+const resumingExam = ref(false)
+
 // Random test state
 const randomTestModalVisible = ref(false)
 const randomTestLoading = ref(false)
@@ -255,6 +274,79 @@ function formatTime(seconds: number) {
   return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
 }
 
+async function checkInProgressSession() {
+  try {
+    const sessions: any[] = await request.get('/sessions', { params: { skip: 0, limit: 10 } })
+    const active = sessions.find((s: any) => s.status === 'in_progress')
+    if (active) {
+      inProgressSession.value = active
+    }
+  } catch { /* ignore */ }
+}
+
+async function resumeExam(activeSession: any) {
+  resumingExam.value = true
+  try {
+    const sheetId = activeSession.id
+    const sessionData: any = await request.get(`/sessions/${sheetId}`)
+
+    session.value = {
+      answer_sheet_id: sheetId,
+      exam_id: activeSession.exam_id,
+      exam_title: activeSession.exam_title || sessionData.exam_title,
+      time_limit_minutes: sessionData.time_limit_minutes,
+      start_time: activeSession.start_time || sessionData.start_time,
+    }
+    questions.value = sessionData.questions || []
+    currentIndex.value = 0
+
+    // Restore existing answers
+    if (sessionData.answers) {
+      for (const [qid, ans] of Object.entries(sessionData.answers)) {
+        answers[qid] = ans as string
+      }
+      // Jump to first unanswered question
+      const firstUnanswered = questions.value.findIndex(q => !answers[q.question_id])
+      if (firstUnanswered >= 0) currentIndex.value = firstUnanswered
+    }
+
+    // Resume timer
+    if (sessionData.time_limit_minutes) {
+      const elapsed = Math.floor((Date.now() - new Date(session.value.start_time).getTime()) / 1000)
+      remainingSeconds.value = Math.max(0, sessionData.time_limit_minutes * 60 - elapsed)
+      startTimer()
+    }
+
+    // Save to sessionStorage for page navigation recovery
+    sessionStorage.setItem('activeExamSession', JSON.stringify({ sheetId, examId: activeSession.exam_id }))
+    inProgressSession.value = null
+    message.success('已恢复考试，继续作答')
+  } catch {
+    message.error('恢复考试失败')
+  } finally {
+    resumingExam.value = false
+  }
+}
+
+async function tryAutoRestore() {
+  // Check sessionStorage for active session from page navigation
+  const saved = sessionStorage.getItem('activeExamSession')
+  if (saved) {
+    try {
+      const { sheetId } = JSON.parse(saved)
+      const sessionData: any = await request.get(`/sessions/${sheetId}`)
+      if (sessionData && sessionData.questions?.length > 0) {
+        await resumeExam({ id: sheetId, exam_id: sessionData.exam_id, exam_title: sessionData.exam_title, start_time: sessionData.start_time })
+        return true
+      }
+    } catch {
+      // Session no longer valid, clean up
+      sessionStorage.removeItem('activeExamSession')
+    }
+  }
+  return false
+}
+
 async function fetchAvailableExams() {
   loadingExams.value = true
   try {
@@ -286,6 +378,8 @@ async function startExam(examId: string) {
       remainingSeconds.value = Math.max(0, data.time_limit_minutes * 60 - elapsed)
       startTimer()
     }
+    // Persist to sessionStorage for navigation recovery
+    sessionStorage.setItem('activeExamSession', JSON.stringify({ sheetId: data.answer_sheet_id, examId: examId }))
     message.success('考试开始')
   } catch { /* handled */ }
 }
@@ -337,6 +431,8 @@ async function submitExam() {
     const sheetId = session.value.answer_sheet_id
     const data: any = await request.post(`/sessions/${sheetId}/submit`)
     clearInterval(timerInterval)
+
+    sessionStorage.removeItem('activeExamSession')
 
     if (isRandomTest.value) {
       // Fetch score and show inline — don't save to history
@@ -421,7 +517,14 @@ async function closeRandomTestResult() {
   fetchAvailableExams()
 }
 
-onMounted(() => { fetchAvailableExams() })
+onMounted(async () => {
+  // Try to auto-restore an active exam session (from page navigation)
+  const restored = await tryAutoRestore()
+  if (!restored) {
+    await fetchAvailableExams()
+    await checkInProgressSession()
+  }
+})
 onUnmounted(() => { if (timerInterval) clearInterval(timerInterval) })
 </script>
 

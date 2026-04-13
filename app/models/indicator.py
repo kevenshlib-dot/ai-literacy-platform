@@ -36,7 +36,7 @@ class IndicatorProposal(Base):
     consultant_mapping: Mapped[dict] = mapped_column(JSONB, nullable=True)
     review_result: Mapped[dict] = mapped_column(JSONB, nullable=True)
     status: Mapped[str] = mapped_column(
-        Enum(ProposalStatus), default=ProposalStatus.DRAFT
+        Enum(ProposalStatus, values_callable=lambda x: [e.value for e in x]), default=ProposalStatus.DRAFT
     )
     confidence_score: Mapped[float] = mapped_column(Float, nullable=True)
     created_by: Mapped[str] = mapped_column(String(50), default="system")

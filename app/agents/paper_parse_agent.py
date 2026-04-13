@@ -5,60 +5,33 @@ Takes the output of parse_word_paper() (regex-based) and enhances it with:
 - Answer inference when regex extraction failed
 - Confidence scores and issue flags per question
 """
+import asyncio
 import json
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from app.core.llm_config import get_llm_config_sync, make_openai_client
 from app.agents.llm_utils import extract_json_text, strip_thinking_tags
 
+_executor = ThreadPoolExecutor(max_workers=2)
+
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 30
 
-SYSTEM_PROMPT = """你是一位专业的考试试卷结构分析专家。你的任务是审核一份已被初步解析的试卷数据，验证并修正每道题的题型和答案。
+SYSTEM_PROMPT = """/no_think
+你是试卷结构验证工具。直接输出JSON数组，不要解释。
 
-你将收到一个JSON数组，每个元素代表一道题，包含：
-- index: 题目序号
-- section_title: 所在分节标题
-- detected_type: 初步检测的题型（可能有误）
-- stem: 题干（可能截断）
-- options: 选项（如有）
-- detected_answer: 初步检测的答案（可能为空或有误）
+输入：题目数组（含 index, detected_type, stem, options, detected_answer）
+输出：验证结果数组
 
-有效题型包括：
-- true_false（判断题）：答案应为 T 或 F
-- single_choice（单选题）：答案应为单个字母如 A、B、C、D
-- multiple_choice（多选题）：答案应为多个字母如 ACD
-- fill_blank（填空题）：答案为文本
-- short_answer（简答/论述/开放题）：答案为文本
+题型：true_false(T/F), single_choice(单字母), multiple_choice(多字母), fill_blank, short_answer
+规则：如果 detected_type 和 detected_answer 看起来合理，直接确认；只在明显错误时修正。
 
-请对每道题：
-1. 根据题干内容、选项结构判断正确的题型
-2. 如果初步答案为空，尝试根据题干内容推断正确答案（仅在有足够信息时推断）
-3. 验证已有答案的正确性和格式
-4. 给出置信度（0.0-1.0）和发现的问题
-
-严格按以下JSON数组格式输出，不要输出其他内容：
-```json
-[
-  {
-    "index": 1,
-    "verified_type": "single_choice",
-    "verified_answer": "B",
-    "type_confidence": 0.95,
-    "answer_confidence": 0.90,
-    "issues": []
-  }
-]
-```
-
-注意：
-- 如果无法确定答案，verified_answer 留空字符串""，answer_confidence 设为 0.0
-- issues 是问题描述数组，如 ["答案缺失，需人工补充", "题型可能有误：检测为判断题但有4个选项"]
-- 判断题答案统一用 T/F 格式
-- 选择题答案统一用大写字母"""
+输出格式（严格JSON数组，无其他文字）：
+[{"index":1,"verified_type":"true_false","verified_answer":"T","type_confidence":0.9,"answer_confidence":0.9,"issues":[]}]"""
 
 
 def _build_question_summary(questions: list[dict], section_title: str = "") -> list[dict]:
@@ -81,11 +54,27 @@ def _build_question_summary(questions: list[dict], section_title: str = "") -> l
     return summaries
 
 
+LLM_TIMEOUT = 120  # seconds — local models may be slow
+
+
 def _call_llm(summaries: list[dict], cfg) -> list[dict]:
     """Send question summaries to LLM for verification. Returns list of verification results."""
-    client = make_openai_client(cfg)
+    # Use a dedicated client with generous timeout for local models
+    client = make_openai_client(cfg, timeout=LLM_TIMEOUT)
 
-    user_prompt = json.dumps(summaries, ensure_ascii=False, indent=2)
+    # Only send questions that actually need LLM help (missing answer or uncertain type)
+    # This reduces token count and speeds up response significantly
+    needs_help = [s for s in summaries if not s.get("detected_answer") or not s.get("detected_type")]
+    to_send = needs_help if needs_help else summaries[:10]  # limit if all look fine
+
+    if not to_send:
+        # All questions have type and answer — no LLM needed
+        return [{"index": s["index"], "verified_type": s["detected_type"],
+                 "verified_answer": s["detected_answer"],
+                 "type_confidence": 0.95, "answer_confidence": 0.95, "issues": []}
+                for s in summaries]
+
+    user_prompt = json.dumps(to_send, ensure_ascii=False)  # compact, no indent
 
     response = client.chat.completions.create(
         model=cfg.model,
@@ -94,13 +83,37 @@ def _call_llm(summaries: list[dict], cfg) -> list[dict]:
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.1,
-        max_tokens=min(4096, max(1024, len(summaries) * 120)),
+        max_tokens=max(4096, len(to_send) * 200),
     )
 
-    raw = response.choices[0].message.content.strip()
+    # Handle None content (Qwen thinking mode may put all tokens in reasoning)
+    raw = response.choices[0].message.content or ""
+    raw = raw.strip()
+
+    if not raw:
+        reasoning = getattr(response.choices[0].message, 'reasoning_content', None)
+        if reasoning:
+            raw = reasoning.strip()
+
+    if not raw:
+        logger.warning(f"LLM returned empty content (finish_reason={response.choices[0].finish_reason})")
+        return []
+
     raw = strip_thinking_tags(raw)
     json_text = extract_json_text(raw)
-    return json.loads(json_text)
+    results = json.loads(json_text)
+
+    # For questions we didn't send to LLM, create pass-through results
+    sent_indices = {s["index"] for s in to_send}
+    for s in summaries:
+        if s["index"] not in sent_indices:
+            results.append({
+                "index": s["index"], "verified_type": s["detected_type"],
+                "verified_answer": s["detected_answer"],
+                "type_confidence": 0.95, "answer_confidence": 0.95, "issues": [],
+            })
+
+    return results
 
 
 def _apply_enhancements(paper_data: dict, results: list[dict]) -> dict:
@@ -127,14 +140,26 @@ def _apply_enhancements(paper_data: dict, results: list[dict]) -> dict:
         q_item["answer_confidence"] = r.get("answer_confidence", 0.5)
         q_item["issues"] = r.get("issues", [])
 
+        # Normalize LLM returned type to valid values
+        VALID_TYPES = {"true_false", "single_choice", "multiple_choice", "fill_blank", "short_answer", "essay", "sjt"}
+        llm_type = r.get("verified_type", "")
+        if llm_type not in VALID_TYPES:
+            llm_type = ""  # Discard invalid type from LLM
+            q_item["llm_question_type"] = ""
+
         # Auto-apply LLM results when regex had no answer and LLM is confident
         if not q.get("correct_answer") and r.get("verified_answer"):
             q["correct_answer"] = r["verified_answer"]
 
         # Auto-apply type correction when LLM is very confident
-        llm_type = r.get("verified_type", "")
-        if llm_type and llm_type != q.get("question_type") and r.get("type_confidence", 0) >= 0.9:
-            q_item["llm_type_differs"] = True
+        # But NEVER change true_false to something else (LLM often gets this wrong)
+        orig_type = q.get("question_type", "")
+        if llm_type and llm_type != orig_type and r.get("type_confidence", 0) >= 0.9:
+            # Don't override true_false → single_choice (common LLM mistake for T/F with options)
+            if orig_type == "true_false" and llm_type in ("single_choice", "multiple_choice"):
+                q_item["llm_type_differs"] = False  # Ignore this suggestion
+            else:
+                q_item["llm_type_differs"] = True
 
         return q_item
 
@@ -148,16 +173,8 @@ def _apply_enhancements(paper_data: dict, results: list[dict]) -> dict:
     return paper_data
 
 
-def enhance_parsed_paper(parsed: dict) -> dict:
-    """Enhance a regex-parsed paper dict with LLM verification.
-
-    Args:
-        parsed: Output from parse_word_paper(), standard paper format.
-
-    Returns:
-        Same dict with per-question LLM enhancement fields added.
-        Top-level 'llm_enhanced' flag indicates whether LLM was used.
-    """
+def _enhance_sync(parsed: dict) -> dict:
+    """Synchronous implementation of enhance_parsed_paper (runs in thread pool)."""
     cfg = get_llm_config_sync("paper_import")
     if cfg.api_key == "your-api-key":
         logger.info("Paper import LLM not configured, skipping enhancement")
@@ -214,3 +231,13 @@ def enhance_parsed_paper(parsed: dict) -> dict:
         parsed["llm_enhanced"] = False
 
     return parsed
+
+
+async def enhance_parsed_paper(parsed: dict) -> dict:
+    """Async wrapper: runs LLM enhancement in a thread pool to avoid blocking the event loop.
+
+    This is critical — synchronous OpenAI client calls block the entire uvicorn event loop,
+    making all pages unresponsive during LLM processing.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, _enhance_sync, parsed)

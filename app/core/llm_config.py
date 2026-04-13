@@ -62,11 +62,16 @@ def _is_local_url(url: str) -> bool:
     return host in ("localhost", "127.0.0.1", "::1") or host.startswith(("192.168.", "10.", "172."))
 
 
-def make_openai_client(cfg: "LLMConfig"):
+def make_openai_client(cfg: "LLMConfig", timeout: int = 300):
     """Return a synchronous OpenAI client configured for the given LLMConfig.
 
     Local/LAN addresses: trust_env=False to bypass proxy.
     Cloud APIs: trust_env=True so HTTP_PROXY/HTTPS_PROXY can be used.
+
+    Args:
+        timeout: HTTP timeout in seconds. Default 300s (5 min) to accommodate
+                 local models with thinking mode (Qwen3.5 etc.) which can take
+                 2-3 minutes for complex reasoning tasks.
     """
     import httpx
     from openai import OpenAI
@@ -74,7 +79,7 @@ def make_openai_client(cfg: "LLMConfig"):
     return OpenAI(
         api_key=cfg.api_key,
         base_url=cfg.base_url.rstrip("/") + "/" if cfg.base_url else None,
-        http_client=httpx.Client(trust_env=not local, timeout=60),
+        http_client=httpx.Client(trust_env=not local, timeout=timeout),
     )
 
 

@@ -115,7 +115,10 @@
 
             <div class="question-actions">
               <a-button :disabled="currentIndex === 0" @click="currentIndex--">上一题</a-button>
-              <a-button type="primary" :disabled="currentIndex === examQuestions.length - 1" @click="currentIndex++">下一题</a-button>
+              <a-button v-if="currentIndex < examQuestions.length - 1" type="primary" @click="currentIndex++">下一题</a-button>
+              <a-popconfirm v-else title="确定提交考试？提交后不可修改。" @confirm="submitExam">
+                <a-button type="primary" danger>交卷</a-button>
+              </a-popconfirm>
             </div>
           </div>
         </div>
@@ -133,6 +136,21 @@
             </a-button>
           </a-space>
         </div>
+
+        <!-- Resume in-progress exam banner -->
+        <a-alert
+          v-if="inProgressSession"
+          type="info"
+          show-icon
+          style="margin-bottom: 16px"
+          :message="`您有一场正在进行的考试：「${inProgressSession.exam_title || '考试'}」`"
+        >
+          <template #action>
+            <a-button type="primary" size="small" :loading="resumingExam" @click="resumeExam(inProgressSession)">
+              继续考试
+            </a-button>
+          </template>
+        </a-alert>
 
         <!-- Filter Bar (manager only) -->
         <a-card v-if="isManager" class="filter-card" :bordered="false">
@@ -490,6 +508,10 @@ const currentIndex = ref(0)
 const remainingSeconds = ref<number | null>(null)
 let timerInterval: any = null
 
+// In-progress session recovery
+const inProgressSession = ref<any>(null)
+const resumingExam = ref(false)
+
 // Random test state
 const randomTestModalVisible = ref(false)
 const randomTestLoading = ref(false)
@@ -525,6 +547,58 @@ function formatTime(seconds: number) {
   const m = Math.floor(seconds / 60)
   const s = seconds % 60
   return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+}
+
+async function checkInProgressSession() {
+  try {
+    const sessions: any[] = await request.get('/sessions', { params: { skip: 0, limit: 10 } })
+    const active = sessions.find((s: any) => s.status === 'in_progress')
+    if (active) {
+      inProgressSession.value = active
+    }
+  } catch { /* ignore */ }
+}
+
+async function resumeExam(activeSession: any) {
+  resumingExam.value = true
+  try {
+    const sheetId = activeSession.id
+    const sessionData: any = await request.get(`/sessions/${sheetId}`)
+
+    session.value = {
+      answer_sheet_id: sheetId,
+      exam_id: activeSession.exam_id,
+      exam_title: activeSession.exam_title || sessionData.exam_title,
+      time_limit_minutes: sessionData.time_limit_minutes,
+      start_time: activeSession.start_time || sessionData.start_time,
+    }
+    examQuestions.value = sessionData.questions || []
+    currentIndex.value = 0
+
+    // Restore existing answers
+    if (sessionData.answers) {
+      for (const [qid, ans] of Object.entries(sessionData.answers)) {
+        answers[qid] = ans as string
+      }
+      // Jump to first unanswered question
+      const firstUnanswered = examQuestions.value.findIndex((q: any) => !answers[q.question_id])
+      if (firstUnanswered >= 0) currentIndex.value = firstUnanswered
+    }
+
+    // Resume timer
+    if (sessionData.time_limit_minutes) {
+      const elapsed = Math.floor((Date.now() - new Date(session.value.start_time).getTime()) / 1000)
+      remainingSeconds.value = Math.max(0, sessionData.time_limit_minutes * 60 - elapsed)
+      startTimer()
+    }
+
+    inProgressSession.value = null
+    message.success('已恢复考试，继续作答')
+  } catch {
+    message.error('恢复考试失败')
+  } finally {
+    resumingExam.value = false
+  }
 }
 
 async function startExam(examId: string) {
@@ -679,7 +753,14 @@ async function closeRandomTestResult() {
 
 // ── Init ──────────────────────────────────────��───────────────────────────
 
-onMounted(() => { fetchExams() })
+onMounted(async () => {
+  await fetchExams()
+  await checkInProgressSession()
+  // Auto-resume if there's an active session
+  if (inProgressSession.value) {
+    await resumeExam(inProgressSession.value)
+  }
+})
 onUnmounted(() => { if (timerInterval) clearInterval(timerInterval) })
 </script>
 

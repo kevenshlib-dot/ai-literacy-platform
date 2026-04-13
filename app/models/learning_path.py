@@ -29,7 +29,7 @@ class LearningPath(Base):
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(
-        Enum(LearningPathStatus), default=LearningPathStatus.ACTIVE
+        Enum(LearningPathStatus, values_callable=lambda x: [e.value for e in x]), default=LearningPathStatus.ACTIVE
     )
     weakness_dimensions: Mapped[dict] = mapped_column(JSONB, nullable=True)
     target_dimensions: Mapped[dict] = mapped_column(JSONB, nullable=True)
@@ -74,7 +74,7 @@ class LearningStep(Base):
     )
     order_num: Mapped[int] = mapped_column(Integer, nullable=False)
     step_type: Mapped[str] = mapped_column(
-        Enum(LearningStepType), nullable=False
+        Enum(LearningStepType, values_callable=lambda x: [e.value for e in x]), nullable=False
     )
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=True)
@@ -83,7 +83,7 @@ class LearningStep(Base):
         UUID(as_uuid=True), nullable=True
     )
     status: Mapped[str] = mapped_column(
-        Enum(LearningStepStatus), default=LearningStepStatus.PENDING
+        Enum(LearningStepStatus, values_callable=lambda x: [e.value for e in x]), default=LearningStepStatus.PENDING
     )
     score: Mapped[float] = mapped_column(Float, nullable=True)
     completed_at: Mapped[datetime] = mapped_column(

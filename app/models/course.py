@@ -30,7 +30,7 @@ class Course(Base):
     difficulty: Mapped[int] = mapped_column(Integer, default=1)
     duration_minutes: Mapped[int] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(
-        Enum(CourseStatus), default=CourseStatus.DRAFT
+        Enum(CourseStatus, values_callable=lambda x: [e.value for e in x]), default=CourseStatus.DRAFT
     )
     tags: Mapped[dict] = mapped_column(JSONB, nullable=True)
     created_by: Mapped[uuid.UUID] = mapped_column(

@@ -35,7 +35,7 @@ class InteractiveSession(Base):
     scenario: Mapped[str] = mapped_column(Text, nullable=False)
     role_description: Mapped[str] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(
-        Enum(InteractiveSessionStatus),
+        Enum(InteractiveSessionStatus, values_callable=lambda x: [e.value for e in x]),
         default=InteractiveSessionStatus.ACTIVE,
     )
     current_difficulty: Mapped[int] = mapped_column(Integer, default=3)

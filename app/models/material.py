@@ -42,12 +42,12 @@ class Material(Base):
     title: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
     description: Mapped[str] = mapped_column(Text, nullable=True)
     format: Mapped[str] = mapped_column(
-        Enum(MaterialFormat), nullable=False
+        Enum(MaterialFormat, values_callable=lambda x: [e.value for e in x]), nullable=False
     )
     file_path: Mapped[str] = mapped_column(String(1000), nullable=False)
     file_size: Mapped[int] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(
-        Enum(MaterialStatus), default=MaterialStatus.UPLOADED
+        Enum(MaterialStatus, values_callable=lambda x: [e.value for e in x]), default=MaterialStatus.UPLOADED
     )
     category: Mapped[str] = mapped_column(String(100), nullable=True, index=True)
     tags: Mapped[dict] = mapped_column(JSONB, nullable=True)

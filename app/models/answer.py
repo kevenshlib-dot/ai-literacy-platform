@@ -32,7 +32,7 @@ class AnswerSheet(Base):
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
     )
     status: Mapped[str] = mapped_column(
-        Enum(AnswerSheetStatus), default=AnswerSheetStatus.IN_PROGRESS
+        Enum(AnswerSheetStatus, values_callable=lambda x: [e.value for e in x]), default=AnswerSheetStatus.IN_PROGRESS
     )
     start_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)

@@ -48,7 +48,7 @@ class Question(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     question_type: Mapped[str] = mapped_column(
-        Enum(QuestionType), nullable=False, index=True
+        Enum(QuestionType, values_callable=lambda x: [e.value for e in x]), nullable=False, index=True
     )
     stem: Mapped[str] = mapped_column(Text, nullable=False)
     options: Mapped[dict] = mapped_column(JSONB, nullable=True)
@@ -59,7 +59,7 @@ class Question(Base):
     dimension: Mapped[str] = mapped_column(String(100), nullable=True, index=True)
     knowledge_tags: Mapped[dict] = mapped_column(JSONB, nullable=True)
     bloom_level: Mapped[str] = mapped_column(
-        Enum(BloomLevel), nullable=True
+        Enum(BloomLevel, values_callable=lambda x: [e.value for e in x]), nullable=True
     )
     source_material_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("materials.id"), nullable=True
@@ -68,7 +68,7 @@ class Question(Base):
         UUID(as_uuid=True), ForeignKey("knowledge_units.id"), nullable=True
     )
     status: Mapped[str] = mapped_column(
-        Enum(QuestionStatus), default=QuestionStatus.DRAFT, index=True
+        Enum(QuestionStatus, values_callable=lambda x: [e.value for e in x]), default=QuestionStatus.DRAFT, index=True
     )
     usage_count: Mapped[int] = mapped_column(Integer, default=0)
     correct_rate: Mapped[float] = mapped_column(Float, nullable=True)
