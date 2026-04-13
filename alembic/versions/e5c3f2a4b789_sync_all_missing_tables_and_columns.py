@@ -332,6 +332,32 @@ def upgrade() -> None:
             sa.Column('correct_answer_override', sa.Text(), nullable=True)
         )
 
+    # ── 18. Fix varchar columns → proper enum types ──────────────────────
+    # Tables created above used sa.String(50) to avoid SQLAlchemy auto-creating
+    # existing enum types. Now cast them to the correct PostgreSQL enum types.
+    _enum_fixes = [
+        ('papers', 'status', 'paperstatus', 'draft'),
+        ('interactive_sessions', 'status', 'interactivesessionstatus', 'active'),
+        ('indicator_proposals', 'status', 'proposalstatus', 'draft'),
+        ('courses', 'status', 'coursestatus', 'draft'),
+        ('learning_paths', 'status', 'learningpathstatus', 'active'),
+        ('learning_steps', 'step_type', 'learningsteptype', None),
+        ('learning_steps', 'status', 'learningstepstatus', 'pending'),
+        ('sandbox_sessions', 'sandbox_type', 'sandboxtype', None),
+        ('sandbox_sessions', 'status', 'sandboxsessionstatus', 'active'),
+    ]
+    bind = op.get_bind()
+    insp = sa_inspect(bind)
+    for tbl, col, enum_name, default_val in _enum_fixes:
+        if tbl not in insp.get_table_names():
+            continue
+        col_info = next((c for c in insp.get_columns(tbl) if c['name'] == col), None)
+        if col_info and 'VARCHAR' in str(col_info['type']).upper():
+            op.execute(f"ALTER TABLE {tbl} ALTER COLUMN {col} DROP DEFAULT")
+            op.execute(f"ALTER TABLE {tbl} ALTER COLUMN {col} TYPE {enum_name} USING {col}::{enum_name}")
+            if default_val:
+                op.execute(f"ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT '{default_val}'")
+
     # reports.content, reports.period_start, reports.period_end
     if _table_exists('reports'):
         if not _column_exists('reports', 'content'):

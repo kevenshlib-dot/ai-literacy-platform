@@ -24,7 +24,8 @@ class Paper(Base):
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(
-        Enum(PaperStatus), default=PaperStatus.DRAFT
+        Enum(PaperStatus, values_callable=lambda x: [e.value for e in x]),
+        default=PaperStatus.DRAFT,
     )
     total_score: Mapped[float] = mapped_column(Float, default=0)
     time_limit_minutes: Mapped[int] = mapped_column(Integer, nullable=True)
