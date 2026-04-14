@@ -84,7 +84,7 @@
             >
               <template #message>
                 <span v-for="(issue, ii) in q.issues" :key="ii" style="font-size: 12px">
-                  {{ issue }}<br v-if="ii < q.issues.length - 1" />
+                  {{ issue }}<br v-if="Number(ii) < q.issues.length - 1" />
                 </span>
               </template>
             </a-alert>
@@ -252,13 +252,6 @@ const typeOptions = [
   { value: 'fill_blank', label: '填空题' },
   { value: 'short_answer', label: '简答题' },
 ]
-
-const TYPE_LABEL_MAP: Record<string, string> = {
-  true_false: '判断题', single_choice: '单选题', multiple_choice: '多选题',
-  fill_blank: '填空题', short_answer: '简答题', essay: '论述题', sjt: '情境判断',
-}
-
-function typeLabel(t: string) { return TYPE_LABEL_MAP[t] || t }
 
 function getEffectiveType(q: any) {
   return q._userType || q.question?.question_type || q.llm_question_type || 'short_answer'

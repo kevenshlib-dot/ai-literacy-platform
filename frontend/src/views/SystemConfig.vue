@@ -170,7 +170,7 @@
             show-search
             placeholder="选择模型"
             :options="presetModels.map(m => ({ value: m, label: m }))"
-            :get-popup-container="(trigger: HTMLElement) => trigger.parentElement || document.body"
+            :get-popup-container="getPopupContainer"
           />
 
           <!-- 云端但无预设（如豆包端点 ID） -->
@@ -190,7 +190,7 @@
                 placeholder="选择或输入模型"
                 style="width: calc(100% - 90px)"
                 :options="fetchedModels.map(m => ({ value: m, label: m }))"
-                :get-popup-container="(trigger: HTMLElement) => trigger.parentElement || document.body"
+                :get-popup-container="getPopupContainer"
               />
               <a-input
                 v-else
@@ -256,6 +256,9 @@ const localTypes = ['vllm', 'ollama', 'lmstudio', 'custom']
 
 function typeLabel(t: string) { return TYPE_META[t]?.label ?? t }
 function typeColor(t: string) { return TYPE_META[t]?.color ?? 'default' }
+function getPopupContainer(trigger: HTMLElement) {
+  return trigger.parentElement ?? globalThis.document.body
+}
 
 const isLocalProvider = computed(() => localTypes.includes(form.provider_type))
 
@@ -449,7 +452,7 @@ function openProviderModal(provider?: any) {
   } else {
     Object.assign(form, {
       provider_type: 'openai', name: '', api_key: '',
-      base_url: TYPE_META.openai.base_url, model: '', enabled: true,
+      base_url: 'https://api.openai.com/v1/', model: '', enabled: true,
     })
   }
   modalVisible.value = true

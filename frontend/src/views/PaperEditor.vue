@@ -57,7 +57,7 @@
 
           <!-- Sections -->
           <a-collapse v-model:activeKey="activeSections" class="section-collapse">
-            <a-collapse-panel v-for="(section, si) in sections" :key="section.id" :forceRender="false">
+            <a-collapse-panel v-for="section in sections" :key="section.id" :forceRender="false">
               <template #header>
                 <div class="section-header" @click.stop>
                   <a-typography-text
@@ -687,11 +687,6 @@ async function updateQuestionScore(pq: PaperQuestion) {
 const OBJECTIVE_TYPES = new Set(['single_choice', 'multiple_choice', 'true_false'])
 const OPTIONS_TYPES = new Set(['single_choice', 'multiple_choice'])
 
-function needsAnswerOverride(pq: PaperQuestion): boolean {
-  const etype = effectiveType(pq)
-  return OBJECTIVE_TYPES.has(etype) && (pq.question_type_override !== null || !pq.correct_answer)
-}
-
 function hasOptionsType(pq: PaperQuestion): boolean {
   return OPTIONS_TYPES.has(effectiveType(pq))
 }
@@ -793,11 +788,14 @@ async function moveQuestion(sectionId: string | null, index: number, direction: 
     : unsectionedQuestions.value
   const targetIndex = index + direction
   if (targetIndex < 0 || targetIndex >= list.length) return
+  const currentQuestion = list[index]
+  const targetQuestion = list[targetIndex]
+  if (!currentQuestion || !targetQuestion) return
 
   // Swap order_num
-  const temp = list[index].order_num
-  list[index].order_num = list[targetIndex].order_num
-  list[targetIndex].order_num = temp
+  const temp = currentQuestion.order_num
+  currentQuestion.order_num = targetQuestion.order_num
+  targetQuestion.order_num = temp
 
   // Build ordered IDs for the full paper
   const allOrdered = [...paperQuestions.value]
@@ -814,8 +812,9 @@ async function moveQuestion(sectionId: string | null, index: number, direction: 
 // ── Add question from bank ────────────────────────────────────────────────────
 async function addQuestionToPaper(q: any) {
   try {
-    const activeSectionId = sections.value.length > 0 ? sections.value[sections.value.length - 1].id : null
-    const data: any = await request.post(`/papers/${paperId.value}/questions`, [
+    const lastSection = sections.value.length > 0 ? sections.value[sections.value.length - 1] : null
+    const activeSectionId = lastSection ? lastSection.id : null
+    await request.post(`/papers/${paperId.value}/questions`, [
       {
         question_id: q.id,
         section_id: activeSectionId,

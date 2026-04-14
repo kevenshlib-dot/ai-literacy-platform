@@ -113,7 +113,6 @@ import {
   SettingOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
-  UserOutlined,
   LogoutOutlined,
 } from '@ant-design/icons-vue'
 
