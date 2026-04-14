@@ -209,8 +209,18 @@ async def get_exam_session_data(
         orig_type = q.question_type.value if hasattr(q.question_type, 'value') else q.question_type
         effective_type = eq.question_type_override or orig_type
 
+        # Smart type detection: fix mismatches between declared type and actual content
+        options = q.options or {}
+        opt_keys = list(options.keys()) if isinstance(options, dict) else []
+
+        # If options have T/F keys → true_false regardless of declared type
+        if len(opt_keys) == 2 and "T" in opt_keys and "F" in opt_keys:
+            effective_type = "true_false"
+        # If declared as short_answer but has A/B/C/D options → single_choice
+        elif effective_type == "short_answer" and len(opt_keys) >= 2 and all(k.isalpha() and len(k) == 1 for k in opt_keys):
+            effective_type = "single_choice"
+
         # Ensure true_false questions always have standard T/F options
-        options = q.options
         if effective_type == "true_false":
             if not options or not isinstance(options, dict) or len(options) == 0:
                 options = {"T": "正确", "F": "错误"}

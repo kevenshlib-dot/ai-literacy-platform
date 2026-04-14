@@ -72,7 +72,7 @@
           <div class="question-content" v-if="currentQuestion">
             <div class="question-header-bar">
               <span class="question-num">第 {{ currentIndex + 1 }} 题</span>
-              <a-tag>{{ typeLabel(currentQuestion.question_type) }}</a-tag>
+              <a-tag>{{ typeLabel(effectiveType) }}</a-tag>
               <a-tag color="blue">{{ currentQuestion.score }} 分</a-tag>
               <a-button size="small" :type="markedSet.has(currentQuestion.question_id) ? 'primary' : 'default'" @click="toggleMark">
                 {{ markedSet.has(currentQuestion.question_id) ? '取消标记' : '标记' }}
@@ -81,7 +81,7 @@
 
             <div class="question-stem">{{ currentQuestion.stem }}</div>
 
-            <div v-if="currentQuestion.question_type === 'single_choice'" class="question-options">
+            <div v-if="effectiveType === 'single_choice'" class="question-options">
               <a-radio-group v-model:value="answers[currentQuestion.question_id]" @change="saveAnswer">
                 <a-radio v-for="(val, key) in currentQuestion.options" :key="key" :value="key" class="option-item">
                   {{ key }}. {{ val }}
@@ -89,7 +89,7 @@
               </a-radio-group>
             </div>
 
-            <div v-else-if="currentQuestion.question_type === 'multiple_choice'" class="question-options">
+            <div v-else-if="effectiveType === 'multiple_choice'" class="question-options">
               <a-checkbox-group v-model:value="multiAnswers" @change="onMultiChange">
                 <a-checkbox v-for="(val, key) in currentQuestion.options" :key="key" :value="key" class="option-item">
                   {{ key }}. {{ val }}
@@ -97,7 +97,7 @@
               </a-checkbox-group>
             </div>
 
-            <div v-else-if="currentQuestion.question_type === 'true_false'" class="question-options">
+            <div v-else-if="effectiveType === 'true_false'" class="question-options">
               <a-radio-group v-model:value="answers[currentQuestion.question_id]" @change="saveAnswer">
                 <a-radio value="T" class="option-item">T. 正确</a-radio>
                 <a-radio value="F" class="option-item">F. 错误</a-radio>
@@ -522,6 +522,25 @@ const cleanupLoading = ref(false)
 
 const currentQuestion = computed(() => examQuestions.value[currentIndex.value] || null)
 const answeredCount = computed(() => examQuestions.value.filter(q => answers[q.question_id]).length)
+
+// Smart type detection: fix mismatches between question_type and actual content
+const effectiveType = computed(() => {
+  const q = currentQuestion.value
+  if (!q) return 'short_answer'
+  const declaredType = q.question_type || 'short_answer'
+  const opts = q.options || {}
+  const optKeys = Object.keys(opts)
+
+  // If options have T/F keys → it's true_false regardless of declared type
+  if (optKeys.length === 2 && optKeys.includes('T') && optKeys.includes('F')) {
+    return 'true_false'
+  }
+  // If has A/B/C/D options but declared as short_answer → single_choice
+  if (optKeys.length >= 2 && optKeys.every(k => /^[A-F]$/.test(k)) && declaredType === 'short_answer') {
+    return 'single_choice'
+  }
+  return declaredType
+})
 
 const multiAnswers = ref<string[]>([])
 
