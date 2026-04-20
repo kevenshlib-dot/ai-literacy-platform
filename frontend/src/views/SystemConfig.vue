@@ -151,9 +151,12 @@
 
         <!-- API Key -->
         <a-form-item :label="isLocalProvider ? 'API Key（可留空）' : 'API Key'" required>
-          <a-input-password v-model:value="form.api_key" placeholder="sk-..." />
+          <a-input-password v-model:value="form.api_key" :placeholder="apiKeyPlaceholder" />
           <div class="field-hint">
             <span v-if="isLocalProvider">本地服务通常无需 API Key</span>
+            <span v-else-if="editingProvider?.has_api_key">
+              已配置 API Key；留空保存将继续使用原密钥，输入新值才会替换
+            </span>
             <span v-else>
               存入数据库，优先级高于 <code>.env</code>；未分配模块时才使用 <code>.env</code> 兜底
             </span>
@@ -313,6 +316,7 @@ const form = reactive({
 
 const presetModels = computed(() => TYPE_META[form.provider_type]?.models ?? [])
 const modelPlaceholder = computed(() => TYPE_META[form.provider_type]?.placeholder ?? '模型名称')
+const apiKeyPlaceholder = computed(() => editingProvider.value?.has_api_key ? '已配置，留空则不修改' : 'sk-...')
 
 // ── API calls ─────────────────────────────────────────────────────────────────
 async function loadProviders() {
@@ -357,9 +361,7 @@ async function deleteProvider(id: string) {
 async function testProvider(p: any) {
   try {
     message.loading({ content: `测试 ${p.name}...`, key: p.id })
-    const res = await request.post('/system/providers/test', {
-      api_key: p.api_key, base_url: p.base_url, model: p.model,
-    })
+    const res = await request.post(`/system/providers/${p.id}/test`, {})
     message.success({ content: `✓ ${p.name} 连接成功（${(res as any).model}）`, key: p.id, duration: 3 })
   } catch (err: any) {
     const detail = err.response?.data?.detail ?? '连接失败'
@@ -375,9 +377,7 @@ async function testAssignment(moduleKey: string) {
   testingModule.value = moduleKey
   delete assignmentResults[moduleKey]
   try {
-    const res = await request.post('/system/providers/test', {
-      api_key: p.api_key, base_url: p.base_url, model: p.model,
-    })
+    const res = await request.post(`/system/providers/${p.id}/test`, {})
     assignmentResults[moduleKey] = { success: true, model: (res as any).model }
   } catch (err: any) {
     assignmentResults[moduleKey] = { success: false, error: err.response?.data?.detail ?? '失败' }
@@ -390,9 +390,10 @@ async function fetchModels() {
   if (!form.base_url) { message.warning('请先填写服务地址'); return }
   fetchingModels.value = true
   try {
-    const res = await request.post('/system/providers/models', {
-      api_key: form.api_key, base_url: form.base_url,
-    })
+    const payload = { api_key: form.api_key, base_url: form.base_url }
+    const res = editingProvider.value && !form.api_key
+      ? await request.post(`/system/providers/${editingProvider.value.id}/models`, payload)
+      : await request.post('/system/providers/models', payload)
     fetchedModels.value = (res as any).models ?? []
     if (fetchedModels.value.length === 0) message.warning('未获取到模型列表')
     else message.success(`获取到 ${fetchedModels.value.length} 个模型`)
@@ -407,9 +408,10 @@ async function testInModal() {
   testingInModal.value = true
   modalTestResult.value = null
   try {
-    const res = await request.post('/system/providers/test', {
-      api_key: form.api_key, base_url: form.base_url, model: form.model,
-    })
+    const payload = { api_key: form.api_key, base_url: form.base_url, model: form.model }
+    const res = editingProvider.value && !form.api_key
+      ? await request.post(`/system/providers/${editingProvider.value.id}/test`, payload)
+      : await request.post('/system/providers/test', payload)
     modalTestResult.value = { success: true, model: (res as any).model }
   } catch (err: any) {
     modalTestResult.value = { success: false, error: err.response?.data?.detail ?? '连接失败' }
@@ -448,7 +450,7 @@ function openProviderModal(provider?: any) {
   modalTestResult.value = null
   fetchedModels.value = []
   if (provider) {
-    Object.assign(form, { ...provider })
+    Object.assign(form, { ...provider, api_key: '' })
   } else {
     Object.assign(form, {
       provider_type: 'openai', name: '', api_key: '',

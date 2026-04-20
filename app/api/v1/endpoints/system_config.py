@@ -49,6 +49,7 @@ class ProviderIn(BaseModel):
 
 class ProviderOut(ProviderIn):
     id: str
+    has_api_key: bool = False
 
 
 class AssignmentsPayload(BaseModel):
@@ -63,9 +64,9 @@ class AssignmentsPayload(BaseModel):
 
 
 class TestPayload(BaseModel):
-    api_key: str
-    base_url: str
-    model: str
+    api_key: str = ""
+    base_url: str = ""
+    model: str = ""
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -95,6 +96,48 @@ async def _save_providers(db: AsyncSession, providers: list[dict], username: str
     refresh_providers_cache(providers)
 
 
+def _mask_api_key(api_key: str) -> str:
+    if not api_key:
+        return ""
+    if len(api_key) <= 8:
+        return "*" * len(api_key)
+    return f"{api_key[:4]}{'*' * 8}{api_key[-4:]}"
+
+
+def _provider_out(provider: dict) -> dict:
+    api_key = provider.get("api_key", "") or ""
+    return {
+        **provider,
+        "api_key": _mask_api_key(api_key),
+        "has_api_key": bool(api_key),
+    }
+
+
+def _provider_payload_with_existing_key(payload: ProviderIn, existing: dict) -> dict:
+    data = payload.model_dump()
+    existing_key = existing.get("api_key", "") or ""
+    submitted_key = data.get("api_key", "") or ""
+    if not submitted_key or submitted_key == _mask_api_key(existing_key):
+        data["api_key"] = existing_key
+    return data
+
+
+def _payload_for_provider(provider: dict, payload: TestPayload | None = None) -> TestPayload:
+    payload_data = payload.model_dump() if payload else {}
+    api_key = payload_data.get("api_key") or provider.get("api_key", "") or ""
+    base_url = payload_data.get("base_url") or provider.get("base_url", "") or ""
+    model = payload_data.get("model") or provider.get("model", "") or ""
+    return TestPayload(api_key=api_key, base_url=base_url, model=model)
+
+
+async def _get_provider_or_404(db: AsyncSession, provider_id: str) -> dict:
+    providers = await _get_providers(db)
+    provider = next((p for p in providers if p["id"] == provider_id), None)
+    if provider is None:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    return provider
+
+
 # ── Provider endpoints ────────────────────────────────────────────────────────
 
 @router.get("/providers", response_model=list[ProviderOut])
@@ -102,7 +145,7 @@ async def list_providers(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_role(["admin"])),
 ):
-    return await _get_providers(db)
+    return [_provider_out(p) for p in await _get_providers(db)]
 
 
 @router.post("/providers", response_model=ProviderOut)
@@ -115,7 +158,7 @@ async def create_provider(
     new_provider = {"id": str(uuid.uuid4()), **payload.model_dump()}
     providers.append(new_provider)
     await _save_providers(db, providers, current_user.username)
-    return new_provider
+    return _provider_out(new_provider)
 
 
 @router.put("/providers/{provider_id}", response_model=ProviderOut)
@@ -129,9 +172,12 @@ async def update_provider(
     idx = next((i for i, p in enumerate(providers) if p["id"] == provider_id), None)
     if idx is None:
         raise HTTPException(status_code=404, detail="Provider not found")
-    providers[idx] = {"id": provider_id, **payload.model_dump()}
+    providers[idx] = {
+        "id": provider_id,
+        **_provider_payload_with_existing_key(payload, providers[idx]),
+    }
     await _save_providers(db, providers, current_user.username)
-    return providers[idx]
+    return _provider_out(providers[idx])
 
 
 @router.delete("/providers/{provider_id}")
@@ -186,11 +232,7 @@ async def update_assignments(
 
 # ── Test connection ───────────────────────────────────────────────────────────
 
-@router.post("/providers/test")
-async def test_provider(
-    payload: TestPayload,
-    _: User = Depends(require_role(["admin"])),
-):
+async def _test_provider_connection(payload: TestPayload):
     if not payload.base_url or not payload.model:
         raise HTTPException(status_code=400, detail="base_url 和 model 不能为空")
     base_url = payload.base_url.rstrip("/") + "/"
@@ -227,17 +269,31 @@ async def test_provider(
         raise HTTPException(status_code=502, detail=f"连接失败：{err}{hint}")
 
 
+@router.post("/providers/test")
+async def test_provider(
+    payload: TestPayload,
+    _: User = Depends(require_role(["admin"])),
+):
+    return await _test_provider_connection(payload)
+
+
+@router.post("/providers/{provider_id}/test")
+async def test_saved_provider(
+    provider_id: str,
+    payload: TestPayload | None = None,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_role(["admin"])),
+):
+    provider = await _get_provider_or_404(db, provider_id)
+    return await _test_provider_connection(_payload_for_provider(provider, payload))
+
+
 class ModelsPayload(BaseModel):
     api_key: str = ""
     base_url: str
 
 
-@router.post("/providers/models")
-async def list_provider_models(
-    payload: ModelsPayload,
-    _: User = Depends(require_role(["admin"])),
-):
-    """Fetch available models from a local OpenAI-compatible server."""
+async def _list_models_for_provider(payload: ModelsPayload):
     try:
         import httpx
         from openai import OpenAI
@@ -253,6 +309,31 @@ async def list_provider_models(
         return {"models": names}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"获取模型列表失败：{e}")
+
+
+@router.post("/providers/models")
+async def list_provider_models(
+    payload: ModelsPayload,
+    _: User = Depends(require_role(["admin"])),
+):
+    """Fetch available models from an OpenAI-compatible server."""
+    return await _list_models_for_provider(payload)
+
+
+@router.post("/providers/{provider_id}/models")
+async def list_saved_provider_models(
+    provider_id: str,
+    payload: ModelsPayload | None = None,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_role(["admin"])),
+):
+    provider = await _get_provider_or_404(db, provider_id)
+    payload_data = payload.model_dump() if payload else {}
+    models_payload = ModelsPayload(
+        api_key=payload_data.get("api_key") or provider.get("api_key", "") or "",
+        base_url=payload_data.get("base_url") or provider.get("base_url", "") or "",
+    )
+    return await _list_models_for_provider(models_payload)
 
 
 @router.get("/llm-status")
