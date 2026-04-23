@@ -26,6 +26,62 @@
       </div>
     </template>
 
+    <template v-else-if="formalFlowState === 'processing'">
+      <div class="page-container">
+        <div class="page-header">
+          <h2>正在生成诊断报告</h2>
+        </div>
+        <a-card class="card-container" :bordered="false">
+          <div class="processing-hero">
+            <div class="processing-hero-title">{{ processingContext?.examTitle || '考试' }}</div>
+            <div class="processing-hero-subtitle">
+              答卷已提交，系统正在评分并生成诊断报告。通常需要十几秒，请勿关闭页面。
+            </div>
+            <div class="processing-hero-meta">
+              已答 {{ processingContext?.totalAnswered || 0 }}/{{ processingContext?.totalQuestions || 0 }} 题
+            </div>
+          </div>
+
+          <a-steps direction="vertical" :current="processingStepIndex" class="processing-steps">
+            <a-step title="答卷已提交" description="考试答案已保存，进入分析流程。" />
+            <a-step title="正在评分" description="系统正在计算得分与题目表现。" />
+            <a-step title="正在生成诊断报告" description="系统正在生成维度分析、错题总结与学习建议。" />
+            <a-step title="诊断报告已就绪" description="处理完成后将自动展示报告。" />
+          </a-steps>
+
+          <a-alert
+            type="info"
+            show-icon
+            :message="processingStatus.message || '系统正在处理中，请稍候。'"
+            style="margin-top: 16px"
+          />
+        </a-card>
+      </div>
+    </template>
+
+    <template v-else-if="formalFlowState === 'processing_failed'">
+      <div class="page-container">
+        <div class="page-header">
+          <h2>诊断报告生成失败</h2>
+        </div>
+        <a-card class="card-container" :bordered="false">
+          <a-result
+            status="error"
+            title="本次分析暂时未完成"
+            :sub-title="processingStatus.message || '生成诊断报告时发生错误，请重试。'"
+          >
+            <template #extra>
+              <a-space wrap>
+                <a-button type="primary" @click="retryProcessing">重试生成</a-button>
+                <a-button @click="returnToScores">返回成绩页</a-button>
+                <a-button @click="returnToExamList">返回考试列表</a-button>
+              </a-space>
+            </template>
+          </a-result>
+        </a-card>
+      </div>
+    </template>
+
     <!-- Exam List (before starting) -->
     <template v-else-if="!session">
       <div class="page-container">
@@ -36,32 +92,23 @@
           </a-button>
         </div>
 
-        <!-- Resume in-progress exam banner -->
-        <a-alert
-          v-if="inProgressSession"
-          type="info"
-          show-icon
-          style="margin-bottom: 16px"
-          :message="`您有一场正在进行的考试：「${inProgressSession.exam_title}」`"
-        >
-          <template #action>
-            <a-button type="primary" size="small" :loading="resumingExam" @click="resumeExam(inProgressSession)">
-              继续考试
-            </a-button>
-          </template>
-        </a-alert>
-
         <!-- Published Exams -->
         <a-card class="card-container" :bordered="false">
-          <a-list :loading="loadingExams" :data-source="availableExams" :locale="{ emptyText: '暂无可用考试' }">
+          <a-list :loading="loadingExams" :data-source="displayedExams" :locale="{ emptyText: '暂无可用考试' }">
             <template #renderItem="{ item }">
               <a-list-item>
                 <a-list-item-meta :title="item.title" :description="item.description || '暂无描述'" />
                 <template #actions>
+                  <a-tag v-if="activeSessionByExamId[item.id]" color="processing">进行中</a-tag>
                   <span v-if="item.time_limit_minutes">{{ item.time_limit_minutes }} 分钟</span>
-                  <span>总分 {{ item.total_score }}</span>
-                  <a-popconfirm title="确定开始考试？开始后将计时。" @confirm="startExam(item.id)">
-                    <a-button type="primary" size="small">开始考试</a-button>
+                  <span v-if="item.total_score !== undefined && item.total_score !== null">总分 {{ item.total_score }}</span>
+                  <a-popconfirm
+                    :title="activeSessionByExamId[item.id] ? '检测到未完成的考试会话，确定继续考试？' : '确定开始考试？开始后将计时。'"
+                    @confirm="startExam(item.id)"
+                  >
+                    <a-button type="primary" size="small">
+                      {{ activeSessionByExamId[item.id] ? '继续考试' : '开始考试' }}
+                    </a-button>
                   </a-popconfirm>
                 </template>
               </a-list-item>
@@ -156,12 +203,17 @@
           <!-- Question Content -->
           <div class="question-content" v-if="currentQuestion">
             <div class="question-header">
-              <span class="question-num">第 {{ currentIndex + 1 }} 题</span>
-              <a-tag>{{ typeLabel(currentQuestion.question_type) }}</a-tag>
-              <a-tag color="blue">{{ currentQuestion.score }} 分</a-tag>
-              <a-button size="small" :type="markedSet.has(currentQuestion.question_id) ? 'primary' : 'default'" @click="toggleMark">
-                {{ markedSet.has(currentQuestion.question_id) ? '取消标记' : '标记' }}
-              </a-button>
+              <div class="question-header-main">
+                <span class="question-num">第 {{ currentIndex + 1 }} 题</span>
+                <a-tag>{{ typeLabel(currentQuestion.question_type) }}</a-tag>
+                <a-tag color="blue">{{ currentQuestion.score }} 分</a-tag>
+              </div>
+              <div class="question-header-side">
+                <a-tag v-if="currentQuestion.dimension" color="geekblue">{{ currentQuestion.dimension }}</a-tag>
+                <a-button size="small" :type="markedSet.has(currentQuestion.question_id) ? 'primary' : 'default'" @click="toggleMark">
+                  {{ markedSet.has(currentQuestion.question_id) ? '取消标记' : '标记' }}
+                </a-button>
+              </div>
             </div>
 
             <div class="question-stem">{{ currentQuestion.stem }}</div>
@@ -169,24 +221,48 @@
             <!-- Choice Questions -->
             <div v-if="currentQuestion.question_type === 'single_choice'" class="question-options">
               <a-radio-group v-model:value="answers[currentQuestion.question_id]" @change="saveAnswer">
-                <a-radio v-for="(val, key) in currentQuestion.options" :key="key" :value="key" class="option-item">
-                  {{ key }}. {{ val }}
-                </a-radio>
+                <div v-for="(val, key) in currentQuestion.options" :key="key" class="option-row">
+                  <a-radio :value="key" class="option-item">
+                    <span class="option-content">
+                      <span class="option-label">{{ key }}.</span>
+                      <span class="option-text">{{ val }}</span>
+                    </span>
+                  </a-radio>
+                </div>
               </a-radio-group>
             </div>
 
             <div v-else-if="currentQuestion.question_type === 'multiple_choice'" class="question-options">
               <a-checkbox-group v-model:value="multiAnswers" @change="onMultiChange">
-                <a-checkbox v-for="(val, key) in currentQuestion.options" :key="key" :value="key" class="option-item">
-                  {{ key }}. {{ val }}
-                </a-checkbox>
+                <div v-for="(val, key) in currentQuestion.options" :key="key" class="option-row">
+                  <a-checkbox :value="key" class="option-item">
+                    <span class="option-content">
+                      <span class="option-label">{{ key }}.</span>
+                      <span class="option-text">{{ val }}</span>
+                    </span>
+                  </a-checkbox>
+                </div>
               </a-checkbox-group>
             </div>
 
             <div v-else-if="currentQuestion.question_type === 'true_false'" class="question-options">
               <a-radio-group v-model:value="answers[currentQuestion.question_id]" @change="saveAnswer">
-                <a-radio value="T" class="option-item">T. 正确</a-radio>
-                <a-radio value="F" class="option-item">F. 错误</a-radio>
+                <div class="option-row">
+                  <a-radio value="A" class="option-item">
+                    <span class="option-content">
+                      <span class="option-label">A.</span>
+                      <span class="option-text">正确</span>
+                    </span>
+                  </a-radio>
+                </div>
+                <div class="option-row">
+                  <a-radio value="B" class="option-item">
+                    <span class="option-content">
+                      <span class="option-label">B.</span>
+                      <span class="option-text">错误</span>
+                    </span>
+                  </a-radio>
+                </div>
               </a-radio-group>
             </div>
 
@@ -202,10 +278,7 @@
             <!-- Navigation Buttons -->
             <div class="question-actions">
               <a-button :disabled="currentIndex === 0" @click="currentIndex--">上一题</a-button>
-              <a-button v-if="currentIndex < questions.length - 1" type="primary" @click="currentIndex++">下一题</a-button>
-              <a-popconfirm v-else title="确定提交考试？提交后不可修改。" @confirm="submitExam">
-                <a-button type="primary" danger>交卷</a-button>
-              </a-popconfirm>
+              <a-button type="primary" :disabled="currentIndex === questions.length - 1" @click="currentIndex++">下一题</a-button>
             </div>
           </div>
         </div>
@@ -220,11 +293,11 @@ import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { ClockCircleOutlined, ThunderboltOutlined } from '@ant-design/icons-vue'
 import request from '@/utils/request'
-import { checkLLMModule } from '@/composables/useLLMStatus'
 
 const router = useRouter()
 const loadingExams = ref(false)
 const availableExams = ref<any[]>([])
+const activeSessionByExamId = reactive<Record<string, string>>({})
 const session = ref<any>(null)
 const questions = ref<any[]>([])
 const answers = reactive<Record<string, string>>({})
@@ -233,10 +306,6 @@ const currentIndex = ref(0)
 const remainingSeconds = ref<number | null>(null)
 let timerInterval: any = null
 
-// In-progress session recovery
-const inProgressSession = ref<any>(null)
-const resumingExam = ref(false)
-
 // Random test state
 const randomTestModalVisible = ref(false)
 const randomTestLoading = ref(false)
@@ -244,11 +313,44 @@ const randomTestForm = reactive({ count: 10, difficulty_mode: 'real' })
 const isRandomTest = ref(false)
 const randomTestResult = ref<any>(null)
 const cleanupLoading = ref(false)
+const formalFlowState = ref<'idle' | 'processing' | 'processing_failed'>('idle')
+const processingContext = ref<any>(null)
+const processingStatus = reactive({
+  stage: 'submitted',
+  score_id: '',
+  diagnostic_ready: false,
+  message: '',
+})
+let stopProcessingPolling = false
 
 const currentQuestion = computed(() => questions.value[currentIndex.value] || null)
 const answeredCount = computed(() => questions.value.filter(q => answers[q.question_id]).length)
+const displayedExams = computed(() => {
+  const published = [...availableExams.value]
+  const publishedIds = new Set(published.map(item => item.id))
+  const resumedOnly = Object.entries(activeSessionMetaByExamId).flatMap(([examId, meta]) => {
+    if (!meta || publishedIds.has(examId)) {
+      return []
+    }
+    return [{
+      id: examId,
+      title: meta.exam_title,
+      description: '未完成的考试会话',
+      total_score: null,
+      time_limit_minutes: meta.time_limit_minutes,
+    }]
+  })
+  return [...resumedOnly, ...published]
+})
 
 const multiAnswers = ref<string[]>([])
+const activeSessionMetaByExamId = reactive<Record<string, { id: string; exam_title: string; time_limit_minutes?: number | null }>>({})
+const processingStepIndex = computed(() => {
+  if (processingStatus.stage === 'completed') return 3
+  if (processingStatus.stage === 'generating_diagnostic') return 2
+  if (processingStatus.stage === 'scoring') return 1
+  return 0
+})
 
 watch(currentIndex, () => {
   if (currentQuestion.value?.question_type === 'multiple_choice') {
@@ -274,91 +376,76 @@ function formatTime(seconds: number) {
   return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
 }
 
-async function checkInProgressSession() {
-  try {
-    const sessions: any[] = await request.get('/sessions', { params: { skip: 0, limit: 10 } })
-    const active = sessions.find((s: any) => s.status === 'in_progress')
-    if (active) {
-      inProgressSession.value = active
-    }
-  } catch { /* ignore */ }
-}
-
-async function resumeExam(activeSession: any) {
-  resumingExam.value = true
-  try {
-    const sheetId = activeSession.id
-    const sessionData: any = await request.get(`/sessions/${sheetId}`)
-
-    session.value = {
-      answer_sheet_id: sheetId,
-      exam_id: activeSession.exam_id,
-      exam_title: activeSession.exam_title || sessionData.exam_title,
-      time_limit_minutes: sessionData.time_limit_minutes,
-      start_time: activeSession.start_time || sessionData.start_time,
-    }
-    questions.value = sessionData.questions || []
-    currentIndex.value = 0
-
-    // Restore existing answers
-    if (sessionData.answers) {
-      for (const [qid, ans] of Object.entries(sessionData.answers)) {
-        answers[qid] = ans as string
-      }
-      // Jump to first unanswered question
-      const firstUnanswered = questions.value.findIndex(q => !answers[q.question_id])
-      if (firstUnanswered >= 0) currentIndex.value = firstUnanswered
-    }
-
-    // Resume timer
-    if (sessionData.time_limit_minutes) {
-      const elapsed = Math.floor((Date.now() - new Date(session.value.start_time).getTime()) / 1000)
-      remainingSeconds.value = Math.max(0, sessionData.time_limit_minutes * 60 - elapsed)
-      startTimer()
-    }
-
-    // Save to sessionStorage for page navigation recovery
-    sessionStorage.setItem('activeExamSession', JSON.stringify({ sheetId, examId: activeSession.exam_id }))
-    inProgressSession.value = null
-    message.success('已恢复考试，继续作答')
-  } catch {
-    message.error('恢复考试失败')
-  } finally {
-    resumingExam.value = false
-  }
-}
-
-async function tryAutoRestore() {
-  // Check sessionStorage for active session from page navigation
-  const saved = sessionStorage.getItem('activeExamSession')
-  if (saved) {
-    try {
-      const { sheetId } = JSON.parse(saved)
-      const sessionData: any = await request.get(`/sessions/${sheetId}`)
-      if (sessionData && sessionData.questions?.length > 0) {
-        await resumeExam({ id: sheetId, exam_id: sessionData.exam_id, exam_title: sessionData.exam_title, start_time: sessionData.start_time })
-        return true
-      }
-    } catch {
-      // Session no longer valid, clean up
-      sessionStorage.removeItem('activeExamSession')
-    }
-  }
-  return false
-}
-
 async function fetchAvailableExams() {
   loadingExams.value = true
   try {
-    const data: any = await request.get('/exams', { params: { status: 'published', skip: 0, limit: 50 } })
-    availableExams.value = (data.items || []).filter((e: any) => !e.title.startsWith('随机测试'))
+    const [examData, sessionData]: [any, any] = await Promise.all([
+      request.get('/exams', { params: { status: 'published', skip: 0, limit: 50 } }),
+      request.get('/sessions', { params: { skip: 0, limit: 100 } }),
+    ])
+    availableExams.value = (examData.items || []).filter((e: any) => !e.title.startsWith('随机测试'))
+    Object.keys(activeSessionByExamId).forEach(key => delete activeSessionByExamId[key])
+    Object.keys(activeSessionMetaByExamId).forEach(key => delete activeSessionMetaByExamId[key])
+    for (const item of sessionData || []) {
+      if (item?.status === 'in_progress' && item?.exam_id) {
+        activeSessionByExamId[item.exam_id] = item.id
+        activeSessionMetaByExamId[item.exam_id] = {
+          id: item.id,
+          exam_title: item.exam_title || '未完成考试',
+          time_limit_minutes: item.time_limit_minutes,
+        }
+      }
+    }
   } catch { /* handled */ } finally {
     loadingExams.value = false
   }
 }
 
+function resetSessionState() {
+  currentIndex.value = 0
+  remainingSeconds.value = null
+  if (timerInterval) {
+    clearInterval(timerInterval)
+    timerInterval = null
+  }
+  questions.value = []
+  Object.keys(answers).forEach(key => delete answers[key])
+  markedSet.value = new Set()
+  multiAnswers.value = []
+}
+
+function resetFormalFlow() {
+  formalFlowState.value = 'idle'
+  processingContext.value = null
+  processingStatus.stage = 'submitted'
+  processingStatus.score_id = ''
+  processingStatus.diagnostic_ready = false
+  processingStatus.message = ''
+}
+
+function clearActiveSession(sheetId: string) {
+  Object.keys(activeSessionByExamId).forEach(key => {
+    if (activeSessionByExamId[key] === sheetId) delete activeSessionByExamId[key]
+  })
+  Object.keys(activeSessionMetaByExamId).forEach(key => {
+    if (activeSessionMetaByExamId[key]?.id === sheetId) delete activeSessionMetaByExamId[key]
+  })
+}
+
+function applyProcessingStatus(payload: any) {
+  processingStatus.stage = payload?.stage || 'submitted'
+  processingStatus.score_id = payload?.score_id || ''
+  processingStatus.diagnostic_ready = Boolean(payload?.diagnostic_ready)
+  processingStatus.message = payload?.message || ''
+}
+
+function wait(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
 async function startExam(examId: string) {
   try {
+    resetSessionState()
     const data: any = await request.post(`/sessions/start/${examId}`)
     session.value = data
 
@@ -378,9 +465,7 @@ async function startExam(examId: string) {
       remainingSeconds.value = Math.max(0, data.time_limit_minutes * 60 - elapsed)
       startTimer()
     }
-    // Persist to sessionStorage for navigation recovery
-    sessionStorage.setItem('activeExamSession', JSON.stringify({ sheetId: data.answer_sheet_id, examId: examId }))
-    message.success('考试开始')
+    message.success(data.resumed ? '已恢复未完成的考试' : '考试开始')
   } catch { /* handled */ }
 }
 
@@ -425,14 +510,18 @@ async function toggleMark() {
 
 async function submitExam() {
   if (!session.value) return
-  // Warn if scoring LLM is not configured (subjective questions may score inaccurately)
-  await checkLLMModule('scoring', '智能评分')
   try {
     const sheetId = session.value.answer_sheet_id
-    const data: any = await request.post(`/sessions/${sheetId}/submit`)
-    clearInterval(timerInterval)
-
-    sessionStorage.removeItem('activeExamSession')
+    const examTitle = session.value.exam_title
+    const data: any = await request.post(
+      `/sessions/${sheetId}/submit`,
+      undefined,
+      isRandomTest.value ? undefined : { params: { auto_score: false } }
+    )
+    if (timerInterval) {
+      clearInterval(timerInterval)
+      timerInterval = null
+    }
 
     if (isRandomTest.value) {
       // Fetch score and show inline — don't save to history
@@ -459,16 +548,77 @@ async function submitExam() {
         }
       }
       session.value = null
-      questions.value = []
-      Object.keys(answers).forEach(k => delete answers[k])
+      resetSessionState()
     } else {
       message.success(`交卷成功！已答 ${data.total_answered}/${data.total_questions} 题`)
+      processingContext.value = {
+        sheetId,
+        examTitle,
+        totalAnswered: data.total_answered,
+        totalQuestions: data.total_questions,
+      }
+      applyProcessingStatus({
+        stage: 'submitted',
+        message: '答卷已提交，处理中。',
+      })
+      formalFlowState.value = 'processing'
       session.value = null
-      questions.value = []
-      Object.keys(answers).forEach(k => delete answers[k])
-      router.push({ name: 'Scores' })
+      clearActiveSession(sheetId)
+      resetSessionState()
+      await startFormalProcessingFlow(sheetId)
     }
   } catch { /* handled */ }
+}
+
+async function startFormalProcessingFlow(sheetId: string) {
+  stopProcessingPolling = false
+  formalFlowState.value = 'processing'
+  try {
+    const kickoff: any = await request.post(`/scores/process/${sheetId}`)
+    applyProcessingStatus(kickoff)
+    await pollFormalProcessingStatus(sheetId)
+  } catch {
+    formalFlowState.value = 'processing_failed'
+    processingStatus.message = '处理流程启动失败，请重试。'
+  }
+}
+
+async function pollFormalProcessingStatus(sheetId: string) {
+  const startedAt = Date.now()
+  while (!stopProcessingPolling && formalFlowState.value === 'processing') {
+    const status: any = await request.get(`/scores/process/${sheetId}`)
+    applyProcessingStatus(status)
+
+    if (status.stage === 'completed' && status.score_id) {
+      stopProcessingPolling = true
+      router.replace({ name: 'ScoreDiagnostic', params: { scoreId: status.score_id } })
+      return
+    }
+    if (status.stage === 'failed') {
+      formalFlowState.value = 'processing_failed'
+      return
+    }
+
+    const interval = Date.now() - startedAt < 20000 ? 2000 : 4000
+    await wait(interval)
+  }
+}
+
+async function retryProcessing() {
+  if (!processingContext.value?.sheetId) return
+  await startFormalProcessingFlow(processingContext.value.sheetId)
+}
+
+async function returnToExamList() {
+  stopProcessingPolling = true
+  resetFormalFlow()
+  await fetchAvailableExams()
+}
+
+function returnToScores() {
+  stopProcessingPolling = true
+  resetFormalFlow()
+  router.push({ name: 'Scores' })
 }
 
 function showRandomTestModal() {
@@ -480,6 +630,7 @@ function showRandomTestModal() {
 async function startRandomTest() {
   randomTestLoading.value = true
   try {
+    resetSessionState()
     const data: any = await request.post('/sessions/random-test', {
       count: randomTestForm.count,
       difficulty_mode: randomTestForm.difficulty_mode,
@@ -517,20 +668,26 @@ async function closeRandomTestResult() {
   fetchAvailableExams()
 }
 
-onMounted(async () => {
-  // Try to auto-restore an active exam session (from page navigation)
-  const restored = await tryAutoRestore()
-  if (!restored) {
-    await fetchAvailableExams()
-    await checkInProgressSession()
-  }
+onMounted(() => { fetchAvailableExams() })
+onUnmounted(() => {
+  stopProcessingPolling = true
+  if (timerInterval) clearInterval(timerInterval)
 })
-onUnmounted(() => { if (timerInterval) clearInterval(timerInterval) })
 </script>
 
 <style scoped>
 .page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
 .page-header h2 { margin: 0; }
+.processing-hero {
+  padding: 24px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #f5f9ff 0%, #eef5fb 100%);
+  margin-bottom: 20px;
+}
+.processing-hero-title { font-size: 22px; font-weight: 600; margin-bottom: 8px; color: #1f4e79; }
+.processing-hero-subtitle { color: #4f5b67; line-height: 1.8; margin-bottom: 8px; }
+.processing-hero-meta { color: #7a8590; font-size: 13px; }
+.processing-steps { margin-top: 8px; }
 .exam-container { height: calc(100vh - 112px); display: flex; flex-direction: column; }
 .exam-header {
   display: flex; align-items: center; gap: 24px; padding: 12px 24px;
@@ -563,10 +720,35 @@ onUnmounted(() => { if (timerInterval) clearInterval(timerInterval) })
 .dot-marked { border: 1px solid #faad14; background: transparent; }
 .dot-current { background: #1F4E79; }
 .question-content { flex: 1; padding: 24px; overflow-y: auto; }
-.question-header { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+.question-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+.question-header-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.question-header-side { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .question-num { font-size: 16px; font-weight: 600; }
 .question-stem { font-size: 15px; line-height: 1.8; margin-bottom: 20px; white-space: pre-wrap; }
 .question-options { margin-bottom: 24px; }
-.option-item { display: block; margin-bottom: 12px; font-size: 14px; line-height: 1.6; }
+.question-options :deep(.ant-radio-group),
+.question-options :deep(.ant-checkbox-group) { width: 100%; display: flex; flex-direction: column; gap: 12px; }
+.option-row { width: 100%; }
+.question-options :deep(.ant-radio-wrapper),
+.question-options :deep(.ant-checkbox-wrapper) {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  margin-inline-start: 0;
+  white-space: normal;
+}
+.question-options :deep(.ant-radio),
+.question-options :deep(.ant-checkbox) { margin-top: 0.35em; }
+.question-options :deep(.ant-radio + span),
+.question-options :deep(.ant-checkbox + span) {
+  flex: 1;
+  min-width: 0;
+  padding-inline-start: 8px;
+  white-space: normal;
+}
+.option-item { font-size: 14px; line-height: 1.6; }
+.option-content { display: flex; align-items: flex-start; gap: 4px; }
+.option-label { flex: 0 0 auto; }
+.option-text { flex: 1; min-width: 0; white-space: normal; word-break: break-word; }
 .question-actions { display: flex; gap: 12px; margin-top: 24px; }
 </style>

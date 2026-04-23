@@ -12,6 +12,7 @@ class StartExamResponse(BaseModel):
     time_limit_minutes: Optional[int] = None
     total_questions: int
     start_time: datetime
+    resumed: bool = False
 
 
 class SubmitAnswerRequest(BaseModel):
@@ -101,6 +102,7 @@ class ExamSessionQuestion(BaseModel):
     stem: str
     options: Optional[dict] = None
     difficulty: int
+    dimension: Optional[str] = None
 
 
 class ExamSessionResponse(BaseModel):

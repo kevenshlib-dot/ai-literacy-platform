@@ -12,7 +12,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
-from app.core.llm_config import get_llm_config_sync, make_openai_client
+from app.agents.llm_utils import strip_thinking_tags, build_disable_thinking_extra_body
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +30,11 @@ def research_agent(topic: Optional[str] = None) -> dict:
 
     Returns research findings with source references.
     """
-    _cfg = get_llm_config_sync("indicator")
-    if _cfg.api_key == "your-api-key":
+    if settings.LLM_API_KEY == "your-api-key":
         return _rule_based_research(topic)
 
     try:
-        client = make_openai_client(_cfg)
+        client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
         prompt = f"""你是一个AI领域研究员。请分析最新的AI发展动态，识别以下方面的趋势：
 1. 新兴AI技术或工具
 2. AI政策法规变化
@@ -59,13 +58,22 @@ def research_agent(topic: Optional[str] = None) -> dict:
   ]
 }}
 ```"""
-        response = client.chat.completions.create(
-            model=_cfg.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=1000,
+        request_kwargs = {
+            "model": settings.LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_tokens": 1000,
+        }
+        extra_body = build_disable_thinking_extra_body(
+            settings.LLM_MODEL,
+            settings.LLM_BASE_URL,
         )
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        response = client.chat.completions.create(**request_kwargs)
         raw = response.choices[0].message.content.strip()
+        raw = strip_thinking_tags(raw)
         json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
         if json_match:
             raw = json_match.group(1)
@@ -80,12 +88,11 @@ def consultant_agent(research_findings: dict) -> list[dict]:
 
     Generates indicator proposals from research findings.
     """
-    _cfg = get_llm_config_sync("indicator")
-    if _cfg.api_key == "your-api-key":
+    if settings.LLM_API_KEY == "your-api-key":
         return _rule_based_consultant(research_findings)
 
     try:
-        client = make_openai_client(_cfg)
+        client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
         dims_str = "、".join(FIVE_DIMENSIONS)
         findings_str = json.dumps(research_findings, ensure_ascii=False, indent=2)
 
@@ -108,13 +115,22 @@ def consultant_agent(research_findings: dict) -> list[dict]:
   }}
 ]
 ```"""
-        response = client.chat.completions.create(
-            model=_cfg.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5,
-            max_tokens=1000,
+        request_kwargs = {
+            "model": settings.LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.5,
+            "max_tokens": 1000,
+        }
+        extra_body = build_disable_thinking_extra_body(
+            settings.LLM_MODEL,
+            settings.LLM_BASE_URL,
         )
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        response = client.chat.completions.create(**request_kwargs)
         raw = response.choices[0].message.content.strip()
+        raw = strip_thinking_tags(raw)
         json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', raw, re.DOTALL)
         if json_match:
             raw = json_match.group(1)
@@ -129,12 +145,11 @@ def review_agent(proposals: list[dict]) -> list[dict]:
 
     Evaluates feasibility, relevance, and potential issues.
     """
-    _cfg = get_llm_config_sync("indicator")
-    if _cfg.api_key == "your-api-key":
+    if settings.LLM_API_KEY == "your-api-key":
         return _rule_based_review(proposals)
 
     try:
-        client = make_openai_client(_cfg)
+        client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
         proposals_str = json.dumps(proposals, ensure_ascii=False, indent=2)
 
         prompt = f"""你是一个AI素养评测框架的红队审核员。请审查以下指标更新建议，评估：
@@ -160,13 +175,22 @@ def review_agent(proposals: list[dict]) -> list[dict]:
   }}
 ]
 ```"""
-        response = client.chat.completions.create(
-            model=_cfg.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=1000,
+        request_kwargs = {
+            "model": settings.LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 1000,
+        }
+        extra_body = build_disable_thinking_extra_body(
+            settings.LLM_MODEL,
+            settings.LLM_BASE_URL,
         )
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        response = client.chat.completions.create(**request_kwargs)
         raw = response.choices[0].message.content.strip()
+        raw = strip_thinking_tags(raw)
         json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', raw, re.DOTALL)
         if json_match:
             raw = json_match.group(1)

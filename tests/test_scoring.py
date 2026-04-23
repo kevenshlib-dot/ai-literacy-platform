@@ -1,14 +1,17 @@
 """Tests for scoring engine and report generation (T015-T017)."""
+import asyncio
 import pytest
 from httpx import AsyncClient, ASGITransport
-from sqlalchemy import text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from app.main import app
 from app.core.database import Base, get_db
 from app.core.config import settings
 from app.services.user_service import init_roles
+from app.agents import scoring_agent
 from app.agents.scoring_agent import _rule_based_scoring
+from app.models.user import User
 
 
 # ---- Unit Tests for Scoring Agent ----
@@ -23,6 +26,8 @@ def test_rule_based_scoring_correct():
     )
     assert result["earned_score"] > 0
     assert "feedback" in result
+    assert result["analysis"]["scoring_source"] == "rule"
+    assert "earned_ratio" in result["analysis"]
 
 
 def test_rule_based_scoring_empty():
@@ -36,6 +41,7 @@ def test_rule_based_scoring_empty():
     assert result["earned_score"] == 0.0
     assert result["is_correct"] is False
     assert "未作答" in result["feedback"]
+    assert result["analysis"]["error_reasons"] == ["no_answer"]
 
 
 def test_rule_based_scoring_partial():
@@ -47,6 +53,34 @@ def test_rule_based_scoring_partial():
         max_score=10.0,
     )
     assert 0 < result["earned_score"] <= 10.0
+    assert "missed_points" in result["analysis"]
+
+
+def test_subjective_scoring_llm_output_is_normalized(monkeypatch):
+    def _fake_llm(**kwargs):
+        return {
+            "earned_ratio": 0.72,
+            "judgement": "覆盖了主要要点，但遗漏了风险分析。",
+            "positive_points": ["说明了AI辅助诊断的主要作用"],
+            "missed_points": ["缺少风险控制说明"],
+            "error_reasons": ["incomplete_answer"],
+            "feedback": "整体较好，但论述不完整。",
+            "confidence": 0.81,
+            "evidence": ["学生答案提到了效率提升"],
+        }
+
+    monkeypatch.setattr(scoring_agent, "_call_subjective_scoring_llm", _fake_llm)
+
+    result = scoring_agent.score_subjective_answer(
+        stem="请分析AI辅助诊断的价值与风险。",
+        correct_answer="应说明效率提升、辅助医生决策，并分析误判风险和人工复核要求。",
+        student_answer="AI可以提升诊断效率，帮助医生判断。",
+        question_type="short_answer",
+        max_score=10.0,
+    )
+    assert result["earned_score"] == 7.2
+    assert result["analysis"]["scoring_source"] == "llm"
+    assert result["analysis"]["missed_points"] == ["缺少风险控制说明"]
 
 
 # ---- Integration Tests ----
@@ -71,17 +105,8 @@ app.dependency_overrides[get_db] = override_get_db
 async def setup_db():
     engine = create_async_engine(settings.DATABASE_URL, echo=False)
     async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
-    async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE TABLE score_details CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE scores CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE answers CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE answer_sheets CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE exam_questions CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE exams CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE review_records CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE questions CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE users CASCADE"))
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as session:
         await init_roles(session)
@@ -103,7 +128,24 @@ async def register_user(client, role="organizer"):
         "password": "password123",
         "role": role,
     })
-    return resp.json()["access_token"]
+    data = resp.json()
+    if data.get("access_token"):
+        return data["access_token"]
+
+    user_id = data["user"]["id"]
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = (await session.execute(select(User).where(User.id == user_id))).scalar_one()
+        user.is_active = True
+        await session.commit()
+    await engine.dispose()
+
+    login_resp = await client.post("/api/v1/auth/login", json={
+        "username": f"user_{unique}",
+        "password": "password123",
+    })
+    return login_resp.json()["access_token"]
 
 
 async def setup_exam_and_submit(client, org_token, ex_token, answers_map):
@@ -166,6 +208,75 @@ async def setup_exam_and_submit(client, org_token, ex_token, answers_map):
     return sid
 
 
+async def setup_exam_submit_only(client, org_token, ex_token, answers_map):
+    rev_token = await register_user(client, "reviewer")
+    org_headers = {"Authorization": f"Bearer {org_token}"}
+    ex_headers = {"Authorization": f"Bearer {ex_token}"}
+
+    qids = []
+    for i, (correct, _) in enumerate(answers_map):
+        resp = await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": f"流程题目{i+1}？",
+            "correct_answer": correct,
+            "options": {"A": "选项A", "B": "选项B", "C": "选项C", "D": "选项D"},
+            "difficulty": 3,
+            "dimension": f"维度{i % 2 + 1}",
+        }, headers=org_headers)
+        qid = resp.json()["id"]
+        await client.post(f"/api/v1/questions/{qid}/submit", headers=org_headers)
+        await client.post(
+            f"/api/v1/questions/{qid}/review",
+            json={"action": "approve"},
+            headers={"Authorization": f"Bearer {rev_token}"},
+        )
+        qids.append(qid)
+
+    exam_resp = await client.post("/api/v1/exams", json={"title": "提交后处理考试"}, headers=org_headers)
+    eid = exam_resp.json()["id"]
+
+    await client.post(
+        f"/api/v1/exams/{eid}/assemble/manual",
+        json={
+            "questions": [
+                {"question_id": qids[i], "order_num": i + 1, "score": 10}
+                for i in range(len(qids))
+            ]
+        },
+        headers=org_headers,
+    )
+    await client.post(f"/api/v1/exams/{eid}/publish", headers=org_headers)
+
+    start = await client.post(f"/api/v1/sessions/start/{eid}", headers=ex_headers)
+    sid = start.json()["answer_sheet_id"]
+
+    for i, (_, student_answer) in enumerate(answers_map):
+        if student_answer is not None:
+            await client.post(
+                f"/api/v1/sessions/{sid}/answer",
+                json={"question_id": qids[i], "answer_content": student_answer},
+                headers=ex_headers,
+            )
+
+    submit_resp = await client.post(
+        f"/api/v1/sessions/{sid}/submit",
+        params={"auto_score": "false"},
+        headers=ex_headers,
+    )
+    assert submit_resp.status_code == 200
+    assert submit_resp.json()["status"] == "submitted"
+    return sid
+
+
+async def get_score_by_sheet_payload(client, sheet_id, token):
+    resp = await client.get(
+        f"/api/v1/scores/sheet/{sheet_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    return resp.json()
+
+
 @pytest.mark.asyncio
 async def test_grade_all_correct():
     """All correct answers should get full score."""
@@ -178,13 +289,7 @@ async def test_grade_all_correct():
             ("B", "B"),
             ("C", "C"),
         ])
-
-        resp = await client.post(
-            f"/api/v1/scores/grade/{sid}",
-            headers={"Authorization": f"Bearer {org_token}"},
-        )
-    assert resp.status_code == 200
-    data = resp.json()
+        data = await get_score_by_sheet_payload(client, sid, ex_token)
     assert data["total_score"] == 30.0
     assert data["max_score"] == 30.0
     assert data["level"] == "优秀"
@@ -201,13 +306,7 @@ async def test_grade_all_wrong():
             ("B", "C"),
             ("C", "A"),
         ])
-
-        resp = await client.post(
-            f"/api/v1/scores/grade/{sid}",
-            headers={"Authorization": f"Bearer {org_token}"},
-        )
-    assert resp.status_code == 200
-    data = resp.json()
+        data = await get_score_by_sheet_payload(client, sid, ex_token)
     assert data["total_score"] == 0.0
     assert data["level"] == "不合格"
 
@@ -223,13 +322,7 @@ async def test_grade_partial():
             ("B", "C"),  # wrong
             ("C", None), # unanswered
         ])
-
-        resp = await client.post(
-            f"/api/v1/scores/grade/{sid}",
-            headers={"Authorization": f"Bearer {org_token}"},
-        )
-    assert resp.status_code == 200
-    data = resp.json()
+        data = await get_score_by_sheet_payload(client, sid, ex_token)
     assert data["total_score"] == 10.0  # only first correct
     assert data["max_score"] == 30.0
 
@@ -244,10 +337,6 @@ async def test_get_score_by_sheet():
             ("A", "A"),
             ("B", "B"),
         ])
-
-        await client.post(f"/api/v1/scores/grade/{sid}",
-                         headers={"Authorization": f"Bearer {org_token}"})
-
         resp = await client.get(f"/api/v1/scores/sheet/{sid}",
                                headers={"Authorization": f"Bearer {ex_token}"})
     assert resp.status_code == 200
@@ -257,6 +346,7 @@ async def test_get_score_by_sheet():
     for d in data["details"]:
         assert d["is_correct"] is True
         assert d["feedback"] == "正确"
+        assert d["analysis"]["scoring_source"] == "rule"
 
 
 @pytest.mark.asyncio
@@ -268,7 +358,6 @@ async def test_cannot_double_grade():
         sid = await setup_exam_and_submit(client, org_token, ex_token, [("A", "A")])
         headers = {"Authorization": f"Bearer {org_token}"}
 
-        await client.post(f"/api/v1/scores/grade/{sid}", headers=headers)
         resp = await client.post(f"/api/v1/scores/grade/{sid}", headers=headers)
     assert resp.status_code == 400
     assert "已评分" in resp.json()["detail"]
@@ -284,10 +373,8 @@ async def test_generate_report():
             ("A", "A"),
             ("B", "C"),
         ])
-
-        grade_resp = await client.post(f"/api/v1/scores/grade/{sid}",
-                                      headers={"Authorization": f"Bearer {org_token}"})
-        score_id = grade_resp.json()["score_id"]
+        score_payload = await get_score_by_sheet_payload(client, sid, ex_token)
+        score_id = score_payload["score_id"]
 
         resp = await client.post(f"/api/v1/scores/{score_id}/report",
                                 headers={"Authorization": f"Bearer {ex_token}"})
@@ -301,6 +388,71 @@ async def test_generate_report():
 
 
 @pytest.mark.asyncio
+async def test_generate_report_and_diagnostic_do_not_override_each_other():
+    async with get_client() as client:
+        org_token = await register_user(client, "organizer")
+        ex_token = await register_user(client, "examinee")
+
+        sid = await setup_exam_and_submit(client, org_token, ex_token, [
+            ("A", "A"),
+            ("B", "C"),
+        ])
+        score_payload = await get_score_by_sheet_payload(client, sid, ex_token)
+        score_id = score_payload["score_id"]
+
+        score_report_resp = await client.post(
+            f"/api/v1/scores/{score_id}/report",
+            headers={"Authorization": f"Bearer {ex_token}"},
+        )
+        diagnostic_resp = await client.get(
+            f"/api/v1/scores/{score_id}/diagnostic",
+            headers={"Authorization": f"Bearer {ex_token}"},
+        )
+
+    assert score_report_resp.status_code == 200
+    assert diagnostic_resp.status_code == 200
+    assert "total_questions" in score_report_resp.json()
+    assert "radar_data" in diagnostic_resp.json()
+
+
+@pytest.mark.asyncio
+async def test_score_processing_endpoints_complete_and_reuse_cached_diagnostic():
+    async with get_client() as client:
+        org_token = await register_user(client, "organizer")
+        ex_token = await register_user(client, "examinee")
+        headers = {"Authorization": f"Bearer {ex_token}"}
+
+        sid = await setup_exam_submit_only(client, org_token, ex_token, [
+            ("A", "A"),
+            ("B", "C"),
+        ])
+
+        start_resp = await client.post(f"/api/v1/scores/process/{sid}", headers=headers)
+        assert start_resp.status_code == 200
+        assert start_resp.json()["stage"] == "submitted"
+
+        status_payload = None
+        for _ in range(30):
+            status_resp = await client.get(f"/api/v1/scores/process/{sid}", headers=headers)
+            assert status_resp.status_code == 200
+            status_payload = status_resp.json()
+            if status_payload["stage"] == "completed":
+                break
+            await asyncio.sleep(0.05)
+
+        assert status_payload is not None
+        assert status_payload["stage"] == "completed"
+        assert status_payload["score_id"]
+        assert status_payload["diagnostic_ready"] is True
+
+        repeat_resp = await client.post(f"/api/v1/scores/process/{sid}", headers=headers)
+        assert repeat_resp.status_code == 200
+        repeat_payload = repeat_resp.json()
+        assert repeat_payload["stage"] == "completed"
+        assert repeat_payload["score_id"] == status_payload["score_id"]
+
+
+@pytest.mark.asyncio
 async def test_dimension_scores():
     """Verify dimension-level scoring breakdown."""
     async with get_client() as client:
@@ -311,10 +463,7 @@ async def test_dimension_scores():
             ("A", "A"),  # 维度1 - correct
             ("B", "C"),  # 维度2 - wrong
         ])
-
-        grade_resp = await client.post(f"/api/v1/scores/grade/{sid}",
-                                      headers={"Authorization": f"Bearer {org_token}"})
-        data = grade_resp.json()
+        data = await get_score_by_sheet_payload(client, sid, ex_token)
     assert "dimension_scores" in data
     dim_scores = data["dimension_scores"]
     assert "维度1" in dim_scores

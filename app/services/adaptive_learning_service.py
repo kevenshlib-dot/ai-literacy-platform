@@ -322,6 +322,25 @@ async def get_recommendations(
     return recommendations
 
 
+async def get_courses_for_dimensions(
+    db: AsyncSession,
+    dimensions: list[str],
+    *,
+    limit_per_dimension: int = 2,
+) -> dict[str, list[Course]]:
+    """Return published courses grouped by target dimension."""
+    courses_by_dim: dict[str, list[Course]] = {}
+    for dim in dimensions:
+        result = await db.execute(
+            select(Course)
+            .where(Course.status == CourseStatus.PUBLISHED, Course.dimension == dim)
+            .order_by(Course.difficulty.asc(), Course.created_at.asc())
+            .limit(limit_per_dimension)
+        )
+        courses_by_dim[dim] = list(result.scalars().all())
+    return courses_by_dim
+
+
 def _generate_path_title(dimensions: list[str]) -> str:
     """Generate a human-readable path title."""
     if len(dimensions) == 1:

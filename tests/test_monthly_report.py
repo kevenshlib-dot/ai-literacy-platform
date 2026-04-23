@@ -7,7 +7,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from app.main import app
 from app.core.database import Base, get_db
 from app.core.config import settings
-from app.services.user_service import init_roles
+from app.core.security import create_access_token
+from app.services.user_service import init_roles, create_user
 from app.services.monthly_report_service import (
     _calculate_health_score,
     _generate_recommendations,
@@ -80,7 +81,12 @@ async def setup_db():
         await conn.run_sync(Base.metadata.create_all)
     async with engine.begin() as conn:
         await conn.execute(text("TRUNCATE TABLE reports CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE users CASCADE"))
+        await conn.execute(text("TRUNCATE TABLE answer_sheets CASCADE"))
+        await conn.execute(text("TRUNCATE TABLE scores CASCADE"))
+        await conn.execute(text("TRUNCATE TABLE exams CASCADE"))
+        await conn.execute(text("TRUNCATE TABLE questions CASCADE"))
+        await conn.execute(text("TRUNCATE TABLE materials CASCADE"))
+        # await conn.execute(text("TRUNCATE TABLE users CASCADE"))
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as session:
         await init_roles(session)
@@ -96,13 +102,24 @@ def get_client():
 async def register_user(client, role="admin"):
     import uuid
     unique = uuid.uuid4().hex[:8]
-    resp = await client.post("/api/v1/auth/register", json={
-        "username": f"user_{unique}",
-        "email": f"{unique}@test.com",
-        "password": "password123",
-        "role": role,
-    })
-    return resp.json()["access_token"]
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = await create_user(
+            session,
+            username=f"user_{unique}",
+            email=f"{unique}@test.com",
+            password="password123",
+            role_name=role,
+            is_active=True,
+        )
+        await session.commit()
+        token = create_access_token(
+            subject=str(user.id),
+            extra_claims={"role": user.role.name.value},
+        )
+    await engine.dispose()
+    return token
 
 
 @pytest.mark.asyncio
@@ -123,6 +140,133 @@ async def test_generate_monthly_report():
     assert "user_statistics" in data
     assert "recommendations" in data
     assert "report_id" in data
+
+
+@pytest.mark.asyncio
+async def test_monthly_report_includes_question_quality_metrics():
+    async with get_client() as client:
+        token = await register_user(client, "admin")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": "月报统计题一",
+            "correct_answer": "A",
+            "options": {"A": "1", "B": "2"},
+            "dimension": "AI基础",
+        }, headers=headers)
+        await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": "月报统计题二",
+            "correct_answer": "A",
+            "options": {"A": "1", "B": "2"},
+            "dimension": "AI基础",
+            "bloom_level": "apply",
+            "explanation": "用于月报统计的解析。",
+        }, headers=headers)
+
+        resp = await client.post(
+            "/api/v1/reports/monthly?year=2026&month=3",
+            headers=headers,
+        )
+    assert resp.status_code == 200
+    data = resp.json()
+    quality_metrics = data["question_bank_health"]["quality_metrics"]
+    assert quality_metrics["missing_bloom_level_count"] == 1
+    assert quality_metrics["missing_explanation_count"] == 1
+    assert data["question_bank_health"]["bloom_distribution"]["apply"] == 1
+    categories = [item["category"] for item in data["recommendations"]]
+    assert "题目标注" in categories
+    assert "题目解析" in categories
+
+
+@pytest.mark.asyncio
+async def test_monthly_report_tracks_question_quality_trend():
+    async with get_client() as client:
+        token = await register_user(client, "admin")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        create_resp = await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": "趋势改善题",
+            "correct_answer": "A",
+            "options": {"A": "1", "B": "2"},
+            "dimension": "AI基础",
+        }, headers=headers)
+        question_id = create_resp.json()["id"]
+
+        feb_resp = await client.post(
+            "/api/v1/reports/monthly?year=2026&month=2",
+            headers=headers,
+        )
+        assert feb_resp.status_code == 200
+
+        update_resp = await client.put(f"/api/v1/questions/{question_id}", json={
+            "bloom_level": "understand",
+            "explanation": "补齐后的解析",
+        }, headers=headers)
+        assert update_resp.status_code == 200
+
+        mar_resp = await client.post(
+            "/api/v1/reports/monthly?year=2026&month=3",
+            headers=headers,
+        )
+    assert mar_resp.status_code == 200
+    data = mar_resp.json()
+    trend = data["question_bank_health"]["trend"]
+    assert trend["has_previous"] is True
+    assert trend["previous_period"] == "2026-02"
+    assert trend["direction"] == "improving"
+    assert trend["quality_issue_total_delta"] == -2
+    assert trend["quality_metric_deltas"]["missing_bloom_level_count"] == -1
+    assert trend["quality_metric_deltas"]["missing_explanation_count"] == -1
+
+
+@pytest.mark.asyncio
+async def test_monthly_report_adds_trend_recommendations_on_quality_decline():
+    async with get_client() as client:
+        token = await register_user(client, "admin")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        good_resp = await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": "趋势基线题",
+            "correct_answer": "A",
+            "options": {"A": "1", "B": "2"},
+            "dimension": "AI基础",
+            "bloom_level": "apply",
+            "explanation": "完整解析",
+        }, headers=headers)
+        assert good_resp.status_code == 201
+
+        feb_resp = await client.post(
+            "/api/v1/reports/monthly?year=2026&month=2",
+            headers=headers,
+        )
+        assert feb_resp.status_code == 200
+
+        bad_resp = await client.post("/api/v1/questions", json={
+            "question_type": "single_choice",
+            "stem": "趋势退化题",
+            "correct_answer": "A",
+            "options": {"A": "1", "B": "2"},
+            "dimension": "AI基础",
+        }, headers=headers)
+        assert bad_resp.status_code == 201
+
+        mar_resp = await client.post(
+            "/api/v1/reports/monthly?year=2026&month=3",
+            headers=headers,
+        )
+    assert mar_resp.status_code == 200
+    data = mar_resp.json()
+    trend = data["question_bank_health"]["trend"]
+    assert trend["direction"] == "declining"
+    assert trend["quality_issue_total_delta"] == 2
+    categories = [item["category"] for item in data["recommendations"]]
+    assert "题库趋势" in categories
+    assert "题目标注趋势" in categories
+    assert "题目解析趋势" in categories
 
 
 @pytest.mark.asyncio

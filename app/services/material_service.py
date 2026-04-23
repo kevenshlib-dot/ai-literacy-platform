@@ -1,12 +1,28 @@
 """Material service - handles material upload, metadata persistence, and queries."""
+import re
 import uuid
 from typing import Optional
 
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.material import Material, MaterialStatus
+from app.models.material import Material, MaterialStatus, KnowledgeUnit
+from app.models.question import Question, QuestionStatus
 from app.services.minio_service import upload_file, delete_file, get_presigned_url
+
+
+DEFAULT_DOWNLOAD_EXTENSIONS = {
+    "pdf": ".pdf",
+    "word": ".docx",
+    "epub": ".epub",
+    "markdown": ".md",
+    "html": ".html",
+    "image": ".png",
+    "video": ".mp4",
+    "audio": ".mp3",
+    "csv": ".csv",
+    "json": ".json",
+}
 
 
 async def create_material(
@@ -60,7 +76,25 @@ async def list_materials(
     uploaded_by: uuid.UUID = None,
 ) -> tuple[list[Material], int]:
     """List materials with filters and pagination."""
-    query = select(Material)
+    approved_question_counts = (
+        select(
+            Question.source_material_id.label("material_id"),
+            func.count(Question.id).label("approved_question_count"),
+        )
+        .where(
+            Question.source_material_id.isnot(None),
+            Question.status == QuestionStatus.APPROVED,
+        )
+        .group_by(Question.source_material_id)
+        .subquery()
+    )
+
+    query = select(
+        Material,
+        func.coalesce(approved_question_counts.c.approved_question_count, 0).label(
+            "approved_question_count"
+        ),
+    ).outerjoin(approved_question_counts, approved_question_counts.c.material_id == Material.id)
     count_query = select(func.count(Material.id))
 
     if status:
@@ -83,7 +117,10 @@ async def list_materials(
     total = await db.scalar(count_query)
     query = query.order_by(desc(Material.created_at)).offset(skip).limit(limit)
     result = await db.execute(query)
-    materials = list(result.scalars().all())
+    materials: list[Material] = []
+    for material, approved_question_count in result.all():
+        setattr(material, "approved_question_count", int(approved_question_count or 0))
+        materials.append(material)
 
     return materials, total
 
@@ -107,6 +144,27 @@ async def delete_material(
     if not material:
         return False
 
+    ku_result = await db.execute(
+        select(KnowledgeUnit.id).where(KnowledgeUnit.material_id == material_id)
+    )
+    knowledge_unit_ids = list(ku_result.scalars().all())
+
+    await db.execute(
+        update(Question)
+        .where(Question.source_material_id == material_id)
+        .values(source_material_id=None)
+    )
+
+    if knowledge_unit_ids:
+        await db.execute(
+            update(Question)
+            .where(Question.source_knowledge_unit_id.in_(knowledge_unit_ids))
+            .values(source_knowledge_unit_id=None)
+        )
+        await db.execute(
+            delete(KnowledgeUnit).where(KnowledgeUnit.material_id == material_id)
+        )
+
     try:
         delete_file(material.file_path)
     except Exception:
@@ -117,6 +175,27 @@ async def delete_material(
     return True
 
 
-def get_material_download_url(file_path: str) -> str:
+def build_material_download_filename(material: Material) -> str:
+    """Build a user-facing download filename from title and stored suffix."""
+    title = (material.title or "素材").strip() or "素材"
+    safe_title = re.sub(r'[\\/:*?"<>|]+', '_', title)
+
+    object_name = material.file_path.rsplit("/", 1)[-1] if "/" in material.file_path else material.file_path
+    suffix = ""
+    if "." in object_name:
+        ext = object_name.rsplit(".", 1)[-1].strip().lower()
+        if ext:
+            suffix = f".{ext}"
+
+    if not suffix:
+        format_value = material.format.value if hasattr(material.format, "value") else str(material.format)
+        suffix = DEFAULT_DOWNLOAD_EXTENSIONS.get(format_value, "")
+
+    if suffix and safe_title.lower().endswith(suffix.lower()):
+        return safe_title
+    return f"{safe_title}{suffix}"
+
+
+def get_material_download_url(file_path: str, download_filename: Optional[str] = None) -> str:
     """Get a presigned download URL for a material file."""
-    return get_presigned_url(file_path)
+    return get_presigned_url(file_path, download_filename=download_filename)

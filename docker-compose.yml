@@ -31,8 +31,6 @@ services:
       - MINIO_HOST=minio
       - RABBITMQ_HOST=rabbitmq
       - REDIS_HOST=redis
-      # LM Studio 运行在宿主机上，通过 host.docker.internal 访问
-      - LLM_BASE_URL=http://host.docker.internal:1234/v1
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

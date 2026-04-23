@@ -9,6 +9,7 @@ Supports multiple thinking output formats:
 - Plain text thinking: Thinking Process:...\n\n[actual content]
 """
 import re
+from urllib.parse import urlparse
 
 
 def strip_thinking_tags(text: str) -> str:
@@ -66,6 +67,44 @@ def strip_thinking_tags(text: str) -> str:
         return text
 
     return text
+
+
+def build_disable_thinking_extra_body(
+    model_name: str | None,
+    base_url: str | None,
+    model_slug: str | None = None,
+) -> dict | None:
+    """Return provider-safe extra_body for disabling reasoning chains.
+
+    Only a subset of OpenAI-compatible backends (notably local vLLM-hosted Qwen)
+    understands ``chat_template_kwargs``. Gemini and other hosted compatible
+    APIs reject this field with HTTP 400, so gate it conservatively.
+    """
+    slug = (model_slug or "").lower()
+    name = (model_name or "").lower()
+    parsed = urlparse(base_url or "")
+    hostname = (parsed.hostname or "").lower()
+
+    if slug == "local_qwen":
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+
+    # Hosted compatible APIs do not accept vLLM-only chat_template_kwargs.
+    unsupported_hosts = (
+        "googleapis.com",
+        "generativelanguage.googleapis.com",
+        "dashscope.aliyuncs.com",
+        "volces.com",
+    )
+    if any(token in hostname for token in unsupported_hosts):
+        return None
+
+    if "qwen" in name and (
+        hostname == "localhost"
+        or hostname.startswith(("127.", "10.", "172.", "192.168.", "100.64."))
+    ):
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+
+    return None
 
 
 def extract_json_text(raw: str) -> str:

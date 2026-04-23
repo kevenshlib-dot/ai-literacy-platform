@@ -1,5 +1,7 @@
 from app.models.user import User, Role
+from app.models.auth_session import AuthSession
 from app.models.material import Material, KnowledgeUnit
+from app.models.material_generation import MaterialGenerationRun, MaterialGenerationRunUnit
 from app.models.question import Question, ReviewRecord
 from app.models.paper import Paper, PaperSection, PaperQuestion
 from app.models.exam import Exam, ExamQuestion
@@ -14,12 +16,16 @@ from app.models.course import Course, CourseChapter
 from app.models.learning_path import LearningPath, LearningStep
 from app.models.sandbox import SandboxSession, SandboxAttempt
 from app.models.system_config import SystemConfig
+from app.models.question_prompt_profile import QuestionPromptProfile
 
 __all__ = [
     "User",
     "Role",
+    "AuthSession",
     "Material",
     "KnowledgeUnit",
+    "MaterialGenerationRun",
+    "MaterialGenerationRunUnit",
     "Question",
     "ReviewRecord",
     "Exam",
@@ -46,4 +52,5 @@ __all__ = [
     "Paper",
     "PaperSection",
     "PaperQuestion",
+    "QuestionPromptProfile",
 ]

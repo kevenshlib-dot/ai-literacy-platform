@@ -55,7 +55,7 @@
 
     <a-row :gutter="[24, 24]" style="margin-top: 24px;">
       <a-col :xs="24" :lg="12">
-        <a-card title="AI素养维度覆盖" class="card-container">
+        <a-card title="AI素养维度题目占比" class="card-container">
           <div class="dimension-list">
             <div v-for="dim in dimensions" :key="dim.name" class="dimension-item">
               <span class="dim-name">{{ dim.name }}</span>
@@ -77,7 +77,7 @@
                         {{ item.status === 'published' ? '进行中' : item.status === 'draft' ? '草稿' : '已关闭' }}
                       </a-tag>
                       <span>总分 {{ item.total_score }}</span>
-                      <span v-if="item.usage_count">{{ item.usage_count }} 人参加</span>
+                      <span>{{ item.usage_count || 0 }} 人参加</span>
                     </a-space>
                   </template>
                 </a-list-item-meta>
@@ -150,6 +150,7 @@ const dimensions = ref([
   { name: 'AI伦理安全', coverage: 0 },
   { name: 'AI批判思维', coverage: 0 },
   { name: 'AI创新实践', coverage: 0 },
+  { name: '未分类', coverage: 0 },
 ])
 
 function typeLabel(t: string) {
@@ -160,8 +161,9 @@ async function loadDashboard() {
   const results = await Promise.allSettled([
     request.get('/materials', { params: { skip: 0, limit: 5 } }),
     request.get('/questions', { params: { skip: 0, limit: 5, status: 'pending_review' } }),
-    request.get('/exams', { params: { skip: 0, limit: 5 } }),
-    request.get('/users', { params: { skip: 0, limit: 1 } }),
+    request.get('/questions/stats', { params: { status: 'approved' } }),
+    request.get('/exams', { params: { skip: 0, limit: 5, is_random_test: false } }),
+    request.get('/users/stats'),
   ])
 
   if (results[0].status === 'fulfilled') {
@@ -172,31 +174,28 @@ async function loadDashboard() {
   if (results[1].status === 'fulfilled') {
     const d = results[1].value as any
     pendingQuestions.value = d.items?.slice(0, 5) || []
-    stats.value.questions = d.total || 0
   }
   if (results[2].status === 'fulfilled') {
     const d = results[2].value as any
-    stats.value.exams = d.total || 0
-    recentExams.value = d.items?.slice(0, 5) || []
+    stats.value.questions = d.total || 0
+    const byDimension = d.by_dimension || {}
+    const totalQuestions = d.total || 0
+    dimensions.value.forEach(dimensionItem => {
+      const count = byDimension[dimensionItem.name] || 0
+      dimensionItem.coverage = totalQuestions > 0
+        ? Math.round((count / totalQuestions) * 100)
+        : 0
+    })
   }
   if (results[3].status === 'fulfilled') {
     const d = results[3].value as any
+    stats.value.exams = d.total || 0
+    recentExams.value = d.items?.slice(0, 5) || []
+  }
+  if (results[4].status === 'fulfilled') {
+    const d = results[4].value as any
     stats.value.users = d.total || 0
   }
-
-  // Dimension coverage from question distribution
-  try {
-    const allQ: any = await request.get('/questions', { params: { skip: 0, limit: 100 } })
-    const items = allQ.items || []
-    const dimCounts: Record<string, number> = {}
-    items.forEach((q: any) => {
-      if (q.dimension) dimCounts[q.dimension] = (dimCounts[q.dimension] || 0) + 1
-    })
-    const total = items.length || 1
-    dimensions.value.forEach(d => {
-      d.coverage = Math.round(((dimCounts[d.name] || 0) / total) * 100)
-    })
-  } catch { /* ignore */ }
 }
 
 async function checkLLMStatus() {

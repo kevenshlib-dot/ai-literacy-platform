@@ -8,7 +8,7 @@ from app.main import app
 from app.core.database import Base, get_db
 from app.core.config import settings
 from app.services.user_service import init_roles
-from app.agents.review_agent import ai_review_question, _rule_based_review
+from app.agents.review_agent import REVIEW_SYSTEM_PROMPT, ai_review_question, _rule_based_review
 
 
 # ---- Unit Tests for Review Agent ----
@@ -27,6 +27,7 @@ def test_rule_based_review_good_question():
     assert result["overall_score"] >= 3.5
     assert result["recommendation"] == "approve"
     assert "scores" in result
+    assert "risk_tags" in result
 
 
 def test_rule_based_review_poor_question():
@@ -57,6 +58,52 @@ def test_rule_based_review_true_false():
     assert result["recommendation"] == "approve"
 
 
+def test_rule_based_review_fill_blank_requires_blank_marker():
+    result = _rule_based_review(
+        stem="人工智能的英文缩写是____。",
+        options=None,
+        correct_answer="AI",
+        explanation="AI 是 Artificial Intelligence 的缩写。",
+        question_type="fill_blank",
+        difficulty=2,
+        dimension="AI基础认知",
+    )
+    assert result["scores"]["stem_clarity"] >= 4
+    assert result["scores"]["option_quality"] >= 4
+    assert result["scores"]["answer_correctness"] >= 4
+    assert result["recommendation"] == "approve"
+
+
+def test_rule_based_review_true_false_rejects_non_standard_options():
+    result = _rule_based_review(
+        stem="人工智能是计算机科学的一个分支。",
+        options={"A": "正确", "B": "错误", "C": "无法判断"},
+        correct_answer="C",
+        explanation="题型配置错误。",
+        question_type="true_false",
+        difficulty=2,
+        dimension="AI基础认知",
+    )
+    assert result["scores"]["option_quality"] <= 2
+    assert result["scores"]["answer_correctness"] <= 2
+    assert result["recommendation"] in ("revise", "reject")
+
+
+def test_rule_based_review_short_answer_requires_textual_answer():
+    result = _rule_based_review(
+        stem="请结合推荐系统场景，说明为什么需要最小化采集用户数据。",
+        options=None,
+        correct_answer="因为过度采集会扩大隐私泄露风险，也会增加越权使用的概率。",
+        explanation="可从合规、风险和用户信任三个角度评分。",
+        question_type="short_answer",
+        difficulty=4,
+        dimension="AI伦理安全",
+    )
+    assert result["scores"]["option_quality"] >= 4
+    assert result["scores"]["answer_correctness"] >= 4
+    assert result["recommendation"] in ("approve", "revise")
+
+
 def test_ai_review_uses_fallback():
     """When LLM not configured, uses rule-based review."""
     result = ai_review_question(
@@ -71,6 +118,41 @@ def test_ai_review_uses_fallback():
     assert "scores" in result
     assert "recommendation" in result
     assert "overall_score" in result
+
+
+def test_rule_based_review_returns_semantic_risk_tags():
+    result = _rule_based_review(
+        stem="在机器人伦理学研究中，被公认的首要议题是什么？",
+        options={"A": "机器人权利", "B": "界面颜色", "C": "办公效率", "D": "随机命名"},
+        correct_answer="A",
+        explanation="该题存在事实风险和选项质量问题。",
+        question_type="single_choice",
+        difficulty=4,
+        dimension="AI伦理安全",
+    )
+
+    assert "risk_tags" in result
+    assert "factual_risk" in result["risk_tags"]
+    assert "distractor_risk" in result["risk_tags"]
+
+
+def test_rule_based_review_marks_short_answer_blank_marker_as_type_mismatch():
+    result = _rule_based_review(
+        stem="请说明将科技伦理冠名为______更合理的原因。",
+        options=None,
+        correct_answer="部门伦理学",
+        explanation="该表述更强调具体学科归属。",
+        question_type="short_answer",
+        difficulty=3,
+        dimension="AI伦理安全",
+    )
+
+    assert "type_mismatch" in result["risk_tags"]
+
+
+def test_review_prompt_documents_fill_blank_and_short_answer_rules():
+    assert "开放式填空题" in REVIEW_SYSTEM_PROMPT
+    assert "开放式简答题" in REVIEW_SYSTEM_PROMPT
 
 
 # ---- Integration Tests ----
@@ -99,7 +181,7 @@ async def setup_db():
     async with engine.begin() as conn:
         await conn.execute(text("TRUNCATE TABLE review_records CASCADE"))
         await conn.execute(text("TRUNCATE TABLE questions CASCADE"))
-        await conn.execute(text("TRUNCATE TABLE users CASCADE"))
+        # await conn.execute(text("TRUNCATE TABLE users CASCADE"))
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as session:
         await init_roles(session)

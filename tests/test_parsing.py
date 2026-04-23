@@ -1,25 +1,124 @@
 import io
+import uuid
+import zipfile
 import pytest
 from httpx import AsyncClient, ASGITransport
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from app.main import app
 from app.core.database import Base, get_db
 from app.core.config import settings
-from app.services.user_service import init_roles
+from app.core.security import create_access_token
+from app.services.user_service import init_roles, create_user
 from app.services.parsing_service import (
     parse_material, chunk_text,
-    PDFParser, WordParser, MarkdownParser, HTMLParser, CSVParser, JSONParser,
+    PDFParser, EPUBParser, WordParser, MarkdownParser, HTMLParser, CSVParser, JSONParser,
 )
+from app.services.parse_worker import parse_and_store
+from app.models.material import KnowledgeUnit, Material, MaterialFormat, MaterialStatus
+from app.models.question import Question
 
 
 # ---- Unit Tests for Parsers ----
+
+
+def build_test_epub_bytes() -> bytes:
+    container_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>
+"""
+    content_opf = """<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>EPUB测试</dc:title>
+  </metadata>
+  <manifest>
+    <item id="chapter2" href="chapter2.xhtml" media-type="application/xhtml+xml"/>
+    <item id="chapter1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="chapter1"/>
+    <itemref idref="chapter2"/>
+  </spine>
+</package>
+"""
+    chapter1 = """<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <body><h1>第一章</h1><p>这是EPUB第一章内容。</p></body>
+</html>
+"""
+    chapter2 = """<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <body><h1>第二章</h1><p>这是EPUB第二章内容。</p></body>
+</html>
+"""
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr("META-INF/container.xml", container_xml)
+        archive.writestr("OEBPS/content.opf", content_opf)
+        archive.writestr("OEBPS/chapter1.xhtml", chapter1)
+        archive.writestr("OEBPS/chapter2.xhtml", chapter2)
+    return buf.getvalue()
 
 def test_markdown_parser():
     text = parse_material(b"# Hello\n\nThis is **markdown**.", "test.md", "markdown")
     assert "Hello" in text
     assert "markdown" in text
+
+
+def test_markdown_parser_strips_nul_bytes():
+    text = parse_material(b"# A\x00I\n\nCon\x00tent", "test.md", "markdown")
+    assert "\x00" not in text
+    assert "AI" in text
+    assert "Content" in text
+
+
+def test_markdown_parser_handles_utf16():
+    text = parse_material("AI基础知识".encode("utf-16"), "test.md", "markdown")
+    assert "\x00" not in text
+    assert "AI基础知识" in text
+
+
+def test_epub_parser():
+    text = parse_material(build_test_epub_bytes(), "book.epub", "epub")
+    assert "第一章" in text
+    assert "第二章" in text
+    assert text.index("第一章") < text.index("第二章")
+
+
+def test_epub_parser_with_ebooklib():
+    pytest.importorskip("ebooklib")
+
+    parser = EPUBParser()
+    text = parser._parse_with_ebooklib(build_test_epub_bytes(), "book.epub")
+    assert "第一章" in text
+    assert "第二章" in text
+    assert text.index("第一章") < text.index("第二章")
+
+
+def test_invalid_epub_parser():
+    with pytest.raises(Exception):
+        parse_material(b"not-an-epub", "broken.epub", "epub")
+
+
+def test_epub_parser_falls_back_to_native(monkeypatch):
+    parser = EPUBParser()
+
+    monkeypatch.setattr(
+        parser,
+        "_parse_with_ebooklib",
+        lambda file_data, filename: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    text = parser.parse(build_test_epub_bytes(), "book.epub")
+    assert "第一章" in text
+    assert "第二章" in text
 
 
 def test_html_parser():
@@ -84,10 +183,25 @@ def test_chunk_text_small():
     assert chunks[0] == "Short text"
 
 
+def test_chunk_text_strips_nul_bytes():
+    chunks = chunk_text("AB\x00CD", chunk_size=10, overlap=1)
+    assert chunks == ["ABCD"]
+
+
+def test_chunk_text_prefers_paragraph_boundaries():
+    text = "第一段第一句。第一段第二句。\n\n第二段第一句。第二段第二句。"
+    chunks = chunk_text(text, chunk_size=20, overlap=5)
+    assert len(chunks) >= 2
+    assert "第一段第一句。" in chunks[0]
+    assert "第一段第二句。" in chunks[0]
+    assert any("第二段第一句" in chunk for chunk in chunks[1:])
+
+
 # ---- PDF Parser Test (with real PyPDF2) ----
 
 def test_pdf_parser():
     """Create a minimal valid PDF and test parsing."""
+    pytest.importorskip("pymupdf")
     from PyPDF2 import PdfWriter
     writer = PdfWriter()
     writer.add_blank_page(width=72, height=72)
@@ -98,6 +212,26 @@ def test_pdf_parser():
     parser = PDFParser()
     text = parser.parse(pdf_bytes, "blank.pdf")
     # Blank page may produce empty text
+    assert isinstance(text, str)
+
+
+def test_pdf_parser_falls_back_to_pypdf2(monkeypatch):
+    from PyPDF2 import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    buf = io.BytesIO()
+    writer.write(buf)
+    pdf_bytes = buf.getvalue()
+
+    parser = PDFParser()
+    monkeypatch.setattr(
+        parser,
+        "_parse_with_pymupdf",
+        lambda file_data: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    text = parser.parse(pdf_bytes, "blank.pdf")
     assert isinstance(text, str)
 
 
@@ -143,7 +277,7 @@ async def setup_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE TABLE users CASCADE"))
+        # await conn.execute(text("TRUNCATE TABLE users CASCADE"))
         await conn.execute(text("TRUNCATE TABLE materials CASCADE"))
         await conn.execute(text("TRUNCATE TABLE knowledge_units CASCADE"))
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -168,6 +302,28 @@ async def register_user(client, role="organizer"):
         "role": role,
     })
     return resp.json()["access_token"]
+
+
+async def create_direct_token(role="organizer"):
+    unique = uuid.uuid4().hex[:8]
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = await create_user(
+            session,
+            username=f"direct_{unique}",
+            email=f"direct_{unique}@test.com",
+            password="password123",
+            role_name=role,
+            is_active=True,
+        )
+        await session.commit()
+        token = create_access_token(
+            subject=str(user.id),
+            extra_claims={"role": user.role.name.value},
+        )
+    await engine.dispose()
+    return token
 
 
 @pytest.mark.asyncio
@@ -247,6 +403,95 @@ async def test_manual_parse_word():
 
 
 @pytest.mark.asyncio
+async def test_manual_parse_epub():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        upload = await client.post(
+            "/api/v1/materials",
+            files={"file": ("book.epub", build_test_epub_bytes(), "application/epub+zip")},
+            data={"title": "EPUB教材"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert upload.status_code == 201
+        mid = upload.json()["id"]
+
+        parse_resp = await client.post(
+            f"/api/v1/materials/{mid}/parse",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert parse_resp.status_code == 200
+        assert parse_resp.json()["parsed"] is True
+
+        ku_resp = await client.get(
+            f"/api/v1/materials/{mid}/knowledge-units",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert ku_resp.status_code == 200
+        data = ku_resp.json()
+        assert data["total_units"] > 0
+        assert data["status"] == "parsed"
+
+
+@pytest.mark.asyncio
+async def test_parse_and_store_marks_failed_after_flush_error(monkeypatch):
+    material = Material(
+        id=uuid.uuid4(),
+        title="故障素材",
+        format=MaterialFormat.MARKDOWN,
+        file_path="bucket/material.md",
+        status=MaterialStatus.UPLOADED,
+        uploaded_by=uuid.uuid4(),
+    )
+
+    class FakeResult:
+        def scalar_one_or_none(self):
+            return material
+
+    class FakeSession:
+        def __init__(self):
+            self.flush_calls = 0
+            self.rollback_calls = 0
+            self.added = []
+
+        async def execute(self, _query):
+            return FakeResult()
+
+        async def flush(self):
+            self.flush_calls += 1
+            if self.flush_calls == 2:
+                raise RuntimeError("invalid byte sequence for encoding UTF8: 0x00")
+
+        async def rollback(self):
+            self.rollback_calls += 1
+
+        def add(self, obj):
+            self.added.append(obj)
+
+    async def fake_fetch_file_from_minio(_file_path: str) -> bytes:
+        return b"broken"
+
+    monkeypatch.setattr(
+        "app.services.parse_worker.fetch_file_from_minio",
+        fake_fetch_file_from_minio,
+    )
+    monkeypatch.setattr(
+        "app.services.parse_worker.parse_material",
+        lambda *_args, **_kwargs: "AI基础知识",
+    )
+    monkeypatch.setattr(
+        "app.services.parse_worker.chunk_text",
+        lambda *_args, **_kwargs: ["chunk-1"],
+    )
+
+    session = FakeSession()
+    result = await parse_and_store(session, material.id)
+
+    assert result is False
+    assert session.rollback_calls == 1
+    assert material.status == MaterialStatus.FAILED
+
+
+@pytest.mark.asyncio
 async def test_parse_material_not_found():
     async with get_client() as client:
         token = await register_user(client, "organizer")
@@ -281,3 +526,221 @@ async def test_auto_parse_on_upload():
     assert resp.status_code == 200
     # Auto-parsing should have created knowledge units
     assert resp.json()["total_units"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_safe_reparse_replaces_units_and_detaches_linked_questions(monkeypatch):
+    async def fake_trigger_parse(_material_id):
+        return None
+
+    async def fake_fetch_file_from_minio(_file_path: str) -> bytes:
+        return b"ignored"
+
+    monkeypatch.setattr("app.api.v1.endpoints.materials.trigger_parse", fake_trigger_parse)
+    monkeypatch.setattr("app.services.parse_worker.fetch_file_from_minio", fake_fetch_file_from_minio)
+    monkeypatch.setattr("app.services.parse_worker.parse_material", lambda *_args, **_kwargs: "AI基础知识")
+    monkeypatch.setattr(
+        "app.services.parse_worker.chunk_text",
+        lambda *_args, **_kwargs: ["旧片段 A", "旧片段 B"],
+    )
+
+    async with get_client() as client:
+        token = await create_direct_token("organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+        upload = await client.post(
+            "/api/v1/materials",
+            files={"file": ("reparse.md", b"content", "text/markdown")},
+            data={"title": "安全重解析素材"},
+            headers=headers,
+        )
+        mid = upload.json()["id"]
+
+        parse_resp = await client.post(f"/api/v1/materials/{mid}/parse", headers=headers)
+        assert parse_resp.status_code == 200
+
+        ku_resp = await client.get(f"/api/v1/materials/{mid}/knowledge-units", headers=headers)
+        assert ku_resp.status_code == 200
+        old_units = ku_resp.json()["units"]
+        assert len(old_units) == 2
+        old_unit_id = old_units[0]["id"]
+
+        question_resp = await client.post(
+            "/api/v1/questions",
+            json={
+                "question_type": "single_choice",
+                "stem": f"重解析解绑题-{uuid.uuid4().hex[:8]}",
+                "correct_answer": "A",
+                "options": {"A": "正确", "B": "错误"},
+                "source_material_id": mid,
+                "source_knowledge_unit_id": old_unit_id,
+            },
+            headers=headers,
+        )
+        assert question_resp.status_code == 201
+        question_id = question_resp.json()["id"]
+
+        monkeypatch.setattr(
+            "app.services.parse_worker.chunk_text",
+            lambda *_args, **_kwargs: ["新片段 A"],
+        )
+
+        reparse_resp = await client.post(f"/api/v1/materials/{mid}/reparse", headers=headers)
+        assert reparse_resp.status_code == 200
+        result = reparse_resp.json()
+        assert result["old_unit_count"] == 2
+        assert result["new_unit_count"] == 1
+        assert result["detached_question_count"] == 1
+        assert result["deleted_vector_count"] == 0
+        assert result["revectorized"] is False
+        assert result["status"] == "parsed"
+
+        new_ku_resp = await client.get(f"/api/v1/materials/{mid}/knowledge-units", headers=headers)
+        assert new_ku_resp.status_code == 200
+        new_units = new_ku_resp.json()["units"]
+        assert len(new_units) == 1
+        assert new_units[0]["content"] == "新片段 A"
+
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        question = (
+            await session.execute(select(Question).where(Question.id == uuid.UUID(question_id)))
+        ).scalar_one()
+        assert question.source_material_id == uuid.UUID(mid)
+        assert question.source_knowledge_unit_id is None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_safe_reparse_rebuilds_vectors_for_vectorized_material(monkeypatch):
+    async def fake_trigger_parse(_material_id):
+        return None
+
+    async def fake_fetch_file_from_minio(_file_path: str) -> bytes:
+        return b"ignored"
+
+    deleted_material_ids = []
+    inserted_batches = []
+
+    def fake_delete_material_vectors(material_id: str) -> int:
+        deleted_material_ids.append(material_id)
+        return 2
+
+    def fake_insert_vectors(knowledge_unit_ids, material_id, chunk_indices, contents) -> int:
+        inserted_batches.append({
+            "knowledge_unit_ids": knowledge_unit_ids,
+            "material_id": material_id,
+            "chunk_indices": chunk_indices,
+            "contents": contents,
+        })
+        return len(contents)
+
+    monkeypatch.setattr("app.api.v1.endpoints.materials.trigger_parse", fake_trigger_parse)
+    monkeypatch.setattr("app.services.parse_worker.fetch_file_from_minio", fake_fetch_file_from_minio)
+    monkeypatch.setattr("app.services.parse_worker.parse_material", lambda *_args, **_kwargs: "AI基础知识")
+    monkeypatch.setattr(
+        "app.services.parse_worker.chunk_text",
+        lambda *_args, **_kwargs: ["旧片段 A", "旧片段 B"],
+    )
+    monkeypatch.setattr("app.services.vector_service.delete_material_vectors", fake_delete_material_vectors)
+    monkeypatch.setattr("app.services.vector_service.insert_vectors", fake_insert_vectors)
+
+    async with get_client() as client:
+        token = await create_direct_token("organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+        upload = await client.post(
+            "/api/v1/materials",
+            files={"file": ("vectorized.md", b"content", "text/markdown")},
+            data={"title": "向量化重解析素材"},
+            headers=headers,
+        )
+        mid = upload.json()["id"]
+
+        parse_resp = await client.post(f"/api/v1/materials/{mid}/parse", headers=headers)
+        assert parse_resp.status_code == 200
+
+        engine = create_async_engine(settings.DATABASE_URL, echo=False)
+        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with session_factory() as session:
+            material = (
+                await session.execute(select(Material).where(Material.id == uuid.UUID(mid)))
+            ).scalar_one()
+            units = list((
+                await session.execute(
+                    select(KnowledgeUnit)
+                    .where(KnowledgeUnit.material_id == uuid.UUID(mid))
+                    .order_by(KnowledgeUnit.chunk_index)
+                )
+            ).scalars().all())
+            material.status = MaterialStatus.VECTORIZED
+            for unit in units:
+                unit.vector_id = str(unit.id)
+            await session.commit()
+        await engine.dispose()
+
+        monkeypatch.setattr(
+            "app.services.parse_worker.chunk_text",
+            lambda *_args, **_kwargs: ["新片段 A", "新片段 B", "新片段 C"],
+        )
+
+        reparse_resp = await client.post(f"/api/v1/materials/{mid}/reparse", headers=headers)
+
+    assert reparse_resp.status_code == 200
+    result = reparse_resp.json()
+    assert result["old_unit_count"] == 2
+    assert result["new_unit_count"] == 3
+    assert result["deleted_vector_count"] == 2
+    assert result["revectorized"] is True
+    assert result["vectorized_count"] == 3
+    assert result["status"] == "vectorized"
+    assert deleted_material_ids == [mid]
+    assert inserted_batches and inserted_batches[0]["material_id"] == mid
+    assert inserted_batches[0]["contents"] == ["新片段 A", "新片段 B", "新片段 C"]
+
+
+@pytest.mark.asyncio
+async def test_safe_reparse_rejects_placeholder_material_without_deleting_old_units(monkeypatch):
+    async def fake_trigger_parse(_material_id):
+        return None
+
+    async def fake_fetch_file_from_minio(_file_path: str) -> bytes:
+        return b"ignored"
+
+    monkeypatch.setattr("app.api.v1.endpoints.materials.trigger_parse", fake_trigger_parse)
+    monkeypatch.setattr("app.services.parse_worker.fetch_file_from_minio", fake_fetch_file_from_minio)
+    monkeypatch.setattr("app.services.parse_worker.parse_material", lambda *_args, **_kwargs: "AI基础知识")
+    monkeypatch.setattr(
+        "app.services.parse_worker.chunk_text",
+        lambda *_args, **_kwargs: ["旧片段 A", "旧片段 B"],
+    )
+
+    async with get_client() as client:
+        token = await create_direct_token("organizer")
+        headers = {"Authorization": f"Bearer {token}"}
+        upload = await client.post(
+            "/api/v1/materials",
+            files={"file": ("placeholder.png", b"content", "image/png")},
+            data={"title": "占位素材"},
+            headers=headers,
+        )
+        mid = upload.json()["id"]
+
+        parse_resp = await client.post(f"/api/v1/materials/{mid}/parse", headers=headers)
+        assert parse_resp.status_code == 200
+
+        monkeypatch.setattr(
+            "app.services.parse_worker.parse_material",
+            lambda *_args, **_kwargs: "[图片素材: placeholder.png - 待OCR处理]",
+        )
+
+        reparse_resp = await client.post(f"/api/v1/materials/{mid}/reparse", headers=headers)
+        assert reparse_resp.status_code == 400
+        assert "占位解析结果" in reparse_resp.json()["detail"]
+
+        ku_resp = await client.get(f"/api/v1/materials/{mid}/knowledge-units", headers=headers)
+        assert ku_resp.status_code == 200
+        assert ku_resp.json()["total_units"] == 2
+
+        material_resp = await client.get(f"/api/v1/materials/{mid}", headers=headers)
+        assert material_resp.status_code == 200
+        assert material_resp.json()["status"] == "parsed"

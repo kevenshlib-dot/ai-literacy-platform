@@ -101,6 +101,7 @@
 import { ref, computed, watch, type Component } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useUserStore } from '@/stores/user'
+import request from '@/utils/request'
 import {
   HomeOutlined,
   DashboardOutlined,
@@ -142,7 +143,7 @@ const router = useRouter()
 const route = useRoute()
 const userStore = useUserStore()
 const collapsed = ref(false)
-const selectedKeys = ref<string[]>([route.name as string || 'Home'])
+const selectedKeys = ref<string[]>([(route.name === 'ExamCompose' ? 'Exams' : route.name as string) || 'Home'])
 
 const visibleMenuItems = computed(() => {
   const role = userStore.userInfo?.role || ''
@@ -154,17 +155,28 @@ const currentPageLabel = computed(() => {
   return menuLabelMap[name] || name || ''
 })
 
+function resolveSelectedKey(name: string | undefined) {
+  if (name === 'ExamCompose') return 'Exams'
+  return name || 'Home'
+}
+
 watch(() => route.name, (name) => {
-  selectedKeys.value = [name as string]
+  selectedKeys.value = [resolveSelectedKey(name as string | undefined)]
 })
 
 function onMenuClick({ key }: { key: string }) {
   router.push({ name: key })
 }
 
-function handleLogout() {
-  userStore.logout()
-  router.push({ name: 'Login' })
+async function handleLogout() {
+  try {
+    await request.post('/auth/logout')
+  } catch (_error) {
+    // Fall back to local logout even if the backend session is already invalid.
+  } finally {
+    userStore.logout()
+    router.push({ name: 'Login' })
+  }
 }
 </script>
 

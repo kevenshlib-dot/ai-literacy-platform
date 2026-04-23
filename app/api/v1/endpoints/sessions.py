@@ -1,4 +1,5 @@
 """Exam session API endpoints - for examinees taking exams."""
+import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
@@ -22,7 +23,7 @@ from app.schemas.answer import (
 )
 from app.services import answer_service
 from app.models.exam import Exam, ExamQuestion
-from app.models.answer import AnswerSheet, Answer
+from app.models.answer import AnswerSheet, Answer, AnswerSheetStatus
 from app.models.score import Score, ScoreDetail
 from sqlalchemy import select, outerjoin, delete
 
@@ -49,7 +50,7 @@ async def start_random_test(
         raise HTTPException(status_code=400, detail=str(e))
 
     # Start session, then close the exam so it won't appear in published list
-    sheet = await answer_service.start_exam(db, exam.id, current_user.id)
+    sheet, resumed = await answer_service.start_exam(db, exam.id, current_user.id)
     eqs = await exam_service.get_exam_questions(db, exam.id)
     await exam_service.close_exam(db, exam.id)
 
@@ -61,6 +62,7 @@ async def start_random_test(
         time_limit_minutes=exam.time_limit_minutes,
         total_questions=len(eqs),
         start_time=sheet.start_time,
+        resumed=resumed,
     )
 
 
@@ -72,7 +74,7 @@ async def start_exam(
 ):
     """Start an exam session."""
     try:
-        sheet = await answer_service.start_exam(db, exam_id, current_user.id)
+        sheet, resumed = await answer_service.start_exam(db, exam_id, current_user.id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -89,6 +91,7 @@ async def start_exam(
         time_limit_minutes=exam.time_limit_minutes,
         total_questions=len(eqs),
         start_time=sheet.start_time,
+        resumed=resumed,
     )
 
 
@@ -162,6 +165,7 @@ async def mark_question(
 @router.post("/{sheet_id}/submit", response_model=SubmitExamResponse)
 async def submit_exam(
     sheet_id: UUID,
+    auto_score: bool = Query(True),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
@@ -175,23 +179,31 @@ async def submit_exam(
     # Count total questions
     from app.services.exam_service import get_exam_questions
     eqs = await get_exam_questions(db, sheet.exam_id)
+    answer_sheet_id = sheet.id
+    response_status = sheet.status.value
+    submit_time = sheet.submit_time
+    duration_seconds = sheet.duration_seconds
 
-    # Auto-score the submitted exam
-    import logging
-    logger = logging.getLogger(__name__)
-    try:
-        from app.services import score_service
-        await score_service.score_answer_sheet(db, sheet.id)
-        logger.info(f"Auto-scored answer sheet {sheet.id}")
-    except Exception as e:
-        logger.warning(f"Auto-scoring failed for sheet {sheet.id}: {e}")
-
+    # Persist the submitted sheet first so scoring failures don't undo the submission.
     await db.commit()
+
+    logger = logging.getLogger(__name__)
+    if auto_score:
+        try:
+            from app.services import score_service
+            await score_service.score_answer_sheet(db, answer_sheet_id)
+            await db.commit()
+            response_status = AnswerSheetStatus.SCORED.value
+            logger.info(f"Auto-scored answer sheet {answer_sheet_id}")
+        except Exception as e:
+            await db.rollback()
+            logger.warning(f"Auto-scoring failed for sheet {answer_sheet_id}: {e}")
+
     return SubmitExamResponse(
-        answer_sheet_id=sheet.id,
-        status=sheet.status.value,
-        submit_time=sheet.submit_time,
-        duration_seconds=sheet.duration_seconds,
+        answer_sheet_id=answer_sheet_id,
+        status=response_status,
+        submit_time=submit_time,
+        duration_seconds=duration_seconds,
         total_answered=total_answered,
         total_questions=len(eqs),
     )

@@ -16,7 +16,7 @@ build: ## Build Docker image
 	docker-compose build
 
 test: ## Run tests
-	pytest tests/ -v
+	TESTING=true pytest tests/ -v
 
 lint: ## Run linter
 	ruff check app/ --select E,F,W --ignore E501

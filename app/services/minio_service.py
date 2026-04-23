@@ -5,10 +5,10 @@ When MinIO is unavailable (e.g. Docker not running), falls back to local
 filesystem at ./storage/ for development convenience.
 """
 import io
-import os
 import uuid
 from datetime import timedelta
 from pathlib import Path
+from typing import Optional
 
 from app.core.config import settings
 
@@ -17,6 +17,7 @@ from app.core.config import settings
 FORMAT_EXTENSIONS = {
     "pdf": [".pdf"],
     "word": [".doc", ".docx"],
+    "epub": [".epub"],
     "markdown": [".md", ".markdown"],
     "html": [".html", ".htm"],
     "image": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg"],
@@ -30,6 +31,7 @@ MIME_TO_FORMAT = {
     "application/pdf": "pdf",
     "application/msword": "word",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "word",
+    "application/epub+zip": "epub",
     "text/markdown": "markdown",
     "text/html": "html",
     "text/csv": "csv",
@@ -52,15 +54,16 @@ MIME_TO_FORMAT = {
 }
 
 MAX_FILE_SIZES = {
-    "pdf": 100 * 1024 * 1024,
-    "word": 50 * 1024 * 1024,
-    "markdown": 10 * 1024 * 1024,
-    "html": 10 * 1024 * 1024,
-    "image": 20 * 1024 * 1024,
-    "video": 500 * 1024 * 1024,
-    "audio": 200 * 1024 * 1024,
-    "csv": 50 * 1024 * 1024,
-    "json": 50 * 1024 * 1024,
+    "pdf": 100 * 1024 * 1024,      # 100MB
+    "word": 50 * 1024 * 1024,       # 50MB
+    "epub": 50 * 1024 * 1024,       # 50MB
+    "markdown": 10 * 1024 * 1024,   # 10MB
+    "html": 10 * 1024 * 1024,       # 10MB
+    "image": 20 * 1024 * 1024,      # 20MB
+    "video": 500 * 1024 * 1024,     # 500MB
+    "audio": 200 * 1024 * 1024,     # 200MB
+    "csv": 50 * 1024 * 1024,        # 50MB
+    "json": 50 * 1024 * 1024,       # 50MB
 }
 
 # ── Local storage root (fallback when MinIO is unavailable) ───────────────────
@@ -152,9 +155,12 @@ async def upload_file(
     }
 
 
-# ── Download URL ──────────────────────────────────────────────────────────────
-
-def get_presigned_url(file_path: str, expires: int = 3600) -> str:
+def get_presigned_url(
+    file_path: str,
+    expires: int = 3600,
+    download_filename: Optional[str] = None,
+) -> str:
+    """Generate a presigned URL for downloading a file."""
     parts = file_path.split("/", 1)
     if len(parts) != 2:
         raise ValueError(f"无效的文件路径: {file_path}")
@@ -163,8 +169,16 @@ def get_presigned_url(file_path: str, expires: int = 3600) -> str:
 
     if _minio_available():
         client = get_minio_client()
+        response_headers = None
+        if download_filename:
+            response_headers = {
+                "response-content-disposition": f'attachment; filename="{download_filename}"',
+            }
         return client.presigned_get_object(
-            bucket, object_name, expires=timedelta(seconds=expires)
+            bucket,
+            object_name,
+            expires=timedelta(seconds=expires),
+            response_headers=response_headers,
         )
 
     # Local fallback — serve via API route (handled elsewhere or static files)

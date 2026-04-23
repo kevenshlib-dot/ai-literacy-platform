@@ -9,26 +9,72 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "change-this"
     API_V1_PREFIX: str = "/api/v1"
     APP_PORT: int = 8080
+    APP_TIMEZONE: str = "Asia/Shanghai"
 
     # PostgreSQL
+    TESTING: bool = False
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432
     POSTGRES_USER: str = "ai_literacy"
     POSTGRES_PASSWORD: str = "ai_literacy_pass"
     POSTGRES_DB: str = "ai_literacy_db"
+    TEST_POSTGRES_HOST: str | None = None
+    TEST_POSTGRES_PORT: int | None = None
+    TEST_POSTGRES_USER: str | None = None
+    TEST_POSTGRES_PASSWORD: str | None = None
+    TEST_POSTGRES_DB: str = "ai_literacy_test"
+
+    def _build_postgres_url(
+        self,
+        *,
+        async_driver: bool,
+        host: str,
+        port: int,
+        user: str,
+        password: str,
+        database: str,
+    ) -> str:
+        driver = "postgresql+asyncpg" if async_driver else "postgresql"
+        return f"{driver}://{user}:{password}@{host}:{port}/{database}"
 
     @property
     def DATABASE_URL(self) -> str:
-        return (
-            f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
-            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        if self.TESTING:
+            return self._build_postgres_url(
+                async_driver=True,
+                host=self.TEST_POSTGRES_HOST or self.POSTGRES_HOST,
+                port=self.TEST_POSTGRES_PORT or self.POSTGRES_PORT,
+                user=self.TEST_POSTGRES_USER or self.POSTGRES_USER,
+                password=self.TEST_POSTGRES_PASSWORD or self.POSTGRES_PASSWORD,
+                database=self.TEST_POSTGRES_DB,
+            )
+        return self._build_postgres_url(
+            async_driver=True,
+            host=self.POSTGRES_HOST,
+            port=self.POSTGRES_PORT,
+            user=self.POSTGRES_USER,
+            password=self.POSTGRES_PASSWORD,
+            database=self.POSTGRES_DB,
         )
 
     @property
     def SYNC_DATABASE_URL(self) -> str:
-        return (
-            f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
-            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        if self.TESTING:
+            return self._build_postgres_url(
+                async_driver=False,
+                host=self.TEST_POSTGRES_HOST or self.POSTGRES_HOST,
+                port=self.TEST_POSTGRES_PORT or self.POSTGRES_PORT,
+                user=self.TEST_POSTGRES_USER or self.POSTGRES_USER,
+                password=self.TEST_POSTGRES_PASSWORD or self.POSTGRES_PASSWORD,
+                database=self.TEST_POSTGRES_DB,
+            )
+        return self._build_postgres_url(
+            async_driver=False,
+            host=self.POSTGRES_HOST,
+            port=self.POSTGRES_PORT,
+            user=self.POSTGRES_USER,
+            password=self.POSTGRES_PASSWORD,
+            database=self.POSTGRES_DB,
         )
 
     # Elasticsearch
@@ -79,11 +125,27 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = "your-api-key"
     LLM_BASE_URL: str = "https://api.deepseek.com/v1"
     LLM_MODEL: str = "deepseek-reasoner"
+    GEMINI_API_KEY: str = ""
+    GEMINI_BASE_URL: str = ""
+    DASHSCOPE_API_KEY: str = ""
+    DASHSCOPE_BASE_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    VOLCES_API_KEY: str = ""
+    VOLCES_BASE_URL: str = "https://ark.cn-beijing.volces.com/api/v3"
+    LOCAL_QWEN_API_KEY: str = "token-not-needed"
+    LOCAL_QWEN_BASE_URL: str = "http://100.64.0.6:8100/v1"
 
     # JWT
     JWT_SECRET_KEY: str = "change-this"
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    AUTH_REFRESH_COOKIE_NAME: str = "refresh_token"
+    AUTH_REFRESH_COOKIE_SECURE: bool = False
+    AUTH_REFRESH_COOKIE_SAMESITE: str = "lax"
+    CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
+
+    @property
+    def CORS_ORIGIN_LIST(self) -> list[str]:
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 

@@ -5,11 +5,13 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.api.deps import get_current_active_user, require_role
 from app.models.user import User
+from app.models.question import QuestionLike, QuestionFavorite, QuestionFeedback
 from app.schemas.question import (
     QuestionCreate,
     QuestionUpdate,
@@ -28,8 +30,19 @@ from app.schemas.question import (
     QuestionBankBuildRequest,
     QuestionBankSuggestResponse,
     FreeGenerateRequest,
+    PreviewQuestionItem,
+    PreviewResponse,
+    BatchCreateFromRawRequest,
+    QuestionPromptConfigResponse,
+    QuestionPromptConfigUpdateRequest,
+    QuestionPromptPreviewRequest,
+    QuestionPromptPreviewResponse,
+    QuestionInteractionsResponse,
+    FeedbackRequest,
 )
+from app.core.config import settings
 from app.services import question_service
+from app.services import question_prompt_service
 from app.services.question_io_service import export_questions_to_md, parse_md_to_questions
 
 router = APIRouter(prefix="/questions", tags=["题库管理"])
@@ -50,6 +63,9 @@ def _to_response(q) -> QuestionResponse:
         bloom_level=q.bloom_level.value if q.bloom_level and hasattr(q.bloom_level, 'value') else q.bloom_level,
         source_material_id=q.source_material_id,
         source_knowledge_unit_id=q.source_knowledge_unit_id,
+        source_material_title=getattr(q, "source_material_title", None),
+        source_knowledge_unit_title=getattr(q, "source_knowledge_unit_title", None),
+        source_knowledge_unit_excerpt=getattr(q, "source_knowledge_unit_excerpt", None),
         status=q.status.value if hasattr(q.status, 'value') else q.status,
         usage_count=q.usage_count,
         correct_rate=q.correct_rate,
@@ -62,7 +78,80 @@ def _to_response(q) -> QuestionResponse:
     )
 
 
+async def _to_enriched_response(db: AsyncSession, q) -> QuestionResponse:
+    await question_service.enrich_question_source_titles(db, [q], include_excerpt=True)
+    return _to_response(q)
+
+
+async def _to_enriched_responses(db: AsyncSession, questions) -> list[QuestionResponse]:
+    await question_service.enrich_question_source_titles(db, questions)
+    return [_to_response(q) for q in questions]
+
+
 # ---- Fixed-path routes MUST come before /{question_id} routes ----
+
+
+@router.get("/generation/prompt-config", response_model=QuestionPromptConfigResponse)
+async def get_generation_prompt_config(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    return await question_prompt_service.get_effective_prompt_config(db, current_user.id)
+
+
+@router.put("/generation/prompt-config", response_model=QuestionPromptConfigResponse)
+async def save_generation_prompt_config(
+    body: QuestionPromptConfigUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    try:
+        await question_prompt_service.save_prompt_profile(
+            db=db,
+            user_id=current_user.id,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    await db.commit()
+    return await question_prompt_service.get_effective_prompt_config(db, current_user.id)
+
+
+@router.delete("/generation/prompt-config", response_model=QuestionPromptConfigResponse)
+async def delete_generation_prompt_config(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    await question_prompt_service.delete_prompt_profile(db, current_user.id)
+    await db.commit()
+    return await question_prompt_service.get_effective_prompt_config(db, current_user.id)
+
+
+@router.post("/generation/prompt-preview", response_model=QuestionPromptPreviewResponse)
+async def preview_generation_prompt(
+    body: QuestionPromptPreviewRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    try:
+        return await question_prompt_service.render_generation_prompt_preview(
+            db=db,
+            user_id=current_user.id,
+            type_distribution=body.type_distribution,
+            difficulty=body.difficulty,
+            bloom_level=body.bloom_level,
+            custom_prompt=body.custom_prompt,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+            prompt_seed=body.prompt_seed,
+            material_ids=body.material_ids,
+            max_units=body.max_units,
+            selection_mode=body.selection_mode,
+        )
+    except ValueError as e:
+        status_code = 422 if "占位符" in str(e) or "prompt" in str(e) else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
 
 @router.post("", response_model=QuestionResponse, status_code=status.HTTP_201_CREATED)
 async def create_question(
@@ -88,7 +177,7 @@ async def create_question(
         created_by=current_user.id,
     )
     await db.commit()
-    return _to_response(q)
+    return await _to_enriched_response(db, q)
 
 
 @router.get("", response_model=QuestionListResponse)
@@ -100,6 +189,9 @@ async def list_questions(
     dimension: Optional[str] = None,
     difficulty: Optional[int] = Query(None, ge=1, le=5),
     keyword: Optional[str] = None,
+    source_material_id: Optional[UUID] = None,
+    only_mine: bool = Query(False),
+    exclude_ids: Optional[list[UUID]] = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
@@ -113,21 +205,36 @@ async def list_questions(
         dimension=dimension,
         difficulty=difficulty,
         keyword=keyword,
+        source_material_id=source_material_id,
+        created_by=current_user.id if only_mine else None,
+        exclude_ids=exclude_ids,
     )
-    return QuestionListResponse(
-        total=total,
-        items=[_to_response(q) for q in items],
-    )
+    return QuestionListResponse(total=total, items=await _to_enriched_responses(db, items))
 
 
 @router.get("/stats")
 async def question_stats(
     dimension: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
+    question_type: Optional[str] = None,
+    difficulty: Optional[int] = Query(None, ge=1, le=5),
+    keyword: Optional[str] = None,
+    source_material_id: Optional[UUID] = None,
+    only_mine: bool = Query(False),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
     """Get question bank statistics."""
-    stats = await question_service.get_question_stats(db, dimension)
+    stats = await question_service.get_question_stats(
+        db=db,
+        dimension=dimension,
+        status=status_filter,
+        question_type=question_type,
+        difficulty=difficulty,
+        keyword=keyword,
+        source_material_id=source_material_id,
+        created_by=current_user.id if only_mine else None,
+    )
     return stats
 
 
@@ -202,10 +309,7 @@ async def get_pending_reviews(
 ):
     """Get questions pending review."""
     items, total = await question_service.get_pending_reviews(db, skip, limit)
-    return QuestionListResponse(
-        total=total,
-        items=[_to_response(q) for q in items],
-    )
+    return QuestionListResponse(total=total, items=await _to_enriched_responses(db, items))
 
 
 @router.post("/generate", response_model=GenerateResponse)
@@ -216,7 +320,13 @@ async def generate_questions(
 ):
     """Generate questions from a knowledge unit using AI."""
     try:
-        questions = await question_service.generate_from_knowledge_unit(
+        prompt_config = await question_prompt_service.resolve_generation_prompts(
+            db=db,
+            user_id=current_user.id,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+        )
+        result = await question_service.generate_from_knowledge_unit(
             db=db,
             knowledge_unit_id=body.knowledge_unit_id,
             question_types=body.question_types,
@@ -224,13 +334,21 @@ async def generate_questions(
             difficulty=body.difficulty,
             bloom_level=body.bloom_level,
             created_by=current_user.id,
+            prompt_seed=body.prompt_seed,
+            system_prompt=prompt_config["system_prompt"],
+            user_prompt_template=prompt_config["user_prompt_template"],
         )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        status_code = 422 if "占位符" in str(e) or "prompt" in str(e) else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
     await db.commit()
+    questions = result.get("questions", result) if isinstance(result, dict) else result
+    stats = result.get("usage") if isinstance(result, dict) else None
     return GenerateResponse(
         generated=len(questions),
-        questions=[_to_response(q) for q in questions],
+        questions=await _to_enriched_responses(db, questions),
+        stats=stats,
+        model_name=settings.LLM_MODEL,
     )
 
 
@@ -243,6 +361,12 @@ async def batch_generate_from_material(
 ):
     """Batch generate questions from all knowledge units of a material."""
     try:
+        prompt_config = await question_prompt_service.resolve_generation_prompts(
+            db=db,
+            user_id=current_user.id,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+        )
         questions = await question_service.batch_generate_from_material(
             db=db,
             material_id=material_id,
@@ -251,14 +375,19 @@ async def batch_generate_from_material(
             difficulty=body.difficulty,
             bloom_level=body.bloom_level,
             max_units=body.max_units,
+            selection_mode=body.selection_mode,
             created_by=current_user.id,
+            prompt_seed=body.prompt_seed,
+            system_prompt=prompt_config["system_prompt"],
+            user_prompt_template=prompt_config["user_prompt_template"],
         )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        status_code = 422 if "占位符" in str(e) or "prompt" in str(e) else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
     await db.commit()
     return GenerateResponse(
         generated=len(questions),
-        questions=[_to_response(q) for q in questions],
+        questions=await _to_enriched_responses(db, questions),
     )
 
 
@@ -276,7 +405,7 @@ async def batch_submit_for_review(
     await db.commit()
     return QuestionListResponse(
         total=len(questions),
-        items=[_to_response(q) for q in questions],
+        items=await _to_enriched_responses(db, questions),
     )
 
 
@@ -298,7 +427,7 @@ async def batch_review(
     await db.commit()
     return QuestionListResponse(
         total=len(questions),
-        items=[_to_response(q) for q in questions],
+        items=await _to_enriched_responses(db, questions),
     )
 
 
@@ -323,34 +452,56 @@ async def build_question_bank(
 ):
     """Build question bank from a material with specific type distribution."""
     try:
-        questions = await question_service.build_question_bank_from_material(
+        prompt_config = await question_prompt_service.resolve_generation_prompts(
+            db=db,
+            user_id=current_user.id,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+        )
+        result = await question_service.build_question_bank_from_material(
             db=db,
             material_id=material_id,
             type_distribution=body.type_distribution,
             difficulty=body.difficulty,
             bloom_level=body.bloom_level,
             max_units=body.max_units,
+            selection_mode=body.selection_mode,
             created_by=current_user.id,
             custom_prompt=body.custom_prompt,
+            prompt_seed=body.prompt_seed,
+            system_prompt=prompt_config["system_prompt"],
+            user_prompt_template=prompt_config["user_prompt_template"],
         )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        status_code = 422 if "占位符" in str(e) or "prompt" in str(e) else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
     await db.commit()
+    questions = result.get("questions", result) if isinstance(result, dict) else result
+    stats = result.get("stats") if isinstance(result, dict) else None
     return GenerateResponse(
         generated=len(questions),
-        questions=[_to_response(q) for q in questions],
+        questions=await _to_enriched_responses(db, questions),
+        stats=stats,
+        model_name=settings.LLM_MODEL,
     )
 
 
 @router.get("/generate/suggest/{material_id}", response_model=QuestionBankSuggestResponse)
 async def suggest_distribution(
     material_id: UUID,
+    max_units: Optional[int] = Query(None, ge=1, le=50),
+    selection_mode: str = Query("stable", pattern="^(stable|coverage)$"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role(["admin", "organizer"])),
 ):
     """Analyze a material and suggest optimal question type distribution."""
     try:
-        result = await question_service.suggest_question_distribution(db, material_id)
+        result = await question_service.suggest_question_distribution(
+            db,
+            material_id,
+            max_units=max_units,
+            selection_mode=selection_mode,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return QuestionBankSuggestResponse(**result)
@@ -364,12 +515,129 @@ async def generate_free(
 ):
     """Generate questions without material, using LLM's own knowledge."""
     try:
-        questions = await question_service.generate_questions_free(
+        prompt_config = await question_prompt_service.resolve_generation_prompts(
+            db=db,
+            user_id=current_user.id,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+        )
+        result = await question_service.generate_questions_free(
             db=db,
             type_distribution=body.type_distribution,
             difficulty=body.difficulty,
             bloom_level=body.bloom_level,
             custom_prompt=body.custom_prompt,
+            created_by=current_user.id,
+            prompt_seed=body.prompt_seed,
+            system_prompt=prompt_config["system_prompt"],
+            user_prompt_template=prompt_config["user_prompt_template"],
+        )
+    except ValueError as e:
+        status_code = 422 if "占位符" in str(e) or "prompt" in str(e) else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
+    await db.commit()
+    questions = result.get("questions", result) if isinstance(result, dict) else result
+    stats = result.get("stats") if isinstance(result, dict) else None
+    return GenerateResponse(
+        generated=len(questions),
+        questions=await _to_enriched_responses(db, questions),
+        stats=stats,
+        model_name=settings.LLM_MODEL,
+    )
+
+
+@router.post("/preview/bank/{material_id}", response_model=PreviewResponse)
+async def preview_question_bank(
+    material_id: UUID,
+    body: QuestionBankBuildRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    """Generate question bank preview WITHOUT saving to DB.
+    Returns raw question items for user review before committing."""
+    try:
+        prompt_config = await question_prompt_service.resolve_generation_prompts(
+            db=db,
+            user_id=current_user.id,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+        )
+        result = await question_service.preview_question_bank_from_material(
+            db=db,
+            material_id=material_id,
+            type_distribution=body.type_distribution,
+            difficulty=body.difficulty,
+            bloom_level=body.bloom_level,
+            max_units=body.max_units,
+            selection_mode=body.selection_mode,
+            custom_prompt=body.custom_prompt,
+            created_by=current_user.id,
+            prompt_seed=body.prompt_seed,
+            system_prompt=prompt_config["system_prompt"],
+            user_prompt_template=prompt_config["user_prompt_template"],
+        )
+    except ValueError as e:
+        status_code = 422 if "占位符" in str(e) or "prompt" in str(e) else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
+
+    preview_items = result.get("questions", [])
+    stats = result.get("stats")
+    return PreviewResponse(
+        questions=[PreviewQuestionItem(**item) for item in preview_items],
+        total=len(preview_items),
+        stats=stats,
+        model_name=settings.LLM_MODEL,
+    )
+
+
+@router.post("/preview/free", response_model=PreviewResponse)
+async def preview_free(
+    body: FreeGenerateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    """Generate preview questions without material (no DB save)."""
+    try:
+        prompt_config = await question_prompt_service.resolve_generation_prompts(
+            db=db,
+            user_id=current_user.id,
+            system_prompt=body.system_prompt,
+            user_prompt_template=body.user_prompt_template,
+        )
+        result = await question_service.preview_questions_free(
+            type_distribution=body.type_distribution,
+            difficulty=body.difficulty,
+            bloom_level=body.bloom_level,
+            custom_prompt=body.custom_prompt,
+            prompt_seed=body.prompt_seed,
+            system_prompt=prompt_config["system_prompt"],
+            user_prompt_template=prompt_config["user_prompt_template"],
+        )
+    except ValueError as e:
+        status_code = 422 if "占位符" in str(e) or "prompt" in str(e) else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
+
+    preview_items = result.get("questions", [])
+    stats = result.get("stats")
+    return PreviewResponse(
+        questions=[PreviewQuestionItem(**item) for item in preview_items],
+        total=len(preview_items),
+        stats=stats,
+        model_name=settings.LLM_MODEL,
+    )
+
+
+@router.post("/batch/create-raw", response_model=GenerateResponse)
+async def batch_create_from_raw(
+    body: BatchCreateFromRawRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    """Batch save previewed questions to DB. Called after user review/edit."""
+    try:
+        questions = await question_service.batch_create_from_raw(
+            db=db,
+            raw_questions=[q.model_dump() for q in body.questions],
             created_by=current_user.id,
         )
     except ValueError as e:
@@ -377,7 +645,7 @@ async def generate_free(
     await db.commit()
     return GenerateResponse(
         generated=len(questions),
-        questions=[_to_response(q) for q in questions],
+        questions=await _to_enriched_responses(db, questions),
     )
 
 
@@ -412,71 +680,6 @@ async def batch_export_md(
             "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
         },
     )
-
-
-@router.post("/batch/preview-md")
-async def batch_preview_md(
-    file: UploadFile = File(...),
-    current_user: User = Depends(require_role(["admin", "organizer"])),
-):
-    """Parse a Markdown question file and return structure analysis WITHOUT saving.
-
-    Returns type statistics and answer-format validation warnings.
-    """
-    if not file.filename or not file.filename.endswith(".md"):
-        raise HTTPException(status_code=400, detail="仅支持 .md 文件")
-
-    content = await file.read()
-    try:
-        md_text = content.decode("utf-8")
-    except UnicodeDecodeError:
-        raise HTTPException(status_code=400, detail="文件编码错误，请使用 UTF-8")
-
-    parsed = parse_md_to_questions(md_text)
-    if not parsed:
-        raise HTTPException(status_code=400, detail="未能从文件中解析出任何题目")
-
-    TYPE_LABELS = {
-        "single_choice": "单选题",
-        "multiple_choice": "多选题",
-        "true_false": "判断题",
-        "fill_blank": "填空题",
-        "short_answer": "简答题",
-        "essay": "论述题",
-        "sjt": "情境判断题",
-    }
-
-    type_stats: dict[str, dict] = {}
-    answer_issues: list[dict] = []
-
-    for idx, q in enumerate(parsed, 1):
-        qt = q.get("question_type", "unknown")
-        answer = (q.get("correct_answer") or "").strip()
-
-        if qt not in type_stats:
-            type_stats[qt] = {"label": TYPE_LABELS.get(qt, qt), "count": 0, "sample_answer": answer}
-        type_stats[qt]["count"] += 1
-
-        issue = None
-        if qt == "single_choice":
-            if len(answer) > 1:
-                issue = f'第{idx}题（单选题）答案"{answer}"含多个字符，单选题答案应为单个字母'
-        elif qt == "multiple_choice":
-            if len(answer) == 1:
-                issue = f'第{idx}题（多选题）答案"{answer}"只有1个字母，多选题通常有2个以上选项'
-        elif qt == "true_false":
-            valid_tf = {"a", "b", "对", "错", "√", "×", "正确", "错误", "true", "false", "t", "f", "是", "否"}
-            if answer.lower() not in valid_tf and answer:
-                issue = f'第{idx}题（判断题）答案"{answer}"格式不标准（期望 T/F 或 对/错/√/×）'
-
-        if issue:
-            answer_issues.append({"question_index": idx, "message": issue})
-
-    return {
-        "total": len(parsed),
-        "type_stats": list(type_stats.values()),
-        "answer_issues": answer_issues,
-    }
 
 
 @router.post("/batch/import-md")
@@ -539,7 +742,7 @@ async def get_question(
     q = await question_service.get_question_by_id(db, question_id)
     if not q:
         raise HTTPException(status_code=404, detail="题目不存在")
-    return _to_response(q)
+    return await _to_enriched_response(db, q)
 
 
 @router.put("/{question_id}", response_model=QuestionResponse)
@@ -550,15 +753,18 @@ async def update_question(
     current_user: User = Depends(require_role(["admin", "organizer"])),
 ):
     """Update a question."""
-    q = await question_service.update_question(
-        db=db,
-        question_id=question_id,
-        **body.model_dump(exclude_unset=True),
-    )
+    try:
+        q = await question_service.update_question(
+            db=db,
+            question_id=question_id,
+            **body.model_dump(exclude_unset=True),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if not q:
         raise HTTPException(status_code=404, detail="题目不存在")
     await db.commit()
-    return _to_response(q)
+    return await _to_enriched_response(db, q)
 
 
 @router.delete("/{question_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -588,7 +794,7 @@ async def submit_for_review(
     if not q:
         raise HTTPException(status_code=404, detail="题目不存在")
     await db.commit()
-    return _to_response(q)
+    return await _to_enriched_response(db, q)
 
 
 @router.post("/{question_id}/review", response_model=QuestionResponse)
@@ -614,7 +820,7 @@ async def review_question(
     if not q:
         raise HTTPException(status_code=404, detail="题目不存在")
     await db.commit()
-    return _to_response(q)
+    return await _to_enriched_response(db, q)
 
 
 @router.post("/{question_id}/ai-check", response_model=AIReviewResponse)
@@ -652,3 +858,138 @@ async def get_review_history(
         )
         for r in records
     ]
+
+
+# ---- Interaction endpoints (like, favorite, feedback) ----
+
+@router.get("/{question_id}/interactions", response_model=QuestionInteractionsResponse)
+async def get_question_interactions(
+    question_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Get current user's interaction state for a question."""
+    liked_result = await db.execute(
+        select(QuestionLike).where(
+            QuestionLike.question_id == question_id,
+            QuestionLike.user_id == current_user.id,
+        )
+    )
+    liked = liked_result.scalar_one_or_none() is not None
+
+    favorited_result = await db.execute(
+        select(QuestionFavorite).where(
+            QuestionFavorite.question_id == question_id,
+            QuestionFavorite.user_id == current_user.id,
+        )
+    )
+    favorited = favorited_result.scalar_one_or_none() is not None
+
+    like_count_result = await db.execute(
+        select(func.count()).where(QuestionLike.question_id == question_id)
+    )
+    like_count = like_count_result.scalar() or 0
+
+    favorite_count_result = await db.execute(
+        select(func.count()).where(QuestionFavorite.question_id == question_id)
+    )
+    favorite_count = favorite_count_result.scalar() or 0
+
+    return QuestionInteractionsResponse(
+        liked=liked,
+        favorited=favorited,
+        like_count=like_count,
+        favorite_count=favorite_count,
+    )
+
+
+@router.post("/{question_id}/like", response_model=dict)
+async def toggle_like(
+    question_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Toggle like for a question. Returns {liked, like_count}."""
+    existing = await db.execute(
+        select(QuestionLike).where(
+            QuestionLike.question_id == question_id,
+            QuestionLike.user_id == current_user.id,
+        )
+    )
+    record = existing.scalar_one_or_none()
+
+    if record is not None:
+        await db.execute(
+            delete(QuestionLike).where(
+                QuestionLike.question_id == question_id,
+                QuestionLike.user_id == current_user.id,
+            )
+        )
+        liked = False
+    else:
+        db.add(QuestionLike(question_id=question_id, user_id=current_user.id))
+        liked = True
+
+    await db.commit()
+
+    count_result = await db.execute(
+        select(func.count()).where(QuestionLike.question_id == question_id)
+    )
+    like_count = count_result.scalar() or 0
+
+    return {"liked": liked, "like_count": like_count}
+
+
+@router.post("/{question_id}/favorite", response_model=dict)
+async def toggle_favorite(
+    question_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Toggle favorite for a question. Returns {favorited, favorite_count}."""
+    existing = await db.execute(
+        select(QuestionFavorite).where(
+            QuestionFavorite.question_id == question_id,
+            QuestionFavorite.user_id == current_user.id,
+        )
+    )
+    record = existing.scalar_one_or_none()
+
+    if record is not None:
+        await db.execute(
+            delete(QuestionFavorite).where(
+                QuestionFavorite.question_id == question_id,
+                QuestionFavorite.user_id == current_user.id,
+            )
+        )
+        favorited = False
+    else:
+        db.add(QuestionFavorite(question_id=question_id, user_id=current_user.id))
+        favorited = True
+
+    await db.commit()
+
+    count_result = await db.execute(
+        select(func.count()).where(QuestionFavorite.question_id == question_id)
+    )
+    favorite_count = count_result.scalar() or 0
+
+    return {"favorited": favorited, "favorite_count": favorite_count}
+
+
+@router.post("/{question_id}/feedback", response_model=dict)
+async def submit_feedback(
+    question_id: UUID,
+    body: FeedbackRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Submit feedback for a question."""
+    db.add(QuestionFeedback(
+        question_id=question_id,
+        user_id=current_user.id,
+        feedback_type=body.feedback_type,
+        comment=body.comment,
+    ))
+    await db.commit()
+    return {"ok": True}

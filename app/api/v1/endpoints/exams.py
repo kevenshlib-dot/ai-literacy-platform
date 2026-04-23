@@ -13,6 +13,10 @@ from app.schemas.exam import (
     ExamUpdate,
     ExamResponse,
     ExamDetailResponse,
+    ExamCompositionResponse,
+    ExamCompositionItemResponse,
+    ExamCompositionUpdateRequest,
+    ExamQuestionSummaryResponse,
     ExamListResponse,
     ExamQuestionResponse,
     ManualAssembleRequest,
@@ -52,6 +56,30 @@ def _eq_to_response(eq) -> ExamQuestionResponse:
         question_id=eq.question_id,
         order_num=eq.order_num,
         score=eq.score,
+    )
+
+
+def _question_summary_to_response(question) -> ExamQuestionSummaryResponse:
+    return ExamQuestionSummaryResponse(
+        id=question.id,
+        question_type=question.question_type.value if hasattr(question.question_type, "value") else question.question_type,
+        stem=question.stem,
+        options=question.options,
+        correct_answer=question.correct_answer,
+        explanation=question.explanation,
+        difficulty=question.difficulty,
+        dimension=question.dimension,
+        status=question.status.value if hasattr(question.status, "value") else question.status,
+    )
+
+
+def _composition_item_to_response(eq, question) -> ExamCompositionItemResponse:
+    return ExamCompositionItemResponse(
+        id=eq.id,
+        question_id=eq.question_id,
+        order_num=eq.order_num,
+        score=eq.score,
+        question=_question_summary_to_response(question),
     )
 
 
@@ -177,6 +205,44 @@ async def analyze_exam_questions(
     result = await _analyze(db, exam_id)
     await db.commit()
     return result
+
+
+@router.get("/{exam_id}/composition", response_model=ExamCompositionResponse)
+async def get_exam_composition(
+    exam_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    exam = await exam_service.get_exam_by_id(db, exam_id)
+    if not exam:
+        raise HTTPException(status_code=404, detail="试卷不存在")
+    rows = await exam_service.get_exam_composition(db, exam_id)
+    return ExamCompositionResponse(
+        exam=_to_response(exam),
+        items=[_composition_item_to_response(eq, question) for eq, question in rows],
+    )
+
+
+@router.put("/{exam_id}/composition", response_model=ExamCompositionResponse)
+async def save_exam_composition(
+    exam_id: UUID,
+    body: ExamCompositionUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "organizer"])),
+):
+    try:
+        exam, rows = await exam_service.save_exam_composition(
+            db=db,
+            exam_id=exam_id,
+            items=[item.model_dump() for item in body.items],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    await db.commit()
+    return ExamCompositionResponse(
+        exam=_to_response(exam),
+        items=[_composition_item_to_response(eq, question) for eq, question in rows],
+    )
 
 
 @router.get("/{exam_id}", response_model=ExamDetailResponse)
@@ -339,8 +405,14 @@ async def auto_assemble(
             difficulty_target=body.difficulty_target,
             difficulty_tolerance=body.difficulty_tolerance,
             dimensions=body.dimensions,
+            dimension_weights=body.dimension_weights,
             score_per_question=body.score_per_question,
             exclude_question_ids=body.exclude_question_ids,
+            audience_type=body.audience_type,
+            library_types=body.library_types,
+            job_type=body.job_type,
+            requirements_prompt=body.requirements_prompt,
+            difficulty_preset=body.difficulty_preset,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

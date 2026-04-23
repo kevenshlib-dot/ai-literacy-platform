@@ -139,6 +139,22 @@ docker compose up -d --build
 
 详细部署说明见 [DEPLOY.md](DEPLOY.md)。
 
+### PostgreSQL 备份
+
+仓库内提供了一个单次导出脚本，默认从根目录的 `docker-compose.yml` 读取 `postgres` 服务，并将备份压缩到 `backups/postgres/`：
+
+```bash
+./scripts/backup_postgres.sh
+```
+
+如需指定其他 Compose 文件，可传入 `-f` 或 `--compose-file`：
+
+```bash
+./scripts/backup_postgres.sh --compose-file docker-compose.prod.yml
+```
+
+相对路径会按仓库根目录解析；如果从其他目录执行脚本，也可以直接传绝对路径。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |

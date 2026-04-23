@@ -23,6 +23,7 @@ env/
 .env
 .env.production
 !.env.example
+.env.test
 
 # Docker
 docker-data/
@@ -39,6 +40,7 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+artifacts/
 
 # Alembic
 alembic/versions/*.pyc
@@ -46,3 +48,7 @@ alembic/versions/*.pyc
 # Claude Code
 .claude/
 .github/
+
+# Codex
+.codex
+.codex/

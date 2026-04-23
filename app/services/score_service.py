@@ -4,8 +4,6 @@ import uuid
 from collections import defaultdict
 from typing import Optional
 
-logger = logging.getLogger(__name__)
-
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -15,6 +13,9 @@ from app.models.answer import AnswerSheet, Answer, AnswerSheetStatus
 from app.models.exam import ExamQuestion
 from app.models.question import Question
 from app.agents.scoring_agent import score_subjective_answer
+from app.services.report_storage import SCORE_REPORT_KEY, get_report_namespace, set_report_namespace
+
+logger = logging.getLogger(__name__)
 
 # Objective types that can be auto-scored
 OBJECTIVE_TYPES = {"single_choice", "multiple_choice", "true_false"}
@@ -52,14 +53,70 @@ def _score_objective(
         elif student_set.issubset(correct_set) and len(student_set) > 0:
             # Partial credit for subset
             partial = round(max_score * len(student_set) / len(correct_set) * 0.5, 1)
-            return {"earned_score": partial, "is_correct": False, "feedback": f"部分正确，漏选。正确答案：{correct}"}
+            return {
+                "earned_score": partial,
+                "is_correct": False,
+                "feedback": f"部分正确，漏选。正确答案：{correct}",
+                "analysis": {
+                    "earned_ratio": round(partial / max_score, 4) if max_score > 0 else 0.0,
+                    "judgement": "部分正确，但存在漏选。",
+                    "positive_points": ["答案命中了部分正确选项。"],
+                    "missed_points": [f"遗漏正确选项：{''.join(sorted(correct_set - student_set))}"],
+                    "error_reasons": ["incomplete_answer"],
+                    "confidence": 1.0,
+                    "evidence": [f"标准答案：{correct}", f"学生答案：{student}"],
+                    "scoring_source": "rule",
+                },
+            }
         else:
-            return {"earned_score": 0.0, "is_correct": False, "feedback": f"错误。正确答案：{correct}"}
+            return {
+                "earned_score": 0.0,
+                "is_correct": False,
+                "feedback": f"错误。正确答案：{correct}",
+                "analysis": {
+                    "earned_ratio": 0.0,
+                    "judgement": "答案与标准答案不匹配。",
+                    "positive_points": [],
+                    "missed_points": [f"正确答案应为：{correct}"],
+                    "error_reasons": ["concept_error"],
+                    "confidence": 1.0,
+                    "evidence": [f"标准答案：{correct}", f"学生答案：{student or '(未作答)'}"],
+                    "scoring_source": "rule",
+                },
+            }
     else:
         if correct == student:
-            return {"earned_score": max_score, "is_correct": True, "feedback": "正确"}
+            return {
+                "earned_score": max_score,
+                "is_correct": True,
+                "feedback": "正确",
+                "analysis": {
+                    "earned_ratio": 1.0,
+                    "judgement": "答案正确。",
+                    "positive_points": ["回答与标准答案一致。"],
+                    "missed_points": [],
+                    "error_reasons": [],
+                    "confidence": 1.0,
+                    "evidence": [f"标准答案：{correct}", f"学生答案：{student}"],
+                    "scoring_source": "rule",
+                },
+            }
         else:
-            return {"earned_score": 0.0, "is_correct": False, "feedback": f"错误。正确答案：{correct}"}
+            return {
+                "earned_score": 0.0,
+                "is_correct": False,
+                "feedback": f"错误。正确答案：{correct}",
+                "analysis": {
+                    "earned_ratio": 0.0,
+                    "judgement": "答案错误。",
+                    "positive_points": [],
+                    "missed_points": [f"正确答案应为：{correct}"],
+                    "error_reasons": ["concept_error"],
+                    "confidence": 1.0,
+                    "evidence": [f"标准答案：{correct}", f"学生答案：{student or '(未作答)'}"],
+                    "scoring_source": "rule",
+                },
+            }
 
 
 async def score_answer_sheet(
@@ -136,6 +193,7 @@ async def score_answer_sheet(
             max_score=max_score,
             is_correct=result.get("is_correct"),
             feedback=result.get("feedback", ""),
+            analysis=result.get("analysis"),
         )
         details.append(detail)
         total_earned += result["earned_score"]
@@ -212,11 +270,16 @@ async def get_score_by_id(
 async def generate_report(
     db: AsyncSession,
     score_id: uuid.UUID,
+    force_refresh: bool = False,
 ) -> dict:
     """Generate a score report with analysis."""
     score = await get_score_by_id(db, score_id, load_details=True)
     if not score:
         raise ValueError("成绩不存在")
+    if not force_refresh:
+        cached = get_report_namespace(score, SCORE_REPORT_KEY)
+        if cached:
+            return cached
 
     total_questions = len(score.details)
     correct_count = sum(1 for d in score.details if d.is_correct)
@@ -253,7 +316,7 @@ async def generate_report(
     }
 
     # Save report to score record
-    score.report = report
+    set_report_namespace(score, SCORE_REPORT_KEY, report)
     await db.flush()
 
     return report
@@ -268,7 +331,7 @@ async def get_wrong_answer_details(
     if not score:
         raise ValueError("成绩不存在")
 
-    wrong_details = [d for d in score.details if not d.is_correct]
+    wrong_details = [d for d in score.details if d.earned_score < d.max_score]
     if not wrong_details:
         return []
 
@@ -312,6 +375,11 @@ async def get_wrong_answer_details(
             "earned_score": detail.earned_score,
             "max_score": detail.max_score,
             "feedback": detail.feedback,
+            "analysis": detail.analysis or {},
+            "error_reasons": (detail.analysis or {}).get("error_reasons", []),
+            "missed_points": (detail.analysis or {}).get("missed_points", []),
+            "positive_points": (detail.analysis or {}).get("positive_points", []),
+            "reference_answer": q.correct_answer,
         })
     return items
 
@@ -517,6 +585,17 @@ async def handle_complaint(
     complaint.reply = reply
     await db.flush()
     return complaint
+
+
+def serialize_score_detail(detail: ScoreDetail) -> dict:
+    return {
+        "question_id": str(detail.question_id),
+        "earned_score": detail.earned_score,
+        "max_score": detail.max_score,
+        "is_correct": detail.is_correct,
+        "feedback": detail.feedback,
+        "analysis": detail.analysis or {},
+    }
 
 
 def _generate_recommendations(dim_analysis: dict, weak_dims: list) -> list[str]:

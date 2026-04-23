@@ -11,7 +11,7 @@ from typing import Optional
 from openai import OpenAI
 
 from app.core.config import settings
-from app.core.llm_config import get_llm_config_sync, make_openai_client
+from app.agents.llm_utils import strip_thinking_tags, build_disable_thinking_extra_body
 
 logger = logging.getLogger(__name__)
 
@@ -92,14 +92,13 @@ def generate_scenario_response(
     user_message: str,
 ) -> dict:
     """Generate next scenario turn using LLM or rule-based fallback."""
-    _cfg = get_llm_config_sync("interactive")
-    if _cfg.api_key == "your-api-key":
+    if settings.LLM_API_KEY == "your-api-key":
         return _rule_based_response(
             scenario, dimension, difficulty, conversation_history, user_message
         )
 
     try:
-        client = make_openai_client(_cfg)
+        client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
 
         system_msg = SCENARIO_SYSTEM_PROMPT.format(
             role_description=role_description or "AI评测教练",
@@ -116,13 +115,22 @@ def generate_scenario_response(
             })
         messages.append({"role": "user", "content": user_message})
 
-        response = client.chat.completions.create(
-            model=_cfg.model,
-            messages=messages,
-            temperature=0.7,
-            max_tokens=800,
+        request_kwargs = {
+            "model": settings.LLM_MODEL,
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": 800,
+        }
+        extra_body = build_disable_thinking_extra_body(
+            settings.LLM_MODEL,
+            settings.LLM_BASE_URL,
         )
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        response = client.chat.completions.create(**request_kwargs)
         content = response.choices[0].message.content.strip()
+        content = strip_thinking_tags(content)
 
         json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
         if json_match:
@@ -143,21 +151,20 @@ def generate_session_summary(
     turns: list[dict],
 ) -> dict:
     """Generate final evaluation summary for completed session."""
-    _cfg2 = get_llm_config_sync("interactive")
-    if _cfg2.api_key == "your-api-key":
+    if settings.LLM_API_KEY == "your-api-key":
         return _rule_based_summary(turns)
 
     try:
-        client = make_openai_client(_cfg2)
+        client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
 
         conversation = "\n".join(
             f"{'[AI]' if t['role'] == 'system' else '[考生]'}: {t['content']}"
             for t in turns
         )
 
-        response = client.chat.completions.create(
-            model=_cfg2.model,
-            messages=[
+        request_kwargs = {
+            "model": settings.LLM_MODEL,
+            "messages": [
                 {"role": "system", "content": "你是一个AI素养评测评估专家。"},
                 {"role": "user", "content": SUMMARY_PROMPT.format(
                     scenario=scenario,
@@ -165,10 +172,19 @@ def generate_session_summary(
                     conversation=conversation,
                 )},
             ],
-            temperature=0.3,
-            max_tokens=800,
+            "temperature": 0.3,
+            "max_tokens": 800,
+        }
+        extra_body = build_disable_thinking_extra_body(
+            settings.LLM_MODEL,
+            settings.LLM_BASE_URL,
         )
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        response = client.chat.completions.create(**request_kwargs)
         content = response.choices[0].message.content.strip()
+        content = strip_thinking_tags(content)
 
         json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
         if json_match:

@@ -48,6 +48,7 @@
           >
             <a-select-option value="pdf">PDF</a-select-option>
             <a-select-option value="word">Word</a-select-option>
+            <a-select-option value="epub">EPUB</a-select-option>
             <a-select-option value="markdown">Markdown</a-select-option>
             <a-select-option value="image">图片</a-select-option>
             <a-select-option value="video">视频</a-select-option>
@@ -146,7 +147,7 @@
           >
             <a-button><UploadOutlined /> 选择文件</a-button>
           </a-upload>
-          <div class="upload-hint">支持 PDF, Word, Markdown, 图片, 视频, 音频, CSV, JSON</div>
+          <div class="upload-hint">支持 PDF, Word, EPUB, Markdown, 图片, 视频, 音频, CSV, JSON</div>
         </a-form-item>
         <a-form-item>
           <a-button
@@ -182,7 +183,7 @@
           >
             <p class="ant-upload-drag-icon"><InboxOutlined /></p>
             <p class="ant-upload-text">点击或拖拽文件到此区域</p>
-            <p class="ant-upload-hint">支持多文件批量上传</p>
+            <p class="ant-upload-hint">支持 PDF、Word、EPUB、Markdown、图片、视频、音频、CSV、JSON 批量上传</p>
           </a-upload-dragger>
         </a-form-item>
         <a-form-item>
@@ -274,6 +275,7 @@ interface Material {
   tags: string[] | null
   source_url: string | null
   quality_score: number | null
+  approved_question_count: number
   uploaded_by: string
   created_at: string
   updated_at: string
@@ -285,17 +287,18 @@ const columns = [
   { title: '格式', key: 'format', width: 100 },
   { title: '大小', key: 'file_size', width: 100 },
   { title: '状态', key: 'status', width: 100 },
+  { title: '题目数量（已审核）', dataIndex: 'approved_question_count', key: 'approved_question_count', width: 140 },
   { title: '分类', dataIndex: 'category', key: 'category', width: 120 },
   { title: '上传时间', key: 'created_at', width: 160 },
   { title: '操作', key: 'actions', width: 200, fixed: 'right' as const },
 ]
 
 const formatLabels: Record<string, string> = {
-  pdf: 'PDF', word: 'Word', markdown: 'Markdown', html: 'HTML',
+  pdf: 'PDF', word: 'Word', epub: 'EPUB', markdown: 'Markdown', html: 'HTML',
   image: '图片', video: '视频', audio: '音频', csv: 'CSV', json: 'JSON',
 }
 const formatColors: Record<string, string> = {
-  pdf: 'red', word: 'blue', markdown: 'green', html: 'orange',
+  pdf: 'red', word: 'blue', epub: 'volcano', markdown: 'green', html: 'orange',
   image: 'purple', video: 'cyan', audio: 'magenta', csv: 'geekblue', json: 'lime',
 }
 const statusLabels: Record<string, string> = {
@@ -404,6 +407,7 @@ async function handleUpload() {
 
     await request.post('/materials', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
     })
     message.success('上传成功')
     showUploadModal.value = false
@@ -428,6 +432,7 @@ async function handleBatchUpload() {
 
     const res: any = await request.post('/materials/batch', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
     })
     message.success(`成功上传 ${res.uploaded} 个文件${res.failed > 0 ? `，${res.failed} 个失败` : ''}`)
     showBatchUpload.value = false
@@ -455,7 +460,13 @@ async function openMaterial(record: Material) {
 async function downloadMaterial(record: Material) {
   try {
     const res: any = await request.get(`/materials/${record.id}/download`)
-    window.open(res.download_url, '_blank')
+    const link = document.createElement('a')
+    link.href = res.download_url
+    link.download = res.filename || record.title
+    link.rel = 'noopener'
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
   } catch {
     message.error('获取下载链接失败')
   }

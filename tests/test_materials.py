@@ -1,3 +1,7 @@
+import io
+import zipfile
+import uuid
+
 import pytest
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy import text
@@ -6,7 +10,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from app.main import app
 from app.core.database import Base, get_db
 from app.core.config import settings
-from app.services.user_service import init_roles
+from app.core.security import create_access_token
+from app.services.user_service import create_user, init_roles
 
 
 async def override_get_db():
@@ -31,7 +36,7 @@ async def setup_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE TABLE users CASCADE"))
+        # await conn.execute(text("TRUNCATE TABLE users CASCADE"))
         await conn.execute(text("TRUNCATE TABLE materials CASCADE"))
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as session:
@@ -41,21 +46,83 @@ async def setup_db():
     yield
 
 
+@pytest.fixture(autouse=True)
+def disable_material_auto_parse(monkeypatch):
+    async def _noop_trigger_parse(material_id):
+        return None
+
+    monkeypatch.setattr("app.api.v1.endpoints.materials.trigger_parse", _noop_trigger_parse)
+
+
 def get_client():
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
 
 async def register_user(client, role="organizer"):
     """Helper to register a user and return auth token."""
-    import uuid
     unique = uuid.uuid4().hex[:8]
-    resp = await client.post("/api/v1/auth/register", json={
-        "username": f"user_{unique}",
-        "email": f"{unique}@test.com",
-        "password": "password123",
-        "role": role,
-    })
-    return resp.json()["access_token"]
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = await create_user(
+            session,
+            username=f"user_{unique}",
+            email=f"{unique}@test.com",
+            password="password123",
+            role_name=role,
+            is_active=True,
+        )
+        await session.commit()
+        token = create_access_token(
+            subject=str(user.id),
+            extra_claims={"role": user.role.name.value},
+        )
+    await engine.dispose()
+    return token
+
+
+def build_test_epub_bytes() -> bytes:
+    container_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>
+"""
+    content_opf = """<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>EPUB测试</dc:title>
+  </metadata>
+  <manifest>
+    <item id="chapter2" href="chapter2.xhtml" media-type="application/xhtml+xml"/>
+    <item id="chapter1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="chapter1"/>
+    <itemref idref="chapter2"/>
+  </spine>
+</package>
+"""
+    chapter1 = """<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <body><h1>第一章</h1><p>这是EPUB第一章内容。</p></body>
+</html>
+"""
+    chapter2 = """<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <body><h1>第二章</h1><p>这是EPUB第二章内容。</p></body>
+</html>
+"""
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr("META-INF/container.xml", container_xml)
+        archive.writestr("OEBPS/content.opf", content_opf)
+        archive.writestr("OEBPS/chapter1.xhtml", chapter1)
+        archive.writestr("OEBPS/chapter2.xhtml", chapter2)
+    return buf.getvalue()
 
 
 # ---- Upload Tests ----
@@ -91,6 +158,20 @@ async def test_upload_word():
     assert resp.status_code == 201
     assert resp.json()["format"] == "word"
     assert resp.json()["category"] == "教材"
+
+
+@pytest.mark.asyncio
+async def test_upload_epub():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        resp = await client.post(
+            "/api/v1/materials",
+            files={"file": ("book.epub", build_test_epub_bytes(), "application/epub+zip")},
+            data={"title": "EPUB电子书"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert resp.status_code == 201
+    assert resp.json()["format"] == "epub"
 
 
 @pytest.mark.asyncio
@@ -156,7 +237,17 @@ async def test_upload_forbidden_for_examinee():
 # ---- Batch Upload Tests ----
 
 @pytest.mark.asyncio
-async def test_batch_upload():
+async def test_batch_upload_triggers_parse(monkeypatch):
+    scheduled_material_ids = []
+
+    async def fake_trigger_parse(material_id):
+        scheduled_material_ids.append(str(material_id))
+
+    monkeypatch.setattr(
+        "app.api.v1.endpoints.materials.trigger_parse",
+        fake_trigger_parse,
+    )
+
     async with get_client() as client:
         token = await register_user(client, "organizer")
         resp = await client.post(
@@ -172,6 +263,8 @@ async def test_batch_upload():
     data = resp.json()
     assert data["uploaded"] == 2
     assert data["failed"] == 0
+    assert len(scheduled_material_ids) == 2
+    assert set(scheduled_material_ids) == {item["id"] for item in data["materials"]}
 
 
 # ---- List / Query Tests ----
@@ -214,6 +307,85 @@ async def test_list_materials_with_keyword():
         )
     assert resp.status_code == 200
     assert resp.json()["total"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_list_materials_includes_approved_question_count():
+    async with get_client() as client:
+        org_token = await register_user(client, "organizer")
+        rev_token = await register_user(client, "reviewer")
+        org_headers = {"Authorization": f"Bearer {org_token}"}
+        rev_headers = {"Authorization": f"Bearer {rev_token}"}
+
+        upload = await client.post(
+            "/api/v1/materials",
+            files={"file": ("count.pdf", b"content", "application/pdf")},
+            data={"title": f"题目数量素材-{uuid.uuid4().hex[:8]}"},
+            headers=org_headers,
+        )
+        material_id = upload.json()["id"]
+        material_title = upload.json()["title"]
+
+        approved_question = await client.post(
+            "/api/v1/questions",
+            json={
+                "question_type": "single_choice",
+                "stem": "已通过题目",
+                "correct_answer": "A",
+                "options": {"A": "1", "B": "2"},
+                "source_material_id": material_id,
+            },
+            headers=org_headers,
+        )
+        approved_question_id = approved_question.json()["id"]
+        await client.post(f"/api/v1/questions/{approved_question_id}/submit", headers=org_headers)
+        await client.post(
+            f"/api/v1/questions/{approved_question_id}/review",
+            json={"action": "approve", "comment": "通过"},
+            headers=rev_headers,
+        )
+
+        rejected_question = await client.post(
+            "/api/v1/questions",
+            json={
+                "question_type": "single_choice",
+                "stem": "已拒绝题目",
+                "correct_answer": "A",
+                "options": {"A": "1", "B": "2"},
+                "source_material_id": material_id,
+            },
+            headers=org_headers,
+        )
+        rejected_question_id = rejected_question.json()["id"]
+        await client.post(f"/api/v1/questions/{rejected_question_id}/submit", headers=org_headers)
+        await client.post(
+            f"/api/v1/questions/{rejected_question_id}/review",
+            json={"action": "reject", "comment": "拒绝"},
+            headers=rev_headers,
+        )
+
+        await client.post(
+            "/api/v1/questions",
+            json={
+                "question_type": "single_choice",
+                "stem": "草稿题目",
+                "correct_answer": "A",
+                "options": {"A": "1", "B": "2"},
+                "source_material_id": material_id,
+            },
+            headers=org_headers,
+        )
+
+        resp = await client.get(
+            f"/api/v1/materials?keyword={material_title}",
+            headers=org_headers,
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] >= 1
+    item = next(entry for entry in data["data"] if entry["id"] == material_id)
+    assert item["approved_question_count"] == 1
 
 
 # ---- Get / Download / Delete Tests ----
@@ -264,7 +436,9 @@ async def test_download_material():
             headers={"Authorization": f"Bearer {token}"},
         )
     assert resp.status_code == 200
-    assert "download_url" in resp.json()
+    data = resp.json()
+    assert "download_url" in data
+    assert data["filename"] == "下载测试.pdf"
 
 
 @pytest.mark.asyncio
@@ -278,6 +452,32 @@ async def test_delete_material():
             headers={"Authorization": f"Bearer {token}"},
         )
         mid = upload.json()["id"]
+        resp = await client.delete(
+            f"/api/v1/materials/{mid}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert resp.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_delete_parsed_material():
+    async with get_client() as client:
+        token = await register_user(client, "organizer")
+        upload = await client.post(
+            "/api/v1/materials",
+            files={"file": ("parsed.md", b"# AI\n\n" + "knowledge " * 200, "text/markdown")},
+            data={"title": "已解析素材删除"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        mid = upload.json()["id"]
+
+        parse_resp = await client.post(
+            f"/api/v1/materials/{mid}/parse",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert parse_resp.status_code == 200
+        assert parse_resp.json()["parsed"] is True
+
         resp = await client.delete(
             f"/api/v1/materials/{mid}",
             headers={"Authorization": f"Bearer {token}"},

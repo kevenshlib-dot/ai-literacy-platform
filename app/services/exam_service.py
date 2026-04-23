@@ -1,6 +1,5 @@
 """Exam service - handles exam CRUD, assembly strategy, and lifecycle management."""
 import math
-import random
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -15,6 +14,189 @@ from app.models.interactive import InteractiveSession
 from app.models.paper import Paper, PaperStatus
 from app.models.question import Question, QuestionType, QuestionStatus
 from app.models.score import Score, ScoreDetail
+
+FIVE_DIMENSIONS = [
+    "AI基础知识",
+    "AI技术应用",
+    "AI伦理安全",
+    "AI批判思维",
+    "AI创新实践",
+]
+
+
+async def _get_draft_exam(db: AsyncSession, exam_id: uuid.UUID) -> Exam:
+    exam = await get_exam_by_id(db, exam_id)
+    if not exam:
+        raise ValueError("试卷不存在")
+    if exam.status != ExamStatus.DRAFT:
+        raise ValueError("只能编辑草稿状态的试卷")
+    return exam
+
+
+async def _validate_composition_items(
+    db: AsyncSession,
+    items: list[dict],
+) -> dict[uuid.UUID, Question]:
+    if not items:
+        raise ValueError("试卷至少需要 1 道题")
+
+    question_ids: list[uuid.UUID] = []
+    seen_question_ids: set[uuid.UUID] = set()
+    seen_orders: set[int] = set()
+
+    for item in items:
+        question_id = item["question_id"]
+        order_num = item["order_num"]
+        score = item.get("score", 0)
+
+        if question_id in seen_question_ids:
+            raise ValueError("试卷中不能重复添加同一道题")
+        if order_num in seen_orders:
+            raise ValueError("题号必须唯一")
+        if score <= 0:
+            raise ValueError("每题分值必须大于 0")
+
+        seen_question_ids.add(question_id)
+        seen_orders.add(order_num)
+        question_ids.append(question_id)
+
+    expected_orders = set(range(1, len(items) + 1))
+    if seen_orders != expected_orders:
+        raise ValueError("题号必须从 1 开始连续且唯一")
+
+    result = await db.execute(select(Question).where(Question.id.in_(question_ids)))
+    questions = list(result.scalars().all())
+    question_map = {q.id: q for q in questions}
+
+    if len(question_map) != len(question_ids):
+        raise ValueError("试卷中包含不存在的题目")
+
+    invalid_questions = [
+        q for q in questions if q.status != QuestionStatus.APPROVED
+    ]
+    if invalid_questions:
+        raise ValueError("只能添加已审核通过的题目")
+
+    return question_map
+
+
+async def _replace_exam_questions(
+    db: AsyncSession,
+    exam: Exam,
+    items: list[dict],
+) -> list[ExamQuestion]:
+    await db.execute(delete(ExamQuestion).where(ExamQuestion.exam_id == exam.id))
+
+    exam_questions = []
+    total_score = 0.0
+    for item in sorted(items, key=lambda entry: entry["order_num"]):
+        eq = ExamQuestion(
+            exam_id=exam.id,
+            question_id=item["question_id"],
+            order_num=item["order_num"],
+            score=item.get("score", 5.0),
+        )
+        db.add(eq)
+        exam_questions.append(eq)
+        total_score += eq.score
+
+    exam.total_score = total_score
+    await db.flush()
+    return exam_questions
+
+
+def _normalize_dimension_weights(
+    dimension_weights: Optional[dict[str, int]],
+) -> Optional[dict[str, int]]:
+    if not dimension_weights:
+        return None
+
+    normalized: dict[str, int] = {}
+    for dimension in FIVE_DIMENSIONS:
+        raw = dimension_weights.get(dimension, 0)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 0
+        normalized[dimension] = max(0, value)
+
+    if sum(normalized.values()) <= 0:
+        return None
+    return normalized
+
+
+def _weights_to_dimensions(
+    dimension_weights: Optional[dict[str, int]],
+) -> Optional[list[str]]:
+    normalized = _normalize_dimension_weights(dimension_weights)
+    if not normalized:
+        return None
+    return [dimension for dimension in FIVE_DIMENSIONS if normalized[dimension] > 0]
+
+
+def _allocate_dimension_counts(
+    total: int,
+    dimension_weights: dict[str, int],
+) -> dict[str, int]:
+    active_dimensions = [dimension for dimension in FIVE_DIMENSIONS if dimension_weights.get(dimension, 0) > 0]
+    if total <= 0 or not active_dimensions:
+        return {}
+
+    weight_sum = sum(dimension_weights[dimension] for dimension in active_dimensions)
+    if weight_sum <= 0:
+        return {}
+
+    raw_counts = {
+        dimension: total * dimension_weights[dimension] / weight_sum
+        for dimension in active_dimensions
+    }
+    allocated = {
+        dimension: int(math.floor(raw_counts[dimension]))
+        for dimension in active_dimensions
+    }
+    remainder = total - sum(allocated.values())
+    ranked_dimensions = sorted(
+        active_dimensions,
+        key=lambda dimension: (raw_counts[dimension] - allocated[dimension], -FIVE_DIMENSIONS.index(dimension)),
+        reverse=True,
+    )
+    for dimension in ranked_dimensions[:remainder]:
+        allocated[dimension] += 1
+    return allocated
+
+
+async def _fetch_candidate_questions(
+    db: AsyncSession,
+    qtype: QuestionType,
+    diff_min: int,
+    diff_max: int,
+    count: int,
+    dimensions: Optional[list[str]] = None,
+    exclude_question_ids: Optional[list[uuid.UUID]] = None,
+) -> list[Question]:
+    if count <= 0:
+        return []
+
+    conditions = [
+        Question.status == QuestionStatus.APPROVED,
+        Question.question_type == qtype,
+        Question.difficulty >= diff_min,
+        Question.difficulty <= diff_max,
+    ]
+
+    if dimensions:
+        conditions.append(Question.dimension.in_(dimensions))
+
+    if exclude_question_ids:
+        conditions.append(Question.id.notin_(exclude_question_ids))
+
+    result = await db.execute(
+        select(Question)
+        .where(and_(*conditions))
+        .order_by(func.random())
+        .limit(count)
+    )
+    return list(result.scalars().all())
 
 
 async def create_exam(
@@ -142,11 +324,14 @@ async def delete_exam(db: AsyncSession, exam_id: uuid.UUID) -> bool:
 
 
 async def publish_exam(db: AsyncSession, exam_id: uuid.UUID) -> Optional[Exam]:
-    exam = await get_exam_by_id(db, exam_id, load_questions=True)
+    exam = await get_exam_by_id(db, exam_id)
     if not exam:
         return None
-    if not exam.questions:
-        raise ValueError("试卷没有题目，无法发布")
+    if exam.status != ExamStatus.DRAFT:
+        raise ValueError("只有草稿状态的试卷才能发布")
+    items = await get_exam_composition_payload(db, exam_id)
+    await _validate_composition_items(db, items)
+    exam.total_score = sum(item["score"] for item in items)
     exam.status = ExamStatus.PUBLISHED
     await db.flush()
     return exam
@@ -169,33 +354,9 @@ async def manual_assemble(
     questions: list[dict],
 ) -> list[ExamQuestion]:
     """Manually add questions to an exam."""
-    exam = await get_exam_by_id(db, exam_id)
-    if not exam:
-        raise ValueError("试卷不存在")
-    if exam.status != ExamStatus.DRAFT:
-        raise ValueError("只能为草稿状态的试卷添加题目")
-
-    # Clear existing questions
-    await db.execute(
-        delete(ExamQuestion).where(ExamQuestion.exam_id == exam_id)
-    )
-
-    exam_questions = []
-    total_score = 0.0
-    for item in questions:
-        eq = ExamQuestion(
-            exam_id=exam_id,
-            question_id=item["question_id"],
-            order_num=item["order_num"],
-            score=item.get("score", 5.0),
-        )
-        db.add(eq)
-        exam_questions.append(eq)
-        total_score += eq.score
-
-    exam.total_score = total_score
-    await db.flush()
-    return exam_questions
+    exam = await _get_draft_exam(db, exam_id)
+    await _validate_composition_items(db, questions)
+    return await _replace_exam_questions(db, exam, questions)
 
 
 async def auto_assemble(
@@ -205,8 +366,14 @@ async def auto_assemble(
     difficulty_target: int = 3,
     difficulty_tolerance: int = 1,
     dimensions: Optional[list[str]] = None,
+    dimension_weights: Optional[dict[str, int]] = None,
     score_per_question: float = 5.0,
     exclude_question_ids: Optional[list[uuid.UUID]] = None,
+    audience_type: Optional[str] = None,
+    library_types: Optional[list[str]] = None,
+    job_type: Optional[str] = None,
+    requirements_prompt: Optional[str] = None,
+    difficulty_preset: Optional[str] = None,
 ) -> list[ExamQuestion]:
     """Auto-assemble an exam based on strategy constraints.
 
@@ -225,38 +392,59 @@ async def auto_assemble(
 
     diff_min = max(1, difficulty_target - difficulty_tolerance)
     diff_max = min(5, difficulty_target + difficulty_tolerance)
+    normalized_weights = _normalize_dimension_weights(dimension_weights)
+    weighted_dimensions = _weights_to_dimensions(normalized_weights)
+    effective_dimensions = weighted_dimensions or dimensions
 
     selected_questions = []
     order = 1
 
     for qtype_str, count in type_distribution.items():
         qtype = QuestionType(qtype_str)
-
-        conditions = [
-            Question.status == QuestionStatus.APPROVED,
-            Question.question_type == qtype,
-            Question.difficulty >= diff_min,
-            Question.difficulty <= diff_max,
+        already_ids = [sq["question_id"] for sq in selected_questions]
+        blocked_ids = [
+            *(exclude_question_ids or []),
+            *already_ids,
         ]
 
-        if dimensions:
-            conditions.append(Question.dimension.in_(dimensions))
+        if normalized_weights:
+            per_dimension_targets = _allocate_dimension_counts(count, normalized_weights)
+            candidates: list[Question] = []
 
-        if exclude_question_ids:
-            conditions.append(Question.id.notin_(exclude_question_ids))
+            for dimension, dimension_count in per_dimension_targets.items():
+                chosen = await _fetch_candidate_questions(
+                    db=db,
+                    qtype=qtype,
+                    diff_min=diff_min,
+                    diff_max=diff_max,
+                    count=dimension_count,
+                    dimensions=[dimension],
+                    exclude_question_ids=blocked_ids + [candidate.id for candidate in candidates],
+                )
+                candidates.extend(chosen)
 
-        # Exclude already selected
-        already_ids = [sq["question_id"] for sq in selected_questions]
-        if already_ids:
-            conditions.append(Question.id.notin_(already_ids))
-
-        result = await db.execute(
-            select(Question)
-            .where(and_(*conditions))
-            .order_by(func.random())
-            .limit(count)
-        )
-        candidates = list(result.scalars().all())
+            shortage = count - len(candidates)
+            if shortage > 0 and weighted_dimensions:
+                fallback_candidates = await _fetch_candidate_questions(
+                    db=db,
+                    qtype=qtype,
+                    diff_min=diff_min,
+                    diff_max=diff_max,
+                    count=shortage,
+                    dimensions=weighted_dimensions,
+                    exclude_question_ids=blocked_ids + [candidate.id for candidate in candidates],
+                )
+                candidates.extend(fallback_candidates)
+        else:
+            candidates = await _fetch_candidate_questions(
+                db=db,
+                qtype=qtype,
+                diff_min=diff_min,
+                diff_max=diff_max,
+                count=count,
+                dimensions=effective_dimensions,
+                exclude_question_ids=blocked_ids,
+            )
 
         for q in candidates:
             selected_questions.append({
@@ -266,31 +454,62 @@ async def auto_assemble(
             })
             order += 1
 
-    # Create ExamQuestion records
-    exam_questions = []
-    total_score = 0.0
-    for item in selected_questions:
-        eq = ExamQuestion(
-            exam_id=exam_id,
-            question_id=item["question_id"],
-            order_num=item["order_num"],
-            score=item["score"],
-        )
-        db.add(eq)
-        exam_questions.append(eq)
-        total_score += eq.score
-
-    exam.total_score = total_score
+    exam_questions = await _replace_exam_questions(db, exam, selected_questions)
     exam.params = {
         "type_distribution": type_distribution,
         "difficulty_target": difficulty_target,
         "difficulty_tolerance": difficulty_tolerance,
-        "dimensions": dimensions,
+        "dimensions": effective_dimensions,
+        "dimension_weights": normalized_weights,
         "score_per_question": score_per_question,
+        "audience_type": audience_type,
+        "library_types": library_types if audience_type == "librarian" else None,
+        "job_type": job_type if audience_type == "librarian" else None,
+        "requirements_prompt": requirements_prompt,
+        "difficulty_preset": difficulty_preset,
     }
     await db.flush()
 
     return exam_questions
+
+
+async def get_exam_composition(
+    db: AsyncSession, exam_id: uuid.UUID
+) -> list[tuple[ExamQuestion, Question]]:
+    result = await db.execute(
+        select(ExamQuestion, Question)
+        .join(Question, ExamQuestion.question_id == Question.id)
+        .where(ExamQuestion.exam_id == exam_id)
+        .order_by(ExamQuestion.order_num)
+    )
+    return list(result.all())
+
+
+async def get_exam_composition_payload(
+    db: AsyncSession, exam_id: uuid.UUID
+) -> list[dict]:
+    rows = await get_exam_composition(db, exam_id)
+    return [
+        {
+            "question_id": eq.question_id,
+            "order_num": eq.order_num,
+            "score": eq.score,
+        }
+        for eq, _ in rows
+    ]
+
+
+async def save_exam_composition(
+    db: AsyncSession,
+    exam_id: uuid.UUID,
+    items: list[dict],
+) -> tuple[Exam, list[tuple[ExamQuestion, Question]]]:
+    exam = await _get_draft_exam(db, exam_id)
+    question_map = await _validate_composition_items(db, items)
+    exam_questions = await _replace_exam_questions(db, exam, items)
+    rows = [(eq, question_map[eq.question_id]) for eq in exam_questions]
+    rows.sort(key=lambda row: row[0].order_num)
+    return exam, rows
 
 
 async def get_exam_questions(

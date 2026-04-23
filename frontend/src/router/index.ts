@@ -68,10 +68,28 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '考试管理', roles: ['admin', 'organizer', 'reviewer', 'examinee'] },
       },
       {
+        path: 'exams/:examId/compose',
+        name: 'ExamCompose',
+        component: () => import('@/views/ExamCompose.vue'),
+        meta: { title: '试卷编排', roles: ['admin', 'organizer'] },
+      },
+      {
+        path: 'take-exam',
+        name: 'TakeExam',
+        component: () => import('@/views/TakeExam.vue'),
+        meta: { title: '在线考试', roles: ['admin', 'organizer', 'reviewer', 'examinee'] },
+      },
+      {
         path: 'scores',
         name: 'Scores',
         component: () => import('@/views/Scores.vue'),
         meta: { title: '成绩管理', roles: ['admin', 'organizer', 'reviewer', 'examinee'] },
+      },
+      {
+        path: 'scores/:scoreId/diagnostic',
+        name: 'ScoreDiagnostic',
+        component: () => import('@/views/ScoreDiagnostic.vue'),
+        meta: { title: '诊断分析报告', roles: ['admin', 'organizer', 'reviewer', 'examinee'] },
       },
       {
         path: 'users',
