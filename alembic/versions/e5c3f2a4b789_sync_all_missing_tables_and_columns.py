@@ -14,6 +14,7 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy import inspect as sa_inspect
+import re
 
 
 revision = 'e5c3f2a4b789'
@@ -36,15 +37,91 @@ def _column_exists(table_name: str, column_name: str) -> bool:
 
 
 def _create_enum_if_not_exists(enum_name: str, values: list[str]):
-    """Create a PostgreSQL enum type if it doesn't already exist."""
+    """Create or normalize a PostgreSQL enum type.
+
+    Some deployed databases already have enum types created by older
+    SQLAlchemy metadata with enum member names such as ACTIVE/COMPLETED.
+    This migration casts varchar columns to lowercase enum values later, so
+    existing uppercase-only enum types must be replaced before those casts.
+    """
     bind = op.get_bind()
     result = bind.execute(
-        sa.text("SELECT 1 FROM pg_type WHERE typname = :name"),
+        sa.text(
+            """
+            SELECT e.enumlabel
+            FROM pg_type t
+            JOIN pg_enum e ON e.enumtypid = t.oid
+            WHERE t.typname = :name
+            ORDER BY e.enumsortorder
+            """
+        ),
         {"name": enum_name}
     )
-    if result.fetchone() is None:
+    existing_values = [row[0] for row in result.fetchall()]
+    if not existing_values:
         enum = sa.Enum(*values, name=enum_name)
         enum.create(bind)
+        return
+    if existing_values == values:
+        return
+
+    dependent_columns = bind.execute(
+        sa.text(
+            """
+            SELECT n.nspname AS schema_name,
+                   c.relname AS table_name,
+                   a.attname AS column_name,
+                   pg_get_expr(d.adbin, d.adrelid) AS default_expr
+            FROM pg_type t
+            JOIN pg_attribute a ON a.atttypid = t.oid
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            LEFT JOIN pg_attrdef d
+                   ON d.adrelid = a.attrelid
+                  AND d.adnum = a.attnum
+            WHERE t.typname = :name
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+              AND c.relkind IN ('r', 'p')
+            """
+        ),
+        {"name": enum_name},
+    ).fetchall()
+
+    temp_name = f"{enum_name}_e5c3_new"
+    value_sql = ", ".join(f"'{value}'" for value in values)
+    bind.execute(sa.text(f'DROP TYPE IF EXISTS "{temp_name}"'))
+    bind.execute(sa.text(f'CREATE TYPE "{temp_name}" AS ENUM ({value_sql})'))
+
+    default_values: list[tuple[str, str, str, str]] = []
+    for schema_name, table_name, column_name, default_expr in dependent_columns:
+        table_ident = f'"{schema_name}"."{table_name}"'
+        column_ident = f'"{column_name}"'
+        bind.execute(sa.text(f'ALTER TABLE {table_ident} ALTER COLUMN {column_ident} DROP DEFAULT'))
+        bind.execute(
+            sa.text(
+                f'ALTER TABLE {table_ident} '
+                f'ALTER COLUMN {column_ident} TYPE "{temp_name}" '
+                f'USING lower({column_ident}::text)::"{temp_name}"'
+            )
+        )
+        if default_expr:
+            match = re.match(r"^'([^']+)'::", default_expr)
+            if match and match.group(1).lower() in values:
+                default_values.append((schema_name, table_name, column_name, match.group(1).lower()))
+
+    bind.execute(sa.text(f'DROP TYPE "{enum_name}"'))
+    bind.execute(sa.text(f'ALTER TYPE "{temp_name}" RENAME TO "{enum_name}"'))
+
+    for schema_name, table_name, column_name, default_value in default_values:
+        table_ident = f'"{schema_name}"."{table_name}"'
+        column_ident = f'"{column_name}"'
+        bind.execute(
+            sa.text(
+                f"ALTER TABLE {table_ident} "
+                f"ALTER COLUMN {column_ident} SET DEFAULT '{default_value}'::\"{enum_name}\""
+            )
+        )
 
 
 def upgrade() -> None:

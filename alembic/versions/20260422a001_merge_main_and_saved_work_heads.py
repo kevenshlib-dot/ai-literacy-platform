@@ -115,6 +115,51 @@ def upgrade() -> None:
         ["draft", "pending_review", "approved", "rejected", "archived"],
         [("questions", "status")],
     )
+    _normalize_enum_values(
+        "paperstatus",
+        ["draft", "published", "archived"],
+        [("papers", "status")],
+    )
+    _normalize_enum_values(
+        "interactivesessionstatus",
+        ["active", "completed", "abandoned"],
+        [("interactive_sessions", "status")],
+    )
+    _normalize_enum_values(
+        "proposalstatus",
+        ["draft", "submitted", "under_review", "approved", "rejected"],
+        [("indicator_proposals", "status")],
+    )
+    _normalize_enum_values(
+        "coursestatus",
+        ["draft", "published", "archived"],
+        [("courses", "status")],
+    )
+    _normalize_enum_values(
+        "learningpathstatus",
+        ["active", "completed", "abandoned"],
+        [("learning_paths", "status")],
+    )
+    _normalize_enum_values(
+        "learningsteptype",
+        ["course", "quiz", "practice", "reading", "sandbox"],
+        [("learning_steps", "step_type")],
+    )
+    _normalize_enum_values(
+        "learningstepstatus",
+        ["pending", "in_progress", "completed", "skipped"],
+        [("learning_steps", "status")],
+    )
+    _normalize_enum_values(
+        "sandboxtype",
+        ["prompt_engineering", "data_analysis", "ethical_reasoning", "tool_usage", "creative_writing"],
+        [("sandbox_sessions", "sandbox_type")],
+    )
+    _normalize_enum_values(
+        "sandboxsessionstatus",
+        ["active", "completed", "abandoned"],
+        [("sandbox_sessions", "status")],
+    )
 
 
 def downgrade() -> None:
