@@ -4,7 +4,7 @@
 让 `generate_questions_via_llm()` 在本地 Qwen 路径下优先消费 SDK 已解析好的结构化对象，降低当前 generator 因文本 `json.loads` 失败导致的重试与 fallback。
 
 ## Problem
-当前 generator 与 planner 一样，虽然已经带了 `response_format=json_schema`，但返回结果仍默认走 `message.content -> extract_json_text -> json.loads`。  
+当前 generator 与 planner 一样，虽然已经带了 `response_format=json_schema`，但返回结果仍默认走 `message.content -> extract_json_text -> json.loads`。
 真实链路里 generator 比 planner 调用次数更多、schema 更复杂，因此它现在是 JSON 漂移与耗时放大的主要来源。
 
 ## Scope

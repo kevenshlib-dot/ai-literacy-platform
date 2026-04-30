@@ -4,7 +4,7 @@
 让 `planner` 和 `batch planner` 在本地 Qwen 路径下优先消费 SDK 已解析好的结构化对象，减少当前“已启用结构化输出但仍因文本 `json.loads` 失败”的问题。
 
 ## Problem
-当前 `planner` / `batch planner` 虽然已经带了 `response_format=json_schema`，但返回结果仍按 `message.content -> extract_json_text -> json.loads` 处理。  
+当前 `planner` / `batch planner` 虽然已经带了 `response_format=json_schema`，但返回结果仍按 `message.content -> extract_json_text -> json.loads` 处理。
 这会把“模型已经支持结构化输出”重新降级成“依赖文本 JSON 严格合法”，只要模型多输出一个字符或少一个逗号就会失败。
 
 ## Scope

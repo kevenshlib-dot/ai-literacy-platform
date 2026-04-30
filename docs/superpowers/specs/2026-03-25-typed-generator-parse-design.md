@@ -4,7 +4,7 @@
 让 generator 在 `parse` 路径下按题型校验必填字段，避免当前“结构化对象可解析，但选择题缺少 `options` 仍被当作成功结构”的问题。
 
 ## Problem
-上一轮已经让 generator 优先消费 `message.parsed`。  
+上一轮已经让 generator 优先消费 `message.parsed`。
 但当前 parse 模型过于宽松，`single_choice` / `multiple_choice` 缺少 `options` 时仍能通过 Pydantic 解析，随后才在业务校验里触发 `缺少有效选项`，导致：
 
 - 结构化成功，但业务上整批无效
