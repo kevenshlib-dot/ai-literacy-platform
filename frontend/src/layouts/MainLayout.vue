@@ -139,11 +139,18 @@ const allMenuItems: MenuItem[] = [
 const menuLabelMap: Record<string, string> = {}
 allMenuItems.forEach(item => { menuLabelMap[item.key] = item.label })
 
+const routeMenuParentMap: Record<string, string> = {
+  ExamCompose: 'Exams',
+  PaperArchive: 'Papers',
+  PaperEditor: 'Papers',
+  ScoreDiagnostic: 'Scores',
+}
+
 const router = useRouter()
 const route = useRoute()
 const userStore = useUserStore()
 const collapsed = ref(false)
-const selectedKeys = ref<string[]>([(route.name === 'ExamCompose' ? 'Exams' : route.name as string) || 'Home'])
+const selectedKeys = ref<string[]>([resolveSelectedKey(route.name as string | undefined)])
 
 const visibleMenuItems = computed(() => {
   const role = userStore.userInfo?.role || ''
@@ -151,13 +158,16 @@ const visibleMenuItems = computed(() => {
 })
 
 const currentPageLabel = computed(() => {
+  const title = route.meta.title
+  if (typeof title === 'string' && title.trim()) return title
+
   const name = route.name as string
   return menuLabelMap[name] || name || ''
 })
 
 function resolveSelectedKey(name: string | undefined) {
-  if (name === 'ExamCompose') return 'Exams'
-  return name || 'Home'
+  if (!name) return 'Home'
+  return routeMenuParentMap[name] || name
 }
 
 watch(() => route.name, (name) => {

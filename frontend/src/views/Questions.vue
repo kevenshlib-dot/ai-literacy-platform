@@ -355,7 +355,7 @@
       </template>
       <a-form :label-col="{ span: 4 }" :wrapper-col="{ span: 20 }">
         <a-form-item label="题型" required>
-          <a-select v-model:value="form.question_type" placeholder="选择题型">
+          <a-select v-model:value="form.question_type" placeholder="选择题型" @change="handleQuestionTypeChange">
             <a-select-option value="single_choice">单选题</a-select-option>
             <a-select-option value="multiple_choice">多选题</a-select-option>
             <a-select-option value="true_false">判断题</a-select-option>
@@ -367,15 +367,19 @@
           <a-textarea v-model:value="form.stem" :rows="3" placeholder="请输入题干" />
         </a-form-item>
         <a-form-item v-if="hasOptions" label="选项">
-          <a-row :gutter="8" v-for="opt in ['A', 'B', 'C', 'D']" :key="opt" style="margin-bottom: 4px">
+          <a-row :gutter="8" v-for="opt in formOptionKeys" :key="opt" style="margin-bottom: 4px">
             <a-col :span="2"><strong>{{ opt }}.</strong></a-col>
             <a-col :span="22">
-              <a-input v-model:value="form.options[opt]" :placeholder="`选项${opt}`" />
+              <a-input v-model:value="form.options[opt]" :placeholder="`选项${opt}`" :disabled="form.question_type === 'true_false'" />
             </a-col>
           </a-row>
         </a-form-item>
         <a-form-item label="正确答案" required>
-          <a-input v-model:value="form.correct_answer" placeholder="如: A 或 AB" />
+          <a-radio-group v-if="form.question_type === 'true_false'" v-model:value="form.correct_answer">
+            <a-radio value="T">T. 正确</a-radio>
+            <a-radio value="F">F. 错误</a-radio>
+          </a-radio-group>
+          <a-input v-else v-model:value="form.correct_answer" placeholder="如: A 或 AB" />
         </a-form-item>
         <a-form-item label="解析">
           <a-textarea v-model:value="form.explanation" :rows="2" placeholder="答案解析" />
@@ -1409,6 +1413,9 @@ const form = reactive({
 const hasOptions = computed(() =>
   ['single_choice', 'multiple_choice', 'true_false'].includes(form.question_type)
 )
+const formOptionKeys = computed(() =>
+  form.question_type === 'true_false' ? ['T', 'F'] : ['A', 'B', 'C', 'D']
+)
 
 // ---- Table Columns ----
 const columns = [
@@ -1625,6 +1632,25 @@ function resetForm() {
   form.bloom_level = undefined
 }
 
+function normalizeTrueFalseAnswer(answer?: string | null): string {
+  const value = String(answer || '').trim()
+  if (!value) return ''
+  const upper = value.toUpperCase()
+  if (['A', 'T', 'TRUE', 'Y', 'YES'].includes(upper) || ['正确', '对', '是', '√', '✓'].includes(value)) return 'T'
+  if (['B', 'F', 'FALSE', 'N', 'NO', 'X'].includes(upper) || ['错误', '错', '否', '×', '✗'].includes(value)) return 'F'
+  return upper
+}
+
+function handleQuestionTypeChange(value: string) {
+  if (value === 'true_false') {
+    form.options = { T: '正确', F: '错误' }
+    form.correct_answer = normalizeTrueFalseAnswer(form.correct_answer) || 'T'
+  } else if (!form.options.A && !form.options.B && !form.options.C && !form.options.D) {
+    form.options = { A: '', B: '', C: '', D: '' }
+    form.correct_answer = ''
+  }
+}
+
 function showCreateModal() {
   editingQuestion.value = null
   resetForm()
@@ -1635,8 +1661,12 @@ function editQuestion(q: any) {
   editingQuestion.value = q
   form.question_type = q.question_type
   form.stem = q.stem
-  form.options = q.options ? { ...q.options } : { A: '', B: '', C: '', D: '' }
-  form.correct_answer = q.correct_answer
+  form.options = q.question_type === 'true_false'
+    ? { T: '正确', F: '错误' }
+    : q.options ? { ...q.options } : { A: '', B: '', C: '', D: '' }
+  form.correct_answer = q.question_type === 'true_false'
+    ? normalizeTrueFalseAnswer(q.correct_answer)
+    : q.correct_answer
   form.explanation = q.explanation || ''
   form.difficulty = q.difficulty
   form.dimension = q.dimension || ''
@@ -1654,14 +1684,18 @@ async function handleCreateOrUpdate() {
     const payload: any = {
       question_type: form.question_type,
       stem: form.stem,
-      correct_answer: form.correct_answer,
+      correct_answer: form.question_type === 'true_false'
+        ? normalizeTrueFalseAnswer(form.correct_answer)
+        : form.correct_answer,
       explanation: form.explanation || undefined,
       difficulty: form.difficulty,
       dimension: form.dimension || undefined,
       bloom_level: form.bloom_level || undefined,
     }
     if (hasOptions.value) {
-      payload.options = { ...form.options }
+      payload.options = form.question_type === 'true_false'
+        ? { T: '正确', F: '错误' }
+        : { ...form.options }
     }
 
     if (editingQuestion.value) {

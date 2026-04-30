@@ -1059,8 +1059,8 @@ def test_build_question_response_format_is_type_aware():
     item_schema = true_false_schema["json_schema"]["schema"]["items"]
 
     assert item_schema["properties"]["question_type"]["const"] == "true_false"
-    assert item_schema["properties"]["options"]["properties"]["A"]["const"] == "正确"
-    assert item_schema["properties"]["correct_answer"]["enum"] == ["A", "B"]
+    assert item_schema["properties"]["options"]["properties"]["T"]["const"] == "正确"
+    assert item_schema["properties"]["correct_answer"]["enum"] == ["T", "F"]
 
     fill_blank_schema = question_agent._build_question_response_format(1, ["fill_blank"])
     fill_blank_item = fill_blank_schema["json_schema"]["schema"]["items"]

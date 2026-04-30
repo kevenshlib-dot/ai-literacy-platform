@@ -395,8 +395,8 @@
           <div style="display: flex; align-items: center; gap: 12px">
             <span style="font-size: 16px; font-weight: 600">批卷详情</span>
             <template v-if="fullReviewData">
-              <a-tag color="green"><CheckCircleOutlined /> 答对 {{ fullReviewData.correct_count }} 题</a-tag>
-              <a-tag color="red"><CloseCircleOutlined /> 答错 {{ fullReviewData.wrong_count }} 题</a-tag>
+              <a-tag color="green"><CheckCircleOutlined /> 满分 {{ fullReviewData.full_score_count ?? derivedFullScoreCount }} 题</a-tag>
+              <a-tag color="red"><CloseCircleOutlined /> 扣分 {{ fullReviewData.deducted_count ?? derivedDeductedCount }} 题</a-tag>
               <a-tag>共 {{ fullReviewData.total }} 题</a-tag>
             </template>
           </div>
@@ -408,18 +408,21 @@
                  marginBottom: '16px',
                  padding: '16px',
                  borderRadius: '8px',
-                 borderLeft: item.is_correct === false ? '5px solid #ff4d4f' : item.is_correct === true ? '5px solid #52c41a' : '5px solid #faad14',
-                 background: item.is_correct === false ? '#fff1f0' : item.is_correct === true ? '#f6ffed' : '#fffbe6',
+                 borderLeft: `5px solid ${scoreStatusBorderColor(item)}`,
+                 background: scoreStatusBackground(item),
                }">
             <!-- Question header -->
             <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap">
               <span style="font-weight: 700; font-size: 15px; color: #333">第 {{ item.order_num }} 题</span>
               <a-tag>{{ typeLabel(item.question_type) }}</a-tag>
-              <a-tag v-if="item.dimension" color="blue">{{ item.dimension }}</a-tag>
-              <a-tag v-if="item.is_correct === true" color="success"><CheckCircleOutlined /> 答对</a-tag>
-              <a-tag v-else-if="item.is_correct === false" color="error" style="font-weight: 600"><CloseCircleOutlined /> 答错</a-tag>
-              <a-tag v-else color="warning"><ExclamationCircleOutlined /> 待人工判定</a-tag>
-              <a-tag :color="item.is_correct === false ? 'red' : 'green'">
+              <a-tag :color="item.dimension ? 'blue' : 'default'">{{ item.dimension || '未分类' }}</a-tag>
+              <a-tag :color="scoreStatusTagColor(item)" style="font-weight: 600">
+                <CheckCircleOutlined v-if="scoreStatusIconName(item) === 'check'" />
+                <CloseCircleOutlined v-else-if="scoreStatusIconName(item) === 'close'" />
+                <ExclamationCircleOutlined v-else />
+                {{ scoreStatusLabel(item) }}
+              </a-tag>
+              <a-tag :color="hasDeduction(item) ? 'red' : 'green'">
                 {{ item.earned_score }} / {{ item.max_score }} 分
               </a-tag>
               <a-button size="small" type="link" style="margin-left: auto" @click="openComplaintModal(item)">
@@ -452,13 +455,13 @@
 
             <!-- Non-option questions (short answer, fill-blank) -->
             <div v-if="!item.options" style="margin-bottom: 12px; padding: 12px; background: #fafafa; border-radius: 6px">
-              <div style="margin-bottom: 8px"><strong>你的答案：</strong><span :style="{ color: item.is_correct === false ? '#ff4d4f' : '#333' }">{{ item.user_answer || '（未作答）' }}</span></div>
+              <div style="margin-bottom: 8px"><strong>你的答案：</strong><span :style="{ color: hasDeduction(item) ? '#ff4d4f' : '#333' }">{{ item.user_answer || '（未作答）' }}</span></div>
               <div v-if="item.correct_answer"><strong>参考答案：</strong><span style="color: #52c41a">{{ item.correct_answer }}</span></div>
             </div>
 
             <!-- Feedback / Explanation -->
             <a-alert
-              :type="item.is_correct === true ? 'success' : item.is_correct === false ? 'error' : 'warning'"
+              :type="scoreStatusAlertType(item)"
               show-icon
               style="margin-top: 8px"
             >
@@ -466,7 +469,7 @@
                 <div>
                   <strong>评语：</strong>{{ item.feedback || '暂无评语' }}
                 </div>
-                <div v-if="item.explanation && item.is_correct === false" style="margin-top: 6px; color: #666">
+                <div v-if="item.explanation" style="margin-top: 6px; color: #666">
                   <strong>解析：</strong>{{ item.explanation }}
                 </div>
               </template>
@@ -550,9 +553,9 @@
             <div><strong>正确答案：</strong>{{ item.correct_answer }}</div>
           </div>
 
-          <a-alert type="info" show-icon style="margin-top: 8px">
+          <a-alert v-if="item.explanation" type="info" show-icon style="margin-top: 8px">
             <template #message>
-              <strong>解析：</strong>{{ item.explanation || item.feedback || '暂无解析' }}
+              <strong>解析：</strong>{{ item.explanation }}
             </template>
           </a-alert>
         </div>
@@ -717,25 +720,11 @@ import { ref, reactive, computed, onMounted, nextTick, watch } from 'vue'
 import { LeftOutlined, DownloadOutlined, SafetyCertificateOutlined, ThunderboltOutlined, SearchOutlined, ExportOutlined, DatabaseOutlined, CheckCircleOutlined, CloseCircleOutlined, ExclamationCircleOutlined } from '@ant-design/icons-vue'
 import { useRouter } from 'vue-router'
 import { message, Empty } from 'ant-design-vue'
-import * as echarts from 'echarts/core'
-import { RadarChart, BarChart } from 'echarts/charts'
-import {
-  TitleComponent,
-  TooltipComponent,
-  LegendComponent,
-  RadarComponent,
-  GridComponent,
-} from 'echarts/components'
-import { CanvasRenderer } from 'echarts/renderers'
 import request from '@/utils/request'
 import { useUserStore } from '@/stores/user'
 import html2canvas from 'html2canvas'
 import { jsPDF } from 'jspdf'
-
-echarts.use([
-  RadarChart, BarChart, TitleComponent, TooltipComponent,
-  LegendComponent, RadarComponent, GridComponent, CanvasRenderer,
-])
+import { exportElementToPdf } from '@/utils/pdfExport'
 
 const userStore = useUserStore()
 const router = useRouter()
@@ -746,8 +735,6 @@ const loading = ref(false)
 const scores = ref<any[]>([])
 const selectedScore = ref<any>(null)
 const diagnostic = ref<any>(null)
-const radarChartRef = ref<HTMLElement | null>(null)
-const barChartRef = ref<HTMLElement | null>(null)
 const reportRef = ref<HTMLElement | null>(null)
 const certRef = ref<HTMLElement | null>(null)
 const downloading = ref(false)
@@ -764,6 +751,9 @@ const currentUserId = computed(() => userStore.userInfo?.id ? String(userStore.u
 // Full review (grading details) state
 const fullReviewData = ref<any>(null)
 const fullReviewLoading = ref(false)
+const fullReviewItems = computed(() => Array.isArray(fullReviewData.value?.items) ? fullReviewData.value.items : [])
+const derivedFullScoreCount = computed(() => fullReviewItems.value.filter((item: any) => scoreStatus(item) === 'full_score').length)
+const derivedDeductedCount = computed(() => fullReviewItems.value.filter((item: any) => hasDeduction(item)).length)
 
 // Complaint state
 const complaintModalVisible = ref(false)
@@ -819,9 +809,6 @@ const certDate = computed(() => {
   const now = new Date()
   return `${now.getFullYear()}年${now.getMonth() + 1}月`
 })
-
-let radarChart: echarts.ECharts | null = null
-let barChart: echarts.ECharts | null = null
 
 const pagination = reactive({
   current: 1,
@@ -965,6 +952,68 @@ function getProgressColor(score: number): string {
   if (score >= 80) return '#1890ff'
   if (score >= 60) return '#faad14'
   return '#f5222d'
+}
+
+function scoreStatus(item: any): string {
+  if (item?.score_status) return item.score_status
+  if (item?.is_correct === null || item?.is_correct === undefined) return 'manual_review'
+  const earned = Number(item?.earned_score ?? 0)
+  const max = Number(item?.max_score ?? 0)
+  if (max > 0 && earned >= max) return 'full_score'
+  if (earned <= 0) return 'zero_score'
+  return 'partial_score'
+}
+
+function hasDeduction(item: any): boolean {
+  if (typeof item?.has_deduction === 'boolean') return item.has_deduction
+  return Number(item?.earned_score ?? 0) < Number(item?.max_score ?? 0)
+}
+
+function scoreStatusLabel(item: any): string {
+  const status = scoreStatus(item)
+  if (status === 'full_score') return '满分'
+  if (status === 'partial_score') return '扣分'
+  if (status === 'zero_score') return '未得分'
+  return '待人工判定'
+}
+
+function scoreStatusTagColor(item: any): string {
+  const status = scoreStatus(item)
+  if (status === 'full_score') return 'success'
+  if (status === 'partial_score') return 'warning'
+  if (status === 'zero_score') return 'error'
+  return 'default'
+}
+
+function scoreStatusAlertType(item: any): 'success' | 'warning' | 'error' {
+  const status = scoreStatus(item)
+  if (status === 'full_score') return 'success'
+  if (status === 'partial_score') return 'warning'
+  if (status === 'zero_score') return 'error'
+  return 'warning'
+}
+
+function scoreStatusBorderColor(item: any): string {
+  const status = scoreStatus(item)
+  if (status === 'full_score') return '#52c41a'
+  if (status === 'partial_score') return '#faad14'
+  if (status === 'zero_score') return '#ff4d4f'
+  return '#d9d9d9'
+}
+
+function scoreStatusBackground(item: any): string {
+  const status = scoreStatus(item)
+  if (status === 'full_score') return '#f6ffed'
+  if (status === 'partial_score') return '#fffbe6'
+  if (status === 'zero_score') return '#fff1f0'
+  return '#fafafa'
+}
+
+function scoreStatusIconName(item: any): string {
+  const status = scoreStatus(item)
+  if (status === 'full_score') return 'check'
+  if (status === 'partial_score' || status === 'manual_review') return 'warning'
+  return 'close'
 }
 
 // --- Leaderboard functions ---
@@ -1179,16 +1228,16 @@ async function restoreScore(record: any) {
 }
 
 async function viewDiagnosticByScoreId(record: any) {
-  selectedScore.value = record
-  try {
-    diagnostic.value = await request.get(`/scores/${record.score_id}/diagnostic`)
-    fetchFullReview(record.score_id)
-    await nextTick()
-    renderRadarChart()
-    renderBarChart()
-  } catch (e) {
-    message.error('获取诊断分析报告失败')
+  if (!record.score_id) {
+    message.warning('该考试尚未评分，无法查看诊断分析报告')
+    return
   }
+  const displayName = record.full_name || record.username || '用户'
+  router.push({
+    name: 'ScoreDiagnostic',
+    params: { scoreId: record.score_id },
+    query: { displayName },
+  })
 }
 
 function canDownloadCertForRecord(record: any): boolean {
@@ -1245,17 +1294,6 @@ async function downloadCertForRecord(record: any) {
   }
 }
 
-async function fetchFullReview(scoreId: string) {
-  fullReviewLoading.value = true
-  try {
-    fullReviewData.value = await request.get(`/scores/${scoreId}/full-review`)
-  } catch (e) {
-    console.error('获取批卷详情失败', e)
-  } finally {
-    fullReviewLoading.value = false
-  }
-}
-
 function openComplaintModal(item: any) {
   complaintTargetDetail.value = item
   complaintReason.value = ''
@@ -1294,16 +1332,7 @@ async function viewDiagnostic(record: any) {
     message.warning('该考试尚未评分，无法查看诊断分析报告')
     return
   }
-  selectedScore.value = record
-  try {
-    diagnostic.value = await request.get(`/scores/${record.score_id}/diagnostic`)
-    fetchFullReview(record.score_id)
-    await nextTick()
-    renderRadarChart()
-    renderBarChart()
-  } catch (e) {
-    message.error('获取诊断分析报告失败')
-  }
+  router.push({ name: 'ScoreDiagnostic', params: { scoreId: record.score_id } })
 }
 
 async function manualGrade(record: any) {
@@ -1319,111 +1348,17 @@ async function manualGrade(record: any) {
   }
 }
 
-function renderRadarChart() {
-  if (!radarChartRef.value || !diagnostic.value?.radar_data) return
-
-  if (radarChart) radarChart.dispose()
-  radarChart = echarts.init(radarChartRef.value)
-
-  const radarData = diagnostic.value.radar_data
-  const indicators = radarData.map((item: any) => ({
-    name: item.dimension,
-    max: 100,
-  }))
-  const values = radarData.map((item: any) => item.score)
-
-  radarChart.setOption({
-    tooltip: {},
-    radar: {
-      indicator: indicators,
-      shape: 'polygon',
-      splitNumber: 5,
-      axisName: { color: '#333', fontSize: 12 },
-    },
-    series: [{
-      type: 'radar',
-      data: [{
-        value: values,
-        name: '个人得分',
-        areaStyle: { opacity: 0.3 },
-        lineStyle: { width: 2 },
-      }],
-      symbol: 'circle',
-      symbolSize: 6,
-    }],
-  })
-}
-
-function renderBarChart() {
-  if (!barChartRef.value || !diagnostic.value?.comparison) return
-
-  if (barChart) barChart.dispose()
-  barChart = echarts.init(barChartRef.value)
-
-  const items = diagnostic.value.comparison.items || []
-  const dims = items.map((i: any) => i.dimension)
-  const userScores = items.map((i: any) => i.user_score)
-  const avgScores = items.map((i: any) => i.avg_score)
-
-  barChart.setOption({
-    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-    legend: { data: ['个人', '平均'] },
-    grid: { left: 20, right: 20, bottom: 20, top: 40, containLabel: true },
-    xAxis: {
-      type: 'category',
-      data: dims,
-      axisLabel: { interval: 0, fontSize: 11 },
-    },
-    yAxis: { type: 'value', max: 100 },
-    series: [
-      {
-        name: '个人',
-        type: 'bar',
-        data: userScores,
-        itemStyle: { color: '#1F4E79' },
-        barWidth: '30%',
-      },
-      {
-        name: '平均',
-        type: 'bar',
-        data: avgScores,
-        itemStyle: { color: '#bbb' },
-        barWidth: '30%',
-      },
-    ],
-  })
-}
-
 async function downloadReport() {
   if (!reportRef.value) return
   downloading.value = true
   try {
-    const canvas = await html2canvas(reportRef.value, {
-      scale: 2,
-      useCORS: true,
-      backgroundColor: '#f0f2f5',
-    })
-    const imgData = canvas.toDataURL('image/png')
-    const imgWidth = 190 // A4 width minus margins (210 - 10*2)
-    const imgHeight = (canvas.height * imgWidth) / canvas.width
-    const pageHeight = 277 // A4 height minus margins (297 - 10*2)
-
-    const pdf = new jsPDF('p', 'mm', 'a4')
-    let heightLeft = imgHeight
-    let position = 10 // top margin
-
-    pdf.addImage(imgData, 'PNG', 10, position, imgWidth, imgHeight)
-    heightLeft -= pageHeight
-
-    while (heightLeft > 0) {
-      position = position - pageHeight
-      pdf.addPage()
-      pdf.addImage(imgData, 'PNG', 10, position, imgWidth, imgHeight)
-      heightLeft -= pageHeight
-    }
-
     const displayName = userStore.userInfo?.full_name || userStore.userInfo?.username || '用户'
-    pdf.save(`${displayName}AI素养分析报告.pdf`)
+    await exportElementToPdf(reportRef.value, {
+      filename: `${displayName}AI素养分析报告.pdf`,
+      backgroundColor: '#f0f2f5',
+      scale: 1.5,
+      imageQuality: 0.78,
+    })
     message.success('报告下载成功')
   } catch (e) {
     message.error('报告下载失败，请重试')
@@ -1554,6 +1489,15 @@ function onTrainingMultiChange(vals: any) {
   trainingMultiAnswers.value = sorted
 }
 
+function normalizeTrueFalseAnswer(answer?: string | null): string {
+  const value = String(answer || '').trim()
+  if (!value) return ''
+  const upper = value.toUpperCase()
+  if (['A', 'T', 'TRUE', 'Y', 'YES'].includes(upper) || ['正确', '对', '是', '√', '✓'].includes(value)) return 'T'
+  if (['B', 'F', 'FALSE', 'N', 'NO', 'X'].includes(upper) || ['错误', '错', '否', '×', '✗'].includes(value)) return 'F'
+  return upper
+}
+
 function submitTraining() {
   const results: any[] = []
   trainingQuestions.value.forEach((q, idx) => {
@@ -1565,6 +1509,8 @@ function submitTraining() {
       const userSet = new Set(userAns.split(''))
       const correctSet = new Set(correctAns.split(''))
       isCorrect = userSet.size === correctSet.size && [...userSet].every(c => correctSet.has(c))
+    } else if (q.question_type === 'true_false') {
+      isCorrect = normalizeTrueFalseAnswer(userAns) === normalizeTrueFalseAnswer(correctAns)
     } else {
       isCorrect = userAns === correctAns
     }
@@ -1611,13 +1557,6 @@ onMounted(() => {
   loadLeaderboardStatus()
 })
 
-// Clean up charts on unmount
-watch(selectedScore, (val) => {
-  if (!val) {
-    if (radarChart) { radarChart.dispose(); radarChart = null }
-    if (barChart) { barChart.dispose(); barChart = null }
-  }
-})
 </script>
 
 <style scoped>

@@ -257,7 +257,8 @@ function getEffectiveType(q: any) {
   return q._userType || q.question?.question_type || q.llm_question_type || 'short_answer'
 }
 function getEffectiveAnswer(q: any) {
-  return q._userAnswer ?? q.question?.correct_answer ?? ''
+  const answer = q._userAnswer ?? q.question?.correct_answer ?? ''
+  return getEffectiveType(q) === 'true_false' ? normalizeTrueFalseAnswer(answer) : answer
 }
 function getFullStem(q: any) { return q.question?.stem || '' }
 function getOptions(q: any) {
@@ -283,6 +284,14 @@ function getAnswerPlaceholder(q: any) {
   const t = getEffectiveType(q)
   if (t === 'fill_blank') return '填空答案'
   return '输入参考答案'
+}
+function normalizeTrueFalseAnswer(answer?: string | null): string {
+  const value = String(answer || '').trim()
+  if (!value) return ''
+  const upper = value.toUpperCase()
+  if (['A', 'T', 'TRUE', 'Y', 'YES'].includes(upper) || ['正确', '对', '是', '√', '✓'].includes(value)) return 'T'
+  if (['B', 'F', 'FALSE', 'N', 'NO', 'X'].includes(upper) || ['错误', '错', '否', '×', '✗'].includes(value)) return 'F'
+  return upper
 }
 function getConfidenceColor(c: number) {
   if (c >= 0.8) return 'green'
@@ -313,6 +322,7 @@ function onTypeChange(q: any, value: string) {
   if (q.question) q.question.question_type = value
 }
 function onAnswerChange(q: any, value: string) {
+  if (getEffectiveType(q) === 'true_false') value = normalizeTrueFalseAnswer(value)
   q._userAnswer = value
   if (q.question) q.question.correct_answer = value
 }

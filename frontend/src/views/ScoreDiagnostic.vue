@@ -1,32 +1,38 @@
 <template>
   <div class="page-container">
-    <div class="page-header">
-      <h2>诊断分析报告</h2>
-      <a-space wrap>
-        <a-button @click="returnToScores">返回成绩页</a-button>
-        <a-button type="primary" :loading="downloading" :disabled="loading || !diagnostic" @click="downloadReport">
-          下载报告
-        </a-button>
-        <a-button
-          :loading="downloadingCert"
-          :disabled="loading || !canDownloadCert"
-          @click="downloadCert"
-          :style="canDownloadCert ? certButtonStyle : {}"
-        >
-          下载证书
-        </a-button>
-      </a-space>
-    </div>
-
     <a-card v-if="loading" :bordered="false">
       <a-skeleton active :paragraph="{ rows: 10 }" />
     </a-card>
 
-    <a-card v-else-if="diagnostic" :bordered="false">
-      <div ref="reportRef">
-        <DiagnosticReportView :diagnostic="diagnostic" :user-name="diagnosticUserName" />
+    <template v-else-if="diagnostic">
+      <div class="report-actions">
+        <a-button @click="returnToScores">
+          <LeftOutlined /> 返回成绩页
+        </a-button>
+        <a-space>
+          <a-button type="primary" :loading="downloading" @click="downloadReport">
+            <DownloadOutlined /> 下载报告
+          </a-button>
+          <a-button
+            :loading="downloadingCert"
+            :disabled="!canDownloadCert"
+            @click="downloadCert"
+            :style="canDownloadCert ? certButtonStyle : {}"
+          >
+            <SafetyCertificateOutlined /> 下载证书
+          </a-button>
+        </a-space>
       </div>
-    </a-card>
+      <div ref="reportRef">
+        <DiagnosticReportView
+          :diagnostic="diagnostic"
+          :user-name="diagnosticUserName"
+          :full-review-data="fullReviewData"
+          :full-review-loading="fullReviewLoading"
+          :open-complaint="openComplaintModal"
+        />
+      </div>
+    </template>
 
     <a-card v-else :bordered="false">
       <a-result
@@ -42,6 +48,28 @@
         </template>
       </a-result>
     </a-card>
+
+    <a-modal
+      v-model:open="complaintModalVisible"
+      title="评分反馈投诉"
+      :confirm-loading="complaintSubmitting"
+      ok-text="提交反馈"
+      cancel-text="取消"
+      @ok="submitComplaint"
+    >
+      <div v-if="complaintTargetDetail" class="complaint-target">
+        <div class="complaint-row"><strong>题目：</strong>第 {{ complaintTargetDetail.order_num }} 题（{{ typeLabel(complaintTargetDetail.question_type) }}）</div>
+        <div class="complaint-row"><strong>得分：</strong>{{ complaintTargetDetail.earned_score }} / {{ complaintTargetDetail.max_score }}</div>
+        <div class="complaint-stem">{{ complaintTargetDetail.stem?.substring(0, 80) }}{{ complaintTargetDetail.stem?.length > 80 ? '...' : '' }}</div>
+      </div>
+      <a-textarea
+        v-model:value="complaintReason"
+        placeholder="请详细描述您认为评分有误的原因，例如：答案选择了B但被判为错误，实际B也是正确答案..."
+        :rows="4"
+        :maxlength="2000"
+        show-count
+      />
+    </a-modal>
 
     <div ref="certRef" class="cert-container" :class="{ 'cert-excellent': certLevel === '优秀' }">
       <div class="cert-border">
@@ -77,11 +105,13 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { DownloadOutlined, LeftOutlined, SafetyCertificateOutlined } from '@ant-design/icons-vue'
 import { message } from 'ant-design-vue'
 import html2canvas from 'html2canvas'
 import { jsPDF } from 'jspdf'
 import request from '@/utils/request'
 import { useUserStore } from '@/stores/user'
+import { exportElementToPdf } from '@/utils/pdfExport'
 import DiagnosticReportView from '@/components/DiagnosticReportView.vue'
 
 const route = useRoute()
@@ -95,6 +125,12 @@ const diagnostic = ref<any>(null)
 const errorMessage = ref('')
 const reportRef = ref<HTMLElement | null>(null)
 const certRef = ref<HTMLElement | null>(null)
+const fullReviewData = ref<any>(null)
+const fullReviewLoading = ref(false)
+const complaintModalVisible = ref(false)
+const complaintTargetDetail = ref<any>(null)
+const complaintReason = ref('')
+const complaintSubmitting = ref(false)
 
 const scoreId = computed(() => String(route.params.scoreId || ''))
 const diagnosticUserName = computed(() => {
@@ -120,6 +156,8 @@ async function fetchDiagnostic() {
   if (!scoreId.value) return
   loading.value = true
   errorMessage.value = ''
+  fullReviewData.value = null
+  void fetchFullReview()
   try {
     diagnostic.value = await request.get(`/scores/${scoreId.value}/diagnostic`)
   } catch (error: any) {
@@ -130,6 +168,55 @@ async function fetchDiagnostic() {
   }
 }
 
+async function fetchFullReview() {
+  if (!scoreId.value) return
+  fullReviewLoading.value = true
+  try {
+    fullReviewData.value = await request.get(`/scores/${scoreId.value}/full-review`)
+  } catch {
+    fullReviewData.value = null
+  } finally {
+    fullReviewLoading.value = false
+  }
+}
+
+function openComplaintModal(item: any) {
+  complaintTargetDetail.value = item
+  complaintReason.value = ''
+  complaintModalVisible.value = true
+}
+
+async function submitComplaint() {
+  if (!complaintReason.value.trim()) {
+    message.warning('请输入反馈原因')
+    return
+  }
+  complaintSubmitting.value = true
+  try {
+    await request.post('/scores/complaints', {
+      score_detail_id: complaintTargetDetail.value.score_detail_id,
+      reason: complaintReason.value,
+    })
+    message.success('反馈已提交，我们会尽快处理')
+    complaintModalVisible.value = false
+  } catch (error: any) {
+    message.error(error?.message || '反馈提交失败，请重试')
+  } finally {
+    complaintSubmitting.value = false
+  }
+}
+
+function typeLabel(type: string): string {
+  const map: Record<string, string> = {
+    single_choice: '单选题',
+    multiple_choice: '多选题',
+    true_false: '判断题',
+    fill_blank: '填空题',
+    short_answer: '简答题',
+  }
+  return map[type] || type
+}
+
 function returnToScores() {
   router.push({ name: 'Scores' })
 }
@@ -138,31 +225,12 @@ async function downloadReport() {
   if (!reportRef.value || !diagnostic.value) return
   downloading.value = true
   try {
-    const canvas = await html2canvas(reportRef.value, {
-      scale: 2,
-      useCORS: true,
+    await exportElementToPdf(reportRef.value, {
+      filename: 'AI素养诊断分析报告.pdf',
       backgroundColor: '#f0f2f5',
+      scale: 1.5,
+      imageQuality: 0.78,
     })
-    const imgData = canvas.toDataURL('image/png')
-    const imgWidth = 190
-    const imgHeight = (canvas.height * imgWidth) / canvas.width
-    const pageHeight = 277
-
-    const pdf = new jsPDF('p', 'mm', 'a4')
-    let heightLeft = imgHeight
-    let position = 10
-
-    pdf.addImage(imgData, 'PNG', 10, position, imgWidth, imgHeight)
-    heightLeft -= pageHeight
-
-    while (heightLeft > 0) {
-      position = heightLeft - imgHeight + 10
-      pdf.addPage()
-      pdf.addImage(imgData, 'PNG', 10, position, imgWidth, imgHeight)
-      heightLeft -= pageHeight
-    }
-
-    pdf.save('AI素养诊断分析报告.pdf')
     message.success('报告下载成功')
   } catch {
     message.error('报告下载失败，请重试')
@@ -217,15 +285,27 @@ onMounted(() => {
 </script>
 
 <style scoped>
-.page-header {
+.report-actions {
   display: flex;
   align-items: center;
   justify-content: space-between;
   margin-bottom: 16px;
 }
 
-.page-header h2 {
-  margin: 0;
+.complaint-target {
+  margin-bottom: 16px;
+  padding: 12px;
+  background: #f5f5f5;
+  border-radius: 6px;
+}
+
+.complaint-row {
+  margin-bottom: 4px;
+}
+
+.complaint-stem {
+  color: #666;
+  font-size: 13px;
 }
 
 .cert-container {

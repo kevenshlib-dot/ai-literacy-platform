@@ -61,7 +61,8 @@ def test_template_fallback_true_false():
     )
     assert len(questions) == 1
     assert questions[0]["question_type"] == "true_false"
-    assert questions[0]["correct_answer"] in ("A", "B")
+    assert questions[0]["options"] == {"T": "正确", "F": "错误"}
+    assert questions[0]["correct_answer"] in ("T", "F")
 
 
 def test_template_fallback_fill_blank():
@@ -1609,8 +1610,8 @@ async def test_preview_questions_free_runs_type_batches_concurrently(monkeypatch
                     {
                         "question_type": qtype,
                         "stem": f"{qtype} 并发测试题",
-                        "options": {"A": "选项A", "B": "选项B", "C": "选项C", "D": "选项D"} if qtype != "true_false" else {"A": "正确", "B": "错误"},
-                        "correct_answer": "A",
+                        "options": {"A": "选项A", "B": "选项B", "C": "选项C", "D": "选项D"} if qtype != "true_false" else {"T": "正确", "F": "错误"},
+                        "correct_answer": "T" if qtype == "true_false" else "A",
                         "explanation": "并发测试",
                         "knowledge_tags": [qtype],
                         "dimension": "AI基础知识",
@@ -2208,8 +2209,8 @@ async def test_preview_question_bank_does_not_retry_for_warning_only_risks(monke
                 {
                     "question_type": qtype,
                     "stem": f"第{index + 1}题测试题干",
-                    "options": {"A": "选项A", "B": "选项B", "C": "选项C", "D": "选项D"} if qtype != "true_false" else {"A": "正确", "B": "错误"},
-                    "correct_answer": "A",
+                    "options": {"A": "选项A", "B": "选项B", "C": "选项C", "D": "选项D"} if qtype != "true_false" else {"T": "正确", "F": "错误"},
+                    "correct_answer": "T" if qtype == "true_false" else "A",
                     "explanation": "解释",
                     "knowledge_tags": [f"标签{index + 1}"],
                     "dimension": "AI基础知识",

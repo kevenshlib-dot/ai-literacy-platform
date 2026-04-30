@@ -27,6 +27,7 @@ from app.agents.question_agent import (
 )
 from app.agents.model_registry import ModelConfig
 from app.agents.review_agent import ai_review_question
+from app.services.score_service import normalize_true_false_answer
 
 logger = logging.getLogger(__name__)
 MATERIAL_PLACEHOLDER_MARKERS = ("待OCR处理", "待转录处理", "待ASR处理")
@@ -39,6 +40,22 @@ COVERAGE_RECENCY_PENALTIES = {
     2: 1.5,
     3: 1.0,
 }
+
+
+def _normalize_true_false_options(options: Optional[dict]) -> dict:
+    return {"T": "正确", "F": "错误"}
+
+
+def _normalize_question_answer_payload(
+    question_type: str,
+    correct_answer: Optional[str],
+    options: Optional[dict],
+) -> tuple[Optional[str], Optional[dict]]:
+    if question_type != "true_false":
+        return correct_answer, options
+    return normalize_true_false_answer(correct_answer), _normalize_true_false_options(options)
+
+
 COVERAGE_PENALTY_CAP = 4.0
 PREVIEW_GENERATION_CONCURRENCY = 3
 BLOOM_LEVEL_ORDER = {
@@ -1131,6 +1148,11 @@ async def create_question(
     created_by: Optional[uuid.UUID] = None,
 ) -> Question:
     """Create a single question."""
+    correct_answer, options = _normalize_question_answer_payload(
+        question_type,
+        correct_answer,
+        options,
+    )
     q = Question(
         question_type=QuestionType(question_type),
         stem=stem,
@@ -1238,7 +1260,22 @@ async def update_question(
         "bloom_level",
     }
 
-    for key, value in kwargs.items():
+    question_type = q.question_type.value if hasattr(q.question_type, "value") else str(q.question_type)
+    normalized_updates = dict(kwargs)
+    if question_type == "true_false":
+        next_answer = normalized_updates.get("correct_answer", q.correct_answer)
+        next_options = normalized_updates.get("options", q.options)
+        normalized_answer, normalized_options = _normalize_question_answer_payload(
+            question_type,
+            next_answer,
+            next_options,
+        )
+        if "correct_answer" in normalized_updates:
+            normalized_updates["correct_answer"] = normalized_answer
+        if "options" in normalized_updates:
+            normalized_updates["options"] = normalized_options
+
+    for key, value in normalized_updates.items():
         if key not in editable_fields or value is None or not hasattr(q, key):
             continue
         if key == "bloom_level":

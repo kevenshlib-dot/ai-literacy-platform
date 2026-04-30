@@ -24,6 +24,8 @@ from app.services.score_service import get_wrong_answer_details
 
 logger = logging.getLogger(__name__)
 DIAGNOSTIC_LLM_TIMEOUT_SECONDS = 20.0
+DIAGNOSTIC_REPORT_VERSION = 2
+UNCATEGORIZED_DIMENSION_LABEL = "未分类"
 
 FIVE_DIMENSIONS = [
     "AI基础知识",
@@ -64,7 +66,11 @@ async def generate_diagnostic_report(
     if not force_refresh:
         cached = get_report_namespace(score, DIAGNOSTIC_REPORT_KEY)
         if cached:
-            return cached
+            normalized_cached = _normalize_cached_diagnostic_report(cached)
+            if normalized_cached != cached:
+                set_report_namespace(score, DIAGNOSTIC_REPORT_KEY, normalized_cached)
+                await db.flush()
+            return normalized_cached
 
     fact_pack = await _build_diagnostic_fact_pack(db, score)
     fallback_sections = _build_fallback_sections(fact_pack)
@@ -87,6 +93,7 @@ async def generate_diagnostic_report(
     )
 
     report = {
+        "report_version": DIAGNOSTIC_REPORT_VERSION,
         "score_id": str(score.id),
         "total_score": score.total_score,
         "max_score": score.max_score,
@@ -98,6 +105,7 @@ async def generate_diagnostic_report(
             fact_pack["dimension_metrics"],
             sections["dimension_analysis"],
         ),
+        "uncategorized_metrics": fact_pack["uncategorized_metrics"],
         "strengths": _identify_strengths(fact_pack["radar_data"]),
         "weaknesses": _identify_weaknesses(fact_pack["radar_data"]),
         "comparison": fact_pack["comparison"],
@@ -118,6 +126,30 @@ async def generate_diagnostic_report(
     await db.flush()
 
     return report
+
+
+def _default_uncategorized_metrics() -> dict:
+    return {
+        "dimension": UNCATEGORIZED_DIMENSION_LABEL,
+        "score": None,
+        "earned": 0.0,
+        "max": 0.0,
+        "ratio": None,
+        "level": "未评估",
+        "question_count": 0,
+        "wrong_count": 0,
+        "evaluated": False,
+        "source_dimensions": [],
+        "description": "未设置或未匹配到五维框架的题目，仅用于补充说明，不参与五维雷达统计。",
+    }
+
+
+def _normalize_cached_diagnostic_report(cached: dict) -> dict:
+    normalized = dict(cached)
+    normalized["report_version"] = DIAGNOSTIC_REPORT_VERSION
+    if not isinstance(normalized.get("uncategorized_metrics"), dict):
+        normalized["uncategorized_metrics"] = _default_uncategorized_metrics()
+    return normalized
 
 
 async def _build_diagnostic_fact_pack(db: AsyncSession, score: Score) -> dict:
@@ -142,6 +174,7 @@ async def _build_diagnostic_fact_pack(db: AsyncSession, score: Score) -> dict:
     percentile = await _calculate_percentile(db, score, sheet.exam_id)
     wrong_items = await get_wrong_answer_details(db, score.id)
     dimension_metrics = _build_dimension_metrics(score, questions_map, wrong_items)
+    uncategorized_metrics = _build_uncategorized_metrics(score, wrong_items)
     radar_data = _build_radar_data(dimension_metrics)
     type_metrics = _build_type_metrics(score, questions_map)
     comparison = await _generate_comparison_data(db, score, sheet.exam_id, radar_data)
@@ -181,8 +214,15 @@ async def _build_diagnostic_fact_pack(db: AsyncSession, score: Score) -> dict:
             "question_count": len(score.details),
             "wrong_count": len(wrong_items),
         },
+        "analysis_rules": {
+            "dimension_policy": (
+                "只有五个标准维度参与五维雷达、维度分析、优势和提升方向。"
+                "未分类或非标准维度题目只进入 uncategorized_metrics，不得平均分摊到五维。"
+            )
+        },
         "radar_data": radar_data,
         "dimension_metrics": dimension_metrics,
+        "uncategorized_metrics": uncategorized_metrics,
         "type_metrics": type_metrics,
         "wrong_items": _build_wrong_item_fact_pack(wrong_items, questions_map, answers_map),
         "comparison": comparison,
@@ -197,7 +237,9 @@ async def _build_diagnostic_fact_pack(db: AsyncSession, score: Score) -> dict:
 def _llm_fact_pack(fact_pack: dict) -> dict:
     return {
         "overview": fact_pack["overview"],
+        "analysis_rules": fact_pack["analysis_rules"],
         "dimension_metrics": fact_pack["dimension_metrics"],
+        "uncategorized_metrics": fact_pack["uncategorized_metrics"],
         "type_metrics": fact_pack["type_metrics"],
         "wrong_items": fact_pack["wrong_items"],
         "error_patterns": fact_pack["error_patterns"],
@@ -322,6 +364,44 @@ def _build_dimension_metrics(
             "evaluated": evaluated,
         }
     return metrics
+
+
+def _build_uncategorized_metrics(score: Score, wrong_items: list[dict]) -> dict:
+    earned = 0.0
+    max_score = 0.0
+    count = 0
+    source_dimensions = []
+
+    for raw_dim, data in (score.dimension_scores or {}).items():
+        if _match_framework_dimension(raw_dim):
+            continue
+        label = str(raw_dim or "").strip() or UNCATEGORIZED_DIMENSION_LABEL
+        source_dimensions.append(label)
+        earned += data.get("earned", 0.0)
+        max_score += data.get("max", 0.0)
+        count += data.get("count", 0)
+
+    uncategorized_wrong_items = [
+        item
+        for item in wrong_items
+        if not _match_framework_dimension(item.get("dimension"))
+    ]
+    ratio = earned / max_score if max_score > 0 else None
+    score_val = round(ratio * 100, 1) if ratio is not None else None
+
+    return {
+        "dimension": UNCATEGORIZED_DIMENSION_LABEL,
+        "score": score_val,
+        "earned": round(earned, 1),
+        "max": round(max_score, 1),
+        "ratio": round(ratio, 2) if ratio is not None else None,
+        "level": _score_to_level(score_val) if score_val is not None else "未评估",
+        "question_count": count,
+        "wrong_count": len(uncategorized_wrong_items),
+        "evaluated": count > 0 and max_score > 0,
+        "source_dimensions": source_dimensions,
+        "description": "未设置或未匹配到五维框架的题目，仅用于补充说明，不参与五维雷达统计。",
+    }
 
 
 def _match_framework_dimension(raw_dimension: str | None) -> str | None:
@@ -732,6 +812,7 @@ def _humanize_error_reason(reason: str) -> str:
         "scenario_misjudgment": "场景判断失误",
         "unsupported_claim": "结论缺少依据",
         "no_answer": "未作答",
+        "manual_review_required": "需要人工复核",
     }
     return mapping.get(reason, reason)
 

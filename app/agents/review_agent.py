@@ -32,7 +32,7 @@ REVIEW_SYSTEM_PROMPT = """你是一个专业的题目质量审核专家。你需
 审核时重点关注：
 - 正确答案是否被题干或素材证据充分支持，避免把争议性表述写成唯一正确答案。
 - 选择题的四个选项是否同层级、同粒度、可比较，干扰项是否围绕真实误解而非离题内容。
-- `fill_blank` 是开放式填空题，不需要选项；`short_answer` 是开放式简答题，不得使用填空标记，也不需要选项；`true_false` 必须使用 A/B 两个标准选项。
+- `fill_blank` 是开放式填空题，不需要选项；`short_answer` 是开放式简答题，不得使用填空标记，也不需要选项；`true_false` 必须使用 T/F 两个标准选项。
 - 若题目涉及“首位/公认/奠基/关键文献/提出者/起源”等唯一归属型表述，应重点检查事实依据是否充分。
 
 请严格按照以下JSON格式输出：
@@ -312,7 +312,7 @@ def _rule_based_review(
         normalized_labels.discard(None)
         has_standard_options = (
             len(normalized_options) == 2
-            and {"A", "B"}.issubset(normalized_options.keys())
+            and {"T", "F"}.issubset(normalized_options.keys())
         )
         if has_standard_options and normalized_labels == {"true", "false"}:
             option_quality = 5
@@ -321,10 +321,10 @@ def _rule_based_review(
             comments_parts.append("判断题建议使用“正确/错误”标准选项")
         else:
             option_quality = 2
-            comments_parts.append("判断题应仅提供 A/B 两个标准选项")
-        answer_score = 4 if correct_answer in ("A", "B") and has_standard_options else 2
+            comments_parts.append("判断题应仅提供 T/F 两个标准选项")
+        answer_score = 4 if correct_answer in ("T", "F") and has_standard_options else 2
         if answer_score < 4:
-            comments_parts.append("判断题正确答案应为 A 或 B")
+            comments_parts.append("判断题正确答案应为 T 或 F")
     elif question_type == "fill_blank":
         option_quality = 5 if not normalized_options else 1
         answer_score = 4

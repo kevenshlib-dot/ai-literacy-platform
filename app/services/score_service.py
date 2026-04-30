@@ -21,6 +21,82 @@ logger = logging.getLogger(__name__)
 OBJECTIVE_TYPES = {"single_choice", "multiple_choice", "true_false"}
 
 
+def normalize_true_false_answer(answer: str | None) -> str:
+    """Normalize true/false answer aliases to the canonical T/F format."""
+    if answer is None:
+        return ""
+
+    value = str(answer).strip()
+    if not value:
+        return ""
+
+    for prefix in ("参考答案：", "参考答案:", "正确答案：", "正确答案:", "答案：", "答案:", "答："):
+        if value.startswith(prefix):
+            value = value[len(prefix):].strip()
+            break
+
+    compact = value.replace(" ", "").replace("　", "")
+    upper = compact.upper()
+
+    true_values = {"A", "T", "TRUE", "Y", "YES", "正确", "对", "是", "√", "✓"}
+    false_values = {"B", "F", "FALSE", "N", "NO", "错误", "错", "否", "×", "✗", "X"}
+
+    if upper in true_values or compact in true_values:
+        return "T"
+    if upper in false_values or compact in false_values:
+        return "F"
+
+    if "正确" in compact or "√" in compact or "✓" in compact:
+        return "T"
+    if "错误" in compact or "错" in compact or "×" in compact or "✗" in compact:
+        return "F"
+
+    letters = [char for char in upper if char in {"A", "B", "T", "F"}]
+    if letters:
+        first = letters[0]
+        return "T" if first in {"A", "T"} else "F"
+
+    return upper
+
+
+def _earned_ratio(earned_score: float, max_score: float) -> float:
+    return round(earned_score / max_score, 4) if max_score > 0 else 0.0
+
+
+def _score_status(earned_score: float, max_score: float, is_correct: Optional[bool]) -> str:
+    if is_correct is None:
+        return "manual_review"
+    if max_score <= 0:
+        return "full_score"
+    if earned_score >= max_score:
+        return "full_score"
+    if earned_score <= 0:
+        return "zero_score"
+    return "partial_score"
+
+
+def _objective_analysis(
+    *,
+    earned_score: float,
+    max_score: float,
+    judgement: str,
+    positive_points: list[str] | None = None,
+    missed_points: list[str] | None = None,
+    error_reasons: list[str] | None = None,
+    evidence: list[str] | None = None,
+) -> dict:
+    return {
+        "earned_ratio": _earned_ratio(earned_score, max_score),
+        "judgement": judgement,
+        "positive_points": positive_points or [],
+        "missed_points": missed_points or [],
+        "error_reasons": error_reasons or [],
+        "confidence": 1.0,
+        "evidence": evidence or [],
+        "scoring_source": "rule",
+    }
+
+
 def _score_objective(
     question: Question,
     answer_content: str,
@@ -36,6 +112,10 @@ def _score_objective(
     # Use effective_type (which includes override) if provided; fall back to original
     qtype = effective_type or (question.question_type.value if hasattr(question.question_type, 'value') else question.question_type)
 
+    if qtype == "true_false":
+        correct = normalize_true_false_answer(raw_correct)
+        student = normalize_true_false_answer(answer_content)
+
     # If correct answer is missing, cannot auto-score — flag for manual review
     if not correct:
         logger.warning(f"Question {question.id} ({qtype}) has no correct_answer, cannot auto-score")
@@ -43,13 +123,32 @@ def _score_objective(
             "earned_score": 0.0,
             "is_correct": None,
             "feedback": f"⚠️ 该题缺少标准答案，无法自动评分。考生作答：{student or '（未作答）'}",
+            "analysis": _objective_analysis(
+                earned_score=0.0,
+                max_score=max_score,
+                judgement="该题缺少标准答案，无法自动评分。",
+                missed_points=["缺少标准答案，需人工复核。"],
+                error_reasons=["manual_review_required"],
+                evidence=[f"学生答案：{student or '(未作答)'}"],
+            ),
         }
 
     if qtype == "multiple_choice":
         correct_set = set(correct)
         student_set = set(student)
         if correct_set == student_set:
-            return {"earned_score": max_score, "is_correct": True, "feedback": "正确"}
+            return {
+                "earned_score": max_score,
+                "is_correct": True,
+                "feedback": "正确",
+                "analysis": _objective_analysis(
+                    earned_score=max_score,
+                    max_score=max_score,
+                    judgement="答案正确。",
+                    positive_points=["选择项与标准答案完全一致。"],
+                    evidence=[f"标准答案：{correct}", f"学生答案：{student}"],
+                ),
+            }
         elif student_set.issubset(correct_set) and len(student_set) > 0:
             # Partial credit for subset
             partial = round(max_score * len(student_set) / len(correct_set) * 0.5, 1)
@@ -57,32 +156,29 @@ def _score_objective(
                 "earned_score": partial,
                 "is_correct": False,
                 "feedback": f"部分正确，漏选。正确答案：{correct}",
-                "analysis": {
-                    "earned_ratio": round(partial / max_score, 4) if max_score > 0 else 0.0,
-                    "judgement": "部分正确，但存在漏选。",
-                    "positive_points": ["答案命中了部分正确选项。"],
-                    "missed_points": [f"遗漏正确选项：{''.join(sorted(correct_set - student_set))}"],
-                    "error_reasons": ["incomplete_answer"],
-                    "confidence": 1.0,
-                    "evidence": [f"标准答案：{correct}", f"学生答案：{student}"],
-                    "scoring_source": "rule",
-                },
+                "analysis": _objective_analysis(
+                    earned_score=partial,
+                    max_score=max_score,
+                    judgement="部分正确，但存在漏选。",
+                    positive_points=["答案命中了部分正确选项。"],
+                    missed_points=[f"遗漏正确选项：{''.join(sorted(correct_set - student_set))}"],
+                    error_reasons=["incomplete_answer"],
+                    evidence=[f"标准答案：{correct}", f"学生答案：{student}"],
+                ),
             }
         else:
             return {
                 "earned_score": 0.0,
                 "is_correct": False,
                 "feedback": f"错误。正确答案：{correct}",
-                "analysis": {
-                    "earned_ratio": 0.0,
-                    "judgement": "答案与标准答案不匹配。",
-                    "positive_points": [],
-                    "missed_points": [f"正确答案应为：{correct}"],
-                    "error_reasons": ["concept_error"],
-                    "confidence": 1.0,
-                    "evidence": [f"标准答案：{correct}", f"学生答案：{student or '(未作答)'}"],
-                    "scoring_source": "rule",
-                },
+                "analysis": _objective_analysis(
+                    earned_score=0.0,
+                    max_score=max_score,
+                    judgement="答案与标准答案不匹配。",
+                    missed_points=[f"正确答案应为：{correct}"],
+                    error_reasons=["concept_error"],
+                    evidence=[f"标准答案：{correct}", f"学生答案：{student or '(未作答)'}"],
+                ),
             }
     else:
         if correct == student:
@@ -90,32 +186,27 @@ def _score_objective(
                 "earned_score": max_score,
                 "is_correct": True,
                 "feedback": "正确",
-                "analysis": {
-                    "earned_ratio": 1.0,
-                    "judgement": "答案正确。",
-                    "positive_points": ["回答与标准答案一致。"],
-                    "missed_points": [],
-                    "error_reasons": [],
-                    "confidence": 1.0,
-                    "evidence": [f"标准答案：{correct}", f"学生答案：{student}"],
-                    "scoring_source": "rule",
-                },
+                "analysis": _objective_analysis(
+                    earned_score=max_score,
+                    max_score=max_score,
+                    judgement="答案正确。",
+                    positive_points=["回答与标准答案一致。"],
+                    evidence=[f"标准答案：{correct}", f"学生答案：{student}"],
+                ),
             }
         else:
             return {
                 "earned_score": 0.0,
                 "is_correct": False,
                 "feedback": f"错误。正确答案：{correct}",
-                "analysis": {
-                    "earned_ratio": 0.0,
-                    "judgement": "答案错误。",
-                    "positive_points": [],
-                    "missed_points": [f"正确答案应为：{correct}"],
-                    "error_reasons": ["concept_error"],
-                    "confidence": 1.0,
-                    "evidence": [f"标准答案：{correct}", f"学生答案：{student or '(未作答)'}"],
-                    "scoring_source": "rule",
-                },
+                "analysis": _objective_analysis(
+                    earned_score=0.0,
+                    max_score=max_score,
+                    judgement="答案错误。",
+                    missed_points=[f"正确答案应为：{correct}"],
+                    error_reasons=["concept_error"],
+                    evidence=[f"标准答案：{correct}", f"学生答案：{student or '(未作答)'}"],
+                ),
             }
 
 
@@ -361,6 +452,13 @@ async def get_wrong_answer_details(
         if not q:
             continue
         qtype = q.question_type.value if hasattr(q.question_type, 'value') else q.question_type
+        answer_text = a.answer_content if a else ""
+        analysis = _normalized_detail_analysis(
+            detail=detail,
+            question=q,
+            question_type=qtype,
+            user_answer=answer_text,
+        )
         items.append({
             "question_id": str(q.id),
             "question_type": qtype,
@@ -371,17 +469,83 @@ async def get_wrong_answer_details(
             "dimension": q.dimension,
             "difficulty": q.difficulty,
             "knowledge_tags": q.knowledge_tags,
-            "user_answer": a.answer_content if a else "",
+            "user_answer": answer_text,
             "earned_score": detail.earned_score,
             "max_score": detail.max_score,
+            "is_correct": detail.is_correct,
+            "has_deduction": detail.earned_score < detail.max_score,
+            "score_status": _score_status(detail.earned_score, detail.max_score, detail.is_correct),
             "feedback": detail.feedback,
-            "analysis": detail.analysis or {},
-            "error_reasons": (detail.analysis or {}).get("error_reasons", []),
-            "missed_points": (detail.analysis or {}).get("missed_points", []),
-            "positive_points": (detail.analysis or {}).get("positive_points", []),
+            "analysis": analysis,
+            "error_reasons": analysis.get("error_reasons", []),
+            "missed_points": analysis.get("missed_points", []),
+            "positive_points": analysis.get("positive_points", []),
             "reference_answer": q.correct_answer,
         })
     return items
+
+
+def _normalized_detail_analysis(
+    *,
+    detail: ScoreDetail,
+    question: Question,
+    question_type: str,
+    user_answer: str,
+) -> dict:
+    analysis = dict(detail.analysis or {})
+    earned_score = detail.earned_score
+    max_score = detail.max_score
+
+    if not analysis:
+        judgement = _default_judgement(earned_score, max_score, detail.is_correct)
+        analysis = {
+            "earned_ratio": _earned_ratio(earned_score, max_score),
+            "judgement": judgement,
+            "positive_points": [],
+            "missed_points": [],
+            "error_reasons": [],
+            "confidence": 1.0 if question_type in OBJECTIVE_TYPES else 0.5,
+            "evidence": [],
+            "scoring_source": "rule" if question_type in OBJECTIVE_TYPES else "unknown",
+        }
+
+    analysis.setdefault("earned_ratio", _earned_ratio(earned_score, max_score))
+    analysis.setdefault("judgement", _default_judgement(earned_score, max_score, detail.is_correct))
+    analysis.setdefault("positive_points", [])
+    analysis.setdefault("missed_points", [])
+    analysis.setdefault("error_reasons", [])
+    analysis.setdefault("confidence", 1.0 if question_type in OBJECTIVE_TYPES else 0.5)
+    analysis.setdefault("evidence", [])
+    analysis.setdefault("scoring_source", "rule" if question_type in OBJECTIVE_TYPES else "unknown")
+
+    if question_type in OBJECTIVE_TYPES:
+        correct_answer = question.correct_answer or ""
+        if earned_score >= max_score and max_score > 0:
+            analysis["positive_points"] = analysis.get("positive_points") or ["回答与标准答案一致。"]
+        elif earned_score < max_score and not analysis.get("missed_points") and correct_answer:
+            analysis["missed_points"] = [f"正确答案应为：{correct_answer}"]
+        if not analysis.get("evidence"):
+            evidence = []
+            if correct_answer:
+                evidence.append(f"标准答案：{correct_answer}")
+            evidence.append(f"学生答案：{user_answer or '(未作答)'}")
+            analysis["evidence"] = evidence
+
+    return analysis
+
+
+def _default_judgement(
+    earned_score: float,
+    max_score: float,
+    is_correct: Optional[bool],
+) -> str:
+    if is_correct is None:
+        return "该题需要人工复核。"
+    if max_score > 0 and earned_score >= max_score:
+        return "本题获得满分。"
+    if earned_score <= 0:
+        return "本题未得分。"
+    return "本题获得部分分数，仍存在扣分点。"
 
 
 async def get_all_answer_details(
@@ -438,6 +602,14 @@ async def get_all_answer_details(
         if not q:
             continue
         qtype = override_map.get(q.id) or (q.question_type.value if hasattr(q.question_type, 'value') else q.question_type)
+        answer_text = a.answer_content if a else ""
+        analysis = _normalized_detail_analysis(
+            detail=detail,
+            question=q,
+            question_type=qtype,
+            user_answer=answer_text,
+        )
+        score_status = _score_status(detail.earned_score, detail.max_score, detail.is_correct)
         items.append({
             "score_detail_id": str(detail.id),
             "question_id": str(q.id),
@@ -449,11 +621,15 @@ async def get_all_answer_details(
             "dimension": q.dimension,
             "difficulty": q.difficulty,
             "knowledge_tags": q.knowledge_tags,
-            "user_answer": a.answer_content if a else "",
+            "user_answer": answer_text,
             "earned_score": detail.earned_score,
             "max_score": detail.max_score,
             "is_correct": detail.is_correct,
+            "has_deduction": detail.earned_score < detail.max_score,
+            "score_status": score_status,
             "feedback": detail.feedback,
+            "analysis": analysis,
+            "reference_answer": q.correct_answer,
             "order_num": order_map.get(q.id, 0),
         })
 

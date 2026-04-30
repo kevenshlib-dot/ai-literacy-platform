@@ -336,7 +336,7 @@ DEFAULT_QUESTION_SYSTEM_PROMPT = """\
 # 题型最低格式
 
 - `single_choice` / `multiple_choice`：必须提供 A/B/C/D 四个选项；选项应同层级、可比较，不得明显离题。
-- `true_false`：题干必须是完整陈述句；`options` 必须严格为 `{"A":"正确","B":"错误"}`；`correct_answer` 只能是 `A` 或 `B`。
+- `true_false`：题干必须是完整陈述句；`options` 必须严格为 `{"T":"正确","F":"错误"}`；`correct_answer` 只能是 `T` 或 `F`。
 - `fill_blank`：题干必须包含明确空位标记；`options` 必须为 `null`；答案应是术语、短语或关键词。
 - `short_answer`：题干必须明确作答任务；不得包含填空标记；`options` 必须为 `null`；答案应为文本说明。
 
@@ -547,7 +547,7 @@ def _build_type_rule_section(question_types: list[str]) -> str:
     if "true_false" in normalized_types:
         lines.extend([
             "- 判断题：题干必须是完整陈述句，不得使用问号或疑问表达。",
-            "- 判断题：options 必须严格为 {\"A\": \"正确\", \"B\": \"错误\"}，correct_answer 只能是 A 或 B。",
+            "- 判断题：options 必须严格为 {\"T\": \"正确\", \"F\": \"错误\"}，correct_answer 只能是 T 或 F。",
         ])
     if "fill_blank" in normalized_types:
         lines.extend([
@@ -838,14 +838,14 @@ def _build_question_item_schema(question_type: str) -> dict:
                 },
                 "options": {
                     "type": "object",
-                    "required": ["A", "B"],
+                    "required": ["T", "F"],
                     "additionalProperties": False,
                     "properties": {
-                        "A": {"const": "正确"},
-                        "B": {"const": "错误"},
+                        "T": {"const": "正确"},
+                        "F": {"const": "错误"},
                     },
                 },
-                "correct_answer": {"type": "string", "enum": ["A", "B"]},
+                "correct_answer": {"type": "string", "enum": ["T", "F"]},
             },
         }
 
@@ -2047,6 +2047,59 @@ def _normalize_options_keys(options: dict) -> dict:
     return normalized
 
 
+def _normalize_true_false_answer(answer: str) -> str:
+    if not answer:
+        return answer
+
+    value = answer.strip()
+    for prefix in ("参考答案：", "参考答案:", "正确答案：", "正确答案:", "答案：", "答案:", "答："):
+        if value.startswith(prefix):
+            value = value[len(prefix):].strip()
+            break
+
+    compact = value.replace(" ", "").replace("　", "")
+    upper = compact.upper()
+    true_values = {"A", "T", "TRUE", "Y", "YES", "正确", "对", "是", "√", "✓"}
+    false_values = {"B", "F", "FALSE", "N", "NO", "错误", "错", "否", "×", "✗", "X"}
+
+    if upper in true_values or compact in true_values:
+        return "T"
+    if upper in false_values or compact in false_values:
+        return "F"
+    if "正确" in compact or "√" in compact or "✓" in compact:
+        return "T"
+    if "错误" in compact or "错" in compact or "×" in compact or "✗" in compact:
+        return "F"
+
+    letters = [char for char in upper if char in {"A", "B", "T", "F"}]
+    if letters:
+        first = letters[0]
+        return "T" if first in {"A", "T"} else "F"
+
+    return upper
+
+
+def _normalize_true_false_options(options: Optional[dict]) -> Optional[dict]:
+    if not options:
+        return {"T": "正确", "F": "错误"}
+    if not isinstance(options, dict) or len(options) != 2:
+        return None
+
+    has_true = False
+    has_false = False
+    for key, value in options.items():
+        key_norm = _normalize_true_false_answer(str(key))
+        value_norm = _normalize_true_false_answer(str(value))
+        if key_norm == "T" or value_norm == "T":
+            has_true = True
+        elif key_norm == "F" or value_norm == "F":
+            has_false = True
+
+    if has_true and has_false:
+        return {"T": "正确", "F": "错误"}
+    return None
+
+
 def _normalize_correct_answer(answer: str, question_type: str, options: Optional[dict]) -> str:
     """规范化正确答案格式。"""
     if not answer:
@@ -2061,8 +2114,11 @@ def _normalize_correct_answer(answer: str, question_type: str, options: Optional
                 answer = answer[len(prefix):].strip()
         return answer
 
-    # 选择题/判断题：提取大写字母
-    if question_type in ("single_choice", "multiple_choice", "true_false"):
+    if question_type == "true_false":
+        return _normalize_true_false_answer(answer)
+
+    # 选择题：提取大写字母
+    if question_type in ("single_choice", "multiple_choice"):
         # 尝试提取字母（兼容 "答案A" "选项B" "A和C" "A、B" 等格式）
         letters = sorted(set(re.findall(r"[A-D]", answer.upper())))
         if letters:
@@ -2070,17 +2126,7 @@ def _normalize_correct_answer(answer: str, question_type: str, options: Optional
             # 单选题只取第一个
             if question_type == "single_choice":
                 return result[0]
-            # 判断题只允许 A 或 B
-            if question_type == "true_false":
-                return result[0] if result[0] in ("A", "B") else "A"
             return result
-
-        # 判断题中文答案映射
-        if question_type == "true_false":
-            if answer in ("正确", "对", "是", "True", "true", "T"):
-                return "A"
-            if answer in ("错误", "错", "否", "False", "false", "F"):
-                return "B"
 
         # 选择题中文选项映射（如答案文本匹配某个选项值）
         if options:
@@ -2138,15 +2184,18 @@ def _validate_and_fix_question(
     # ── 3. 选项规范化 ──
     options = raw.get("options")
     if qt in OPTION_TYPES:
-        if not options or not isinstance(options, dict):
-            # 判断题可以自动补充
-            if qt == "true_false":
-                options = {"A": "正确", "B": "错误"}
-            else:
+        if qt == "true_false":
+            options = _normalize_true_false_options(options)
+            if not options:
+                logger.warning(f"判断题选项非标准格式，已丢弃: {stem[:30]}")
+                reject("判断题选项必须严格为 T.正确 / F.错误")
+                return None
+        else:
+            if not options or not isinstance(options, dict):
                 logger.warning(f"选择题缺少有效 options，已丢弃: {stem[:30]}")
                 reject("缺少有效选项")
                 return None
-        options = _normalize_options_keys(options)
+            options = _normalize_options_keys(options)
         # 确保至少有2个选项
         if len(options) < 2:
             logger.warning(f"选项数量不足，已丢弃: {stem[:30]}")
@@ -2194,9 +2243,9 @@ def _validate_and_fix_question(
                 return None
             raw["correct_answer"] = fixed
 
-    if qt == "true_false" and raw["correct_answer"] not in ("A", "B"):
+    if qt == "true_false" and raw["correct_answer"] not in ("T", "F"):
         logger.warning(f"判断题答案 '{correct_answer}' 非法，已丢弃: {stem[:30]}")
-        reject("判断题答案必须为 A 或 B")
+        reject("判断题答案必须为 T 或 F")
         return None
 
     if qt == "true_false":
@@ -2204,9 +2253,9 @@ def _validate_and_fix_question(
             logger.warning(f"判断题题干不是陈述句，已丢弃: {stem[:30]}")
             reject("判断题题干必须是陈述句且不得包含问号或疑问表达")
             return None
-        if raw.get("options") != {"A": "正确", "B": "错误"}:
+        if raw.get("options") != {"T": "正确", "F": "错误"}:
             logger.warning(f"判断题选项非标准格式，已丢弃: {stem[:30]}")
-            reject("判断题选项必须严格为 A.正确 / B.错误")
+            reject("判断题选项必须严格为 T.正确 / F.错误")
             return None
 
     if qt == "fill_blank":
@@ -2519,8 +2568,8 @@ def _validate_generated_question_set(
         if question_type == "true_false":
             if "?" in stem or "？" in stem:
                 reasons.append(f"第{index}题判断题题干必须是陈述句")
-            if options != {"A": "正确", "B": "错误"}:
-                reasons.append(f"第{index}题判断题选项必须严格为A.正确/B.错误")
+            if options != {"T": "正确", "F": "错误"}:
+                reasons.append(f"第{index}题判断题选项必须严格为T.正确/F.错误")
 
     if len(single_choice_answers) >= 3 and len(set(single_choice_answers)) == 1:
         reasons.append("同套单选题正确答案位置全部相同")
@@ -3068,14 +3117,14 @@ def _template_fallback(
 
     multiple_choice_templates = [_multiple_choice_variant_1, _multiple_choice_variant_2]
 
-    # ── 判断题模板池（3种变体，混合正确A和错误B） ──
+    # ── 判断题模板池（3种变体，混合正确T和错误F） ──
     def _true_false_variant_1(sent, dim):
         return {
             "question_type": "true_false",
             "dimension": dim,
             "stem": sent + "。",
-            "options": {"A": "正确", "B": "错误"},
-            "correct_answer": "A",
+            "options": {"T": "正确", "F": "错误"},
+            "correct_answer": "T",
             "explanation": "该描述正确。" + sent + "是AI领域公认的基本事实。",
             "knowledge_tags": ["AI素养", "基础判断"],
         }
@@ -3085,8 +3134,8 @@ def _template_fallback(
             "question_type": "true_false",
             "dimension": "AI伦理安全",
             "stem": "AI技术的所有应用都不需要人类进行任何形式的监督和审核。",
-            "options": {"A": "正确", "B": "错误"},
-            "correct_answer": "B",
+            "options": {"T": "正确", "F": "错误"},
+            "correct_answer": "F",
             "explanation": "该说法错误。虽然AI技术可以自动化许多任务，但在关键决策、伦理审查等方面仍需要人类监督，这是负责任AI的基本原则。",
             "knowledge_tags": ["AI伦理", "人机协作"],
         }
@@ -3096,8 +3145,8 @@ def _template_fallback(
             "question_type": "true_false",
             "dimension": "AI基础知识",
             "stem": "机器学习模型的性能完全取决于算法的先进程度，与训练数据的质量无关。",
-            "options": {"A": "正确", "B": "错误"},
-            "correct_answer": "B",
+            "options": {"T": "正确", "F": "错误"},
+            "correct_answer": "F",
             "explanation": "该说法错误。数据质量对模型性能有至关重要的影响，'垃圾进，垃圾出'（Garbage In, Garbage Out）是机器学习的基本准则。",
             "knowledge_tags": ["机器学习", "数据质量"],
         }

@@ -48,8 +48,8 @@ def test_rule_based_review_poor_question():
 def test_rule_based_review_true_false():
     result = _rule_based_review(
         stem="人工智能是计算机科学的一个分支。",
-        options={"A": "正确", "B": "错误"},
-        correct_answer="A",
+        options={"T": "正确", "F": "错误"},
+        correct_answer="T",
         explanation="正确描述",
         question_type="true_false",
         difficulty=1,
@@ -108,8 +108,8 @@ def test_ai_review_uses_fallback():
     """When LLM not configured, uses rule-based review."""
     result = ai_review_question(
         stem="深度学习使用多层神经网络进行特征提取？",
-        options={"A": "正确", "B": "错误"},
-        correct_answer="A",
+        options={"T": "正确", "F": "错误"},
+        correct_answer="T",
         explanation="深度学习的核心特征",
         question_type="true_false",
         difficulty=3,

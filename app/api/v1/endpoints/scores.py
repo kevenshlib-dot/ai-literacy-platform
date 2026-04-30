@@ -914,12 +914,16 @@ async def get_full_review_data(
 
     correct_count = sum(1 for i in items if i.get("is_correct"))
     wrong_count = sum(1 for i in items if i.get("is_correct") is False)
+    full_score_count = sum(1 for i in items if i.get("score_status") == "full_score")
+    deducted_count = sum(1 for i in items if i.get("has_deduction"))
     return {
         "score_id": str(score_id),
         "items": items,
         "total": len(items),
         "correct_count": correct_count,
         "wrong_count": wrong_count,
+        "full_score_count": full_score_count,
+        "deducted_count": deducted_count,
     }
 
 

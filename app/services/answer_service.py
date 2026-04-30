@@ -224,8 +224,7 @@ async def get_exam_session_data(
 
         # Ensure true_false questions always have standard T/F options
         if effective_type == "true_false":
-            if not options or not isinstance(options, dict) or len(options) == 0:
-                options = {"T": "正确", "F": "错误"}
+            options = {"T": "正确", "F": "错误"}
 
         questions.append({
             "question_id": str(q.id),

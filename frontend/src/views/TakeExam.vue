@@ -248,17 +248,17 @@
             <div v-else-if="currentQuestion.question_type === 'true_false'" class="question-options">
               <a-radio-group v-model:value="answers[currentQuestion.question_id]" @change="saveAnswer">
                 <div class="option-row">
-                  <a-radio value="A" class="option-item">
+                  <a-radio value="T" class="option-item">
                     <span class="option-content">
-                      <span class="option-label">A.</span>
+                      <span class="option-label">T.</span>
                       <span class="option-text">正确</span>
                     </span>
                   </a-radio>
                 </div>
                 <div class="option-row">
-                  <a-radio value="B" class="option-item">
+                  <a-radio value="F" class="option-item">
                     <span class="option-content">
-                      <span class="option-label">B.</span>
+                      <span class="option-label">F.</span>
                       <span class="option-text">错误</span>
                     </span>
                   </a-radio>

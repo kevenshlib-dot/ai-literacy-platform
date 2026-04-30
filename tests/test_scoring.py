@@ -1,5 +1,6 @@
 """Tests for scoring engine and report generation (T015-T017)."""
 import asyncio
+from types import SimpleNamespace
 import pytest
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy import select
@@ -12,6 +13,7 @@ from app.services.user_service import init_roles
 from app.agents import scoring_agent
 from app.agents.scoring_agent import _rule_based_scoring
 from app.models.user import User
+from app.services.score_service import _score_objective, normalize_true_false_answer
 
 
 # ---- Unit Tests for Scoring Agent ----
@@ -81,6 +83,21 @@ def test_subjective_scoring_llm_output_is_normalized(monkeypatch):
     assert result["earned_score"] == 7.2
     assert result["analysis"]["scoring_source"] == "llm"
     assert result["analysis"]["missed_points"] == ["缺少风险控制说明"]
+
+
+def test_true_false_scoring_normalizes_legacy_answer_formats():
+    assert normalize_true_false_answer("A") == "T"
+    assert normalize_true_false_answer("B") == "F"
+    assert normalize_true_false_answer("正确") == "T"
+    assert normalize_true_false_answer("错误") == "F"
+
+    question = SimpleNamespace(id="q1", question_type="true_false", correct_answer="A")
+    assert _score_objective(question, "T", 5.0, effective_type="true_false")["is_correct"] is True
+    assert _score_objective(question, "F", 5.0, effective_type="true_false")["is_correct"] is False
+
+    question.correct_answer = "F"
+    assert _score_objective(question, "B", 5.0, effective_type="true_false")["is_correct"] is True
+    assert _score_objective(question, "A", 5.0, effective_type="true_false")["is_correct"] is False
 
 
 # ---- Integration Tests ----

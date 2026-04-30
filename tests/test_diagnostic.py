@@ -1,5 +1,6 @@
 """Tests for five-dimensional diagnostic report (T022)."""
 import time
+import uuid
 import pytest
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy import select
@@ -10,6 +11,7 @@ from app.core.database import Base, get_db
 from app.core.config import settings
 from app.services.user_service import init_roles
 from app.models.user import User
+from app.models.score import Score
 
 
 async def override_get_db():
@@ -199,6 +201,62 @@ async def test_diagnostic_report_basic():
 
 
 @pytest.mark.asyncio
+async def test_diagnostic_legacy_cache_returns_without_llm_regeneration(monkeypatch):
+    from app.services import diagnostic_service
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("legacy cached diagnostic should not call LLM")
+
+    monkeypatch.setattr(
+        diagnostic_service,
+        "generate_structured_diagnostic_sections",
+        _fail_if_called,
+    )
+
+    async with get_client() as client:
+        org_token = await register_user(client, "organizer")
+        ex_token = await register_user(client, "examinee")
+
+        score_id = await create_scored_exam(client, org_token, ex_token, [("A", "A")])
+
+        engine = create_async_engine(settings.DATABASE_URL, echo=False)
+        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with session_factory() as session:
+            score = (
+                await session.execute(select(Score).where(Score.id == uuid.UUID(score_id)))
+            ).scalar_one()
+            score.report = {
+                "diagnostic_report": {
+                    "score_id": score_id,
+                    "total_score": 10.0,
+                    "max_score": 10.0,
+                    "ratio": 1.0,
+                    "level": "优秀",
+                    "percentile_rank": 0,
+                    "radar_data": [],
+                    "dimension_analysis": {},
+                    "strengths": [],
+                    "weaknesses": [],
+                    "comparison": {"items": []},
+                    "recommendations": [],
+                }
+            }
+            await session.commit()
+        await engine.dispose()
+
+        resp = await client.get(
+            f"/api/v1/scores/{score_id}/diagnostic",
+            headers={"Authorization": f"Bearer {ex_token}"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["report_version"] == diagnostic_service.DIAGNOSTIC_REPORT_VERSION
+    assert data["uncategorized_metrics"]["evaluated"] is False
+    assert data["total_score"] == 10.0
+
+
+@pytest.mark.asyncio
 async def test_diagnostic_radar_data_format():
     async with get_client() as client:
         org_token = await register_user(client, "organizer")
@@ -327,6 +385,78 @@ async def test_diagnostic_partial_credit_subjective_question_is_listed_as_lost_s
 
 
 @pytest.mark.asyncio
+async def test_full_review_uses_deduction_counts_for_partial_credit_subjective_question(monkeypatch):
+    from app.services import score_service
+
+    def _partial_subjective_score(**kwargs):
+        return {
+            "earned_score": 3.6,
+            "is_correct": True,
+            "feedback": "回答命中主要要点，但仍有遗漏，缺少透明度说明。",
+            "analysis": {
+                "earned_ratio": 0.6,
+                "judgement": "回答达到基本要求，但未拿满分。",
+                "positive_points": ["说明了公平性和隐私保护。"],
+                "missed_points": ["缺少透明度说明。"],
+                "error_reasons": ["incomplete_answer"],
+                "confidence": 0.9,
+                "evidence": ["学生答案提到了公平性和隐私保护。"],
+                "scoring_source": "llm",
+            },
+        }
+
+    monkeypatch.setattr(score_service, "score_subjective_answer", _partial_subjective_score)
+
+    async with get_client() as client:
+        org_token = await register_user(client, "organizer")
+        ex_token = await register_user(client, "examinee")
+
+        score_id = await create_scored_exam_with_questions(client, org_token, ex_token, [
+            {
+                "question_type": "short_answer",
+                "stem": "请说明 AI 伦理评估应重点关注哪些方面？",
+                "correct_answer": "公平性，透明度，隐私保护",
+                "student_answer": "需要关注公平性和隐私保护。",
+                "dimension": "AI伦理安全",
+                "explanation": "本题考查 AI 伦理评估的核心关注点，包括公平性、透明度与隐私保护。",
+                "score": 6,
+            },
+            {
+                "question_type": "single_choice",
+                "stem": "基础知识题？",
+                "correct_answer": "A",
+                "student_answer": "A",
+                "dimension": "AI基础知识",
+                "explanation": "A 是正确选项。",
+                "score": 4,
+            },
+        ])
+
+        resp = await client.get(
+            f"/api/v1/scores/{score_id}/full-review",
+            headers={"Authorization": f"Bearer {ex_token}"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["correct_count"] == 2
+    assert data["full_score_count"] == 1
+    assert data["deducted_count"] == 1
+    partial_item = next(item for item in data["items"] if item["question_type"] == "short_answer")
+    assert partial_item["is_correct"] is True
+    assert partial_item["has_deduction"] is True
+    assert partial_item["score_status"] == "partial_score"
+    assert "缺少透明度说明" in partial_item["feedback"]
+    assert partial_item["explanation"] == "本题考查 AI 伦理评估的核心关注点，包括公平性、透明度与隐私保护。"
+    assert "question_analysis_text" not in partial_item
+    assert "analysis_text" not in partial_item
+    correct_item = next(item for item in data["items"] if item["question_type"] == "single_choice")
+    assert correct_item["explanation"] == "A 是正确选项。"
+    assert "question_analysis_text" not in correct_item
+    assert "analysis_text" not in correct_item
+
+
+@pytest.mark.asyncio
 async def test_diagnostic_uncovered_dimensions_are_marked_not_evaluated():
     async with get_client() as client:
         org_token = await register_user(client, "organizer")
@@ -363,6 +493,48 @@ async def test_diagnostic_uncovered_dimensions_are_marked_not_evaluated():
     assert innovation["detail"] == "本次测评在该维度没有题目覆盖，暂不评估。"
     assert all(item["dimension"] != "AI创新实践" for item in data["improvement_priorities"])
     assert all(item["dimension"] != "AI创新实践" for item in data["weaknesses"])
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_uncategorized_questions_do_not_affect_five_dimension_scores():
+    async with get_client() as client:
+        org_token = await register_user(client, "organizer")
+        ex_token = await register_user(client, "examinee")
+
+        score_id = await create_scored_exam_with_questions(client, org_token, ex_token, [
+            {
+                "question_type": "single_choice",
+                "stem": "基础知识题？",
+                "correct_answer": "A",
+                "student_answer": "A",
+                "dimension": "AI基础知识",
+                "score": 10,
+            },
+            {
+                "question_type": "single_choice",
+                "stem": "未分类题？",
+                "correct_answer": "B",
+                "student_answer": "C",
+                "dimension": None,
+                "score": 10,
+            },
+        ])
+
+        resp = await client.get(
+            f"/api/v1/scores/{score_id}/diagnostic",
+            headers={"Authorization": f"Bearer {ex_token}"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["dimension_analysis"]["AI基础知识"]["score"] == 100.0
+    assert data["dimension_analysis"]["AI基础知识"]["question_count"] == 1
+    assert data["dimension_analysis"]["AI伦理安全"]["evaluated"] is False
+    uncategorized = data["uncategorized_metrics"]
+    assert uncategorized["evaluated"] is True
+    assert uncategorized["question_count"] == 1
+    assert uncategorized["wrong_count"] == 1
+    assert uncategorized["score"] == 0.0
 
 
 @pytest.mark.asyncio

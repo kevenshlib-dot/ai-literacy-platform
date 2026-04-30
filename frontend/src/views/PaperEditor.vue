@@ -259,8 +259,8 @@
                     </template>
                     <a-form-item label="正确答案">
                       <a-radio-group v-if="effectiveType(pq) === 'true_false'" v-model:value="pq.correct_answer_override" @change="updateCorrectAnswerOverride(pq)">
-                        <a-radio value="A">A. 正确</a-radio>
-                        <a-radio value="B">B. 错误</a-radio>
+                        <a-radio value="T">T. 正确</a-radio>
+                        <a-radio value="F">F. 错误</a-radio>
                       </a-radio-group>
                       <template v-else-if="effectiveType(pq) === 'single_choice'">
                         <a-radio-group v-model:value="pq.correct_answer_override" @change="updateCorrectAnswerOverride(pq)">
@@ -517,6 +517,14 @@ const TYPE_OPTIONS = Object.entries(TYPE_MAP).map(([value, { label }]) => ({ val
 function typeLabel(t: string) { return TYPE_MAP[t]?.label ?? t }
 function typeColor(t: string) { return TYPE_MAP[t]?.color ?? 'default' }
 function effectiveType(pq: PaperQuestion) { return pq.question_type_override || pq.question_type }
+function normalizeTrueFalseAnswer(answer?: string | null): string {
+  const value = String(answer || '').trim()
+  if (!value) return ''
+  const upper = value.toUpperCase()
+  if (['A', 'T', 'TRUE', 'Y', 'YES'].includes(upper) || ['正确', '对', '是', '√', '✓'].includes(value)) return 'T'
+  if (['B', 'F', 'FALSE', 'N', 'NO', 'X'].includes(upper) || ['错误', '错', '否', '×', '✗'].includes(value)) return 'F'
+  return upper
+}
 function truncate(s: string, len: number) {
   if (!s) return ''
   return s.length > len ? s.slice(0, len) + '...' : s
@@ -584,8 +592,9 @@ async function loadPaper() {
       const origOptions = q.question?.options || null
       const overrideOptions = q.options_override || null
       const mergedOptions: Record<string, string> = { ...(origOptions || {}), ...(overrideOptions || {}) }
-      const effectiveAnswer = q.correct_answer_override || q.question?.correct_answer || ''
+      const rawEffectiveAnswer = q.correct_answer_override || q.question?.correct_answer || ''
       const qtype = q.question_type_override || q.question?.question_type || ''
+      const effectiveAnswer = qtype === 'true_false' ? normalizeTrueFalseAnswer(rawEffectiveAnswer) : rawEffectiveAnswer
       return {
         id: q.id,
         question_id: q.question_id,
@@ -595,7 +604,7 @@ async function loadPaper() {
         question_type: q.question?.question_type || '',
         question_type_override: q.question_type_override || null,
         correct_answer: q.question?.correct_answer || '',
-        correct_answer_override: q.correct_answer_override || null,
+        correct_answer_override: qtype === 'true_false' ? effectiveAnswer || null : q.correct_answer_override || null,
         stem: q.question?.stem || '',
         stem_override: q.stem_override || null,
         options: origOptions,
@@ -727,9 +736,9 @@ async function changeQuestionType(pq: PaperQuestion, newType: string) {
     const stem = (pq.stem || '').trim()
     // Simple heuristic: if stem contains clear true/false indicator, auto-fill
     if (stem.endsWith('（×）') || stem.endsWith('(×)') || stem.endsWith('（错）') || stem.endsWith('(F)')) {
-      pq.correct_answer_override = 'B'
+      pq.correct_answer_override = 'F'
     } else if (stem.endsWith('（√）') || stem.endsWith('(√)') || stem.endsWith('（对）') || stem.endsWith('(T)')) {
-      pq.correct_answer_override = 'A'
+      pq.correct_answer_override = 'T'
     }
   }
   // If reverting to original type, clear the answer override too
@@ -758,6 +767,9 @@ async function changeQuestionType(pq: PaperQuestion, newType: string) {
 
 async function updateCorrectAnswerOverride(pq: PaperQuestion) {
   try {
+    if (effectiveType(pq) === 'true_false') {
+      pq.correct_answer_override = normalizeTrueFalseAnswer(pq.correct_answer_override)
+    }
     await request.put(`/papers/questions/${pq.id}`, {
       correct_answer_override: pq.correct_answer_override || null,
     })
